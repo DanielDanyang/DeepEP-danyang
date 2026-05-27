@@ -1,0 +1,4 @@
+benchmark
+*.hip
+*_hip.*
+*.egg-info
