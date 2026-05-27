@@ -6,7 +6,17 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#if __has_include(<numaif.h>)
 #include <numaif.h>
+#else
+#include <cerrno>
+#define MPOL_PREFERRED 1
+extern "C" long set_mempolicy(int mode, const unsigned long* nodemask,
+                              unsigned long maxnode) {
+  errno = ENOSYS;
+  return -1;
+}
+#endif
 
 namespace mscclpp {
 
