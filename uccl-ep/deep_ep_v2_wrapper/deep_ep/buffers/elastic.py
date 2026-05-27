@@ -105,12 +105,15 @@ class ElasticBuffer:
         self.num_rdma_ranks = self.num_scaleout_ranks
         self.num_nvlink_ranks = self.num_scaleup_ranks
 
-        # Native proxy runtime hook.  This is deliberately explicit so the next
-        # porting step can replace it with `ep.ElasticProxyBuffer` or equivalent
-        # nanobind bindings without changing the public Python API.
-        if not hasattr(ep, "Buffer"):
-            raise RuntimeError("uccl.ep native extension is missing Buffer; build uccl-ep first")
-        self.runtime = None
+        if not hasattr(ep, "ElasticProxyBuffer"):
+            raise RuntimeError("uccl.ep native extension is missing ElasticProxyBuffer; rebuild uccl-ep")
+        self.runtime = ep.ElasticProxyBuffer(
+            self.rank_idx,
+            self.num_ranks,
+            int(self.num_bytes),
+            int(local_world),
+            bool(explicitly_destroy),
+        )
 
     @staticmethod
     def get_buffer_size_hint(
@@ -193,4 +196,3 @@ class ElasticBuffer:
 def _align_2mb(value: int) -> int:
     alignment = 2 * 1024 * 1024
     return ((value + alignment - 1) // alignment) * alignment
-

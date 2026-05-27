@@ -49,6 +49,57 @@ namespace nb = nanobind;
 static std::mutex g_proxies_mu;
 
 struct EventOverlap {};
+class ElasticProxyBuffer {
+ public:
+  ElasticProxyBuffer(int rank, int num_ranks, long num_bytes, int local_world,
+                     bool explicitly_destroy)
+      : rank_(rank),
+        num_ranks_(num_ranks),
+        num_bytes_(num_bytes),
+        local_world_(std::max(1, local_world)),
+        explicitly_destroy_(explicitly_destroy) {
+    if (rank_ < 0 || rank_ >= num_ranks_) {
+      throw std::invalid_argument("ElasticProxyBuffer rank out of range");
+    }
+    if (num_bytes_ <= 0) {
+      throw std::invalid_argument("ElasticProxyBuffer requires positive buffer bytes");
+    }
+  }
+
+  ~ElasticProxyBuffer() {
+    if (!destroyed_ && !explicitly_destroy_) destroy();
+  }
+
+  void destroy() { destroyed_ = true; }
+  bool is_available() const { return !destroyed_; }
+
+  std::tuple<int, int> get_physical_domain_size() const {
+    return {num_scaleout_ranks(), num_scaleup_ranks()};
+  }
+
+  std::tuple<int, int> get_logical_domain_size() const {
+    return {num_scaleout_ranks(), num_scaleup_ranks()};
+  }
+
+  int rank() const { return rank_; }
+  int num_ranks() const { return num_ranks_; }
+  long num_bytes() const { return num_bytes_; }
+  int num_scaleout_ranks() const {
+    return std::max(1, num_ranks_ / num_scaleup_ranks());
+  }
+  int num_scaleup_ranks() const { return std::min(local_world_, num_ranks_); }
+  int scaleout_rank() const { return rank_ / num_scaleup_ranks(); }
+  int scaleup_rank() const { return rank_ % num_scaleup_ranks(); }
+
+ private:
+  int rank_;
+  int num_ranks_;
+  long num_bytes_;
+  int local_world_;
+  bool explicitly_destroy_;
+  bool destroyed_{false};
+};
+
 struct Ctx {
   long num_tokens{0};
   long hidden{0};
@@ -1931,6 +1982,23 @@ NB_MODULE(ep, m) {
   });
 
   nb::class_<EventOverlap>(m, "EventOverlap").def(nb::init<>());
+  nb::class_<ElasticProxyBuffer>(m, "ElasticProxyBuffer")
+      .def(nb::init<int, int, long, int, bool>(), nb::arg("rank"),
+           nb::arg("num_ranks"), nb::arg("num_bytes"),
+           nb::arg("local_world"), nb::arg("explicitly_destroy") = false)
+      .def("destroy", &ElasticProxyBuffer::destroy)
+      .def("is_available", &ElasticProxyBuffer::is_available)
+      .def("get_physical_domain_size",
+           &ElasticProxyBuffer::get_physical_domain_size)
+      .def("get_logical_domain_size",
+           &ElasticProxyBuffer::get_logical_domain_size)
+      .def("rank", &ElasticProxyBuffer::rank)
+      .def("num_ranks", &ElasticProxyBuffer::num_ranks)
+      .def("num_bytes", &ElasticProxyBuffer::num_bytes)
+      .def("num_scaleout_ranks", &ElasticProxyBuffer::num_scaleout_ranks)
+      .def("num_scaleup_ranks", &ElasticProxyBuffer::num_scaleup_ranks)
+      .def("scaleout_rank", &ElasticProxyBuffer::scaleout_rank)
+      .def("scaleup_rank", &ElasticProxyBuffer::scaleup_rank);
   nb::class_<Buffer>(m, "Buffer")
       .def(nb::init<int, int, long, long, bool, bool, int>(), nb::arg("rank"),
            nb::arg("num_ranks"), nb::arg("num_nvl_bytes") = 0,
