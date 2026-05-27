@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 
 import deep_ep
+from deep_ep.utils.math import per_token_cast_to_fp8
 
 
 def wait_event(event) -> None:
@@ -40,6 +41,12 @@ def init_dist() -> tuple[int, int, dist.ProcessGroup]:
     return dist.get_rank(), dist.get_world_size(), group
 
 
+def tensor_shape(value) -> tuple:
+    if isinstance(value, tuple):
+        return tuple(value[0].shape)
+    return tuple(value.shape)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-tokens", type=int, default=1024)
@@ -47,6 +54,7 @@ def main() -> None:
     parser.add_argument("--num-topk", type=int, default=8)
     parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--use-fp8-dispatch", action="store_true")
     args = parser.parse_args()
 
     rank, world, group = init_dist()
@@ -61,7 +69,8 @@ def main() -> None:
         explicitly_destroy=True,
     )
 
-    x = torch.randn((args.num_tokens, args.hidden), dtype=torch.bfloat16, device="cuda")
+    x_bf16 = torch.randn((args.num_tokens, args.hidden), dtype=torch.bfloat16, device="cuda")
+    x = per_token_cast_to_fp8(x_bf16) if args.use_fp8_dispatch else x_bf16
     topk_idx = torch.topk(
         torch.rand((args.num_tokens, args.num_experts), dtype=torch.float32, device="cuda"),
         args.num_topk,
@@ -84,13 +93,16 @@ def main() -> None:
             expert_alignment=1,
         )
         wait_event(event)
-        combined_x, combined_topk_weights, event = buffer.combine(
-            x=recv_x,
-            handle=handle,
-            topk_weights=recv_topk_weights,
-        )
-        wait_event(event)
-        torch.cuda.synchronize()
+        if args.use_fp8_dispatch:
+            combined_x = combined_topk_weights = None
+        else:
+            combined_x, combined_topk_weights, event = buffer.combine(
+                x=recv_x,
+                handle=handle,
+                topk_weights=recv_topk_weights,
+            )
+            wait_event(event)
+            torch.cuda.synchronize()
         dist.barrier(group)
 
         elapsed = []
@@ -127,7 +139,7 @@ def main() -> None:
         if rank % int(os.environ["LOCAL_WORLD_SIZE"]) == 0:
             print(
                 f"[v2-proxy-smoke] rank={rank}/{world} local_rank={local_rank} "
-                f"recv={tuple(recv_x.shape)} combined={tuple(combined_x.shape)} "
+                f"recv={tensor_shape(recv_x)} combined={None if combined_x is None else tuple(combined_x.shape)} "
                 f"dispatch_avg_ms={avg_ms:.3f} cached_dispatch_avg_ms={cached_avg_ms:.3f}",
                 flush=True,
             )
@@ -137,7 +149,7 @@ def main() -> None:
             dist.barrier(group)
         del recv_x, recv_topk_idx, recv_topk_weights, handle, combined_x, combined_topk_weights
         del cached_recv_x, cached_recv_topk_idx, cached_recv_topk_weights, cached_handle
-        del x, topk_idx, topk_weights
+        del x, x_bf16, topk_idx, topk_weights
         torch.cuda.synchronize()
         buffer.destroy()
 

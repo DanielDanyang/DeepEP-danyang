@@ -515,11 +515,19 @@ Benchmark 结果：
   - `rank=0/16`: `recv=(53780, 7168)`, `dispatch_avg_ms=25.920`, `cached_dispatch_avg_ms=5.584`
   - `rank=8/16`: `recv=(53412, 7168)`, `dispatch_avg_ms=25.722`, `cached_dispatch_avg_ms=5.637`
   - 粗略按远端 BF16 payload 估算，cached dispatch 约 `21 GB/s`。
+- 8192 tokens, FP8 dispatch（更接近 README 配置）:
+  - 命令增加 `--use-fp8-dispatch`；FP8 smoke 只测 dispatch/cached dispatch，不做 combine。
+  - 日志：
+    - `/tmp/v2_proxy_smoke_8192_fp8_rank0.log`
+    - `/tmp/v2_proxy_smoke_8192_fp8_rank1.log`
+  - `rank=0/16`: `recv=(53780, 7168)`, `combined=None`, `dispatch_avg_ms=21.786`, `cached_dispatch_avg_ms=3.034`
+  - `rank=8/16`: `recv=(53412, 7168)`, `combined=None`, `dispatch_avg_ms=21.869`, `cached_dispatch_avg_ms=3.008`
+  - 粗略按 README “logical bandwidth contains local rank traffic” 口径估算，cached dispatch 约 `40 GB/s`；若只算跨节点 EFA payload，则约 `20 GB/s`。
 
 性能解释：
 
 - uncached wrapper dispatch 被 Python `_build_legacy_layout()`、`_build_v2_metadata()`、额外 source-id all-to-all、expanded metadata/scatter 语义拖慢，不能代表 UCCL 数据面。
-- cached wrapper dispatch 已明显好于 DeepEP V2 Gin proxy 的 `~5 GB/s` dispatch，但仍低于直接 UCCL-EP HT BF16 dispatch 的 `~59 GB/s`。
+- cached wrapper dispatch 已明显好于 DeepEP V2 Gin proxy 的 `~5 GB/s` dispatch；FP8 8K 下约为 README CX7 EP16 `90 GB/s` 的 45% 左右，但离直接 UCCL-EP HT / CX7 上限仍有距离。
 - 要继续逼近 README SM90 EP16，下一步不是调环境变量，而是：
   - 把 V2 metadata、source token id、expert prefix、expanded slot 生成下沉到 native/CUDA；
   - 避免 Python `num_recv_tokens * topk` 循环；
