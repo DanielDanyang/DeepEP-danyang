@@ -6,7 +6,10 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from uccl import ep
+from uccl.ep import Config
 
+from ..buffer import Buffer as UcclBuffer
+from ..utils_uccl import inplace_unique
 from ..utils.event import EventOverlap
 
 
@@ -97,13 +100,10 @@ class ElasticBuffer:
         self._destroyed = False
 
         # These are logical V2 topology values for the initial p5en EP16 scope.
+        # AWS p5en 的目标形态是 8 GPU/node；小规模 smoke test 可能只有
+        # 1-2 个 rank，所以这里不能直接把 `torch.cuda.device_count()` 当成
+        # scaleup 域大小，否则 wrapper 会在 world_size < 8 时暴露假的 EP8。
         local_world = int(torch.cuda.device_count())
-        self.num_scaleup_ranks = local_world
-        self.num_scaleout_ranks = max(1, self.num_ranks // max(1, local_world))
-        self.scaleout_rank_idx = self.rank_idx // max(1, self.num_scaleup_ranks)
-        self.scaleup_rank_idx = self.rank_idx % max(1, self.num_scaleup_ranks)
-        self.num_rdma_ranks = self.num_scaleout_ranks
-        self.num_nvlink_ranks = self.num_scaleup_ranks
 
         if not hasattr(ep, "ElasticProxyBuffer"):
             raise RuntimeError("uccl.ep native extension is missing ElasticProxyBuffer; rebuild uccl-ep")
@@ -114,6 +114,12 @@ class ElasticBuffer:
             int(local_world),
             bool(explicitly_destroy),
         )
+        self.num_scaleout_ranks, self.num_scaleup_ranks = self.runtime.get_logical_domain_size()
+        self.num_rdma_ranks, self.num_nvlink_ranks = self.runtime.get_physical_domain_size()
+        self.scaleout_rank_idx = self.runtime.scaleout_rank()
+        self.scaleup_rank_idx = self.runtime.scaleup_rank()
+        self._legacy_buffer: Optional[UcclBuffer] = None
+        self._legacy_hidden = int(hidden)
 
     @staticmethod
     def get_buffer_size_hint(
@@ -138,9 +144,75 @@ class ElasticBuffer:
     def destroy(self) -> None:
         if self._destroyed:
             return
+        if self._legacy_buffer is not None:
+            self._legacy_buffer.destroy()
+            self._legacy_buffer = None
         if self.runtime is not None and hasattr(self.runtime, "destroy"):
             self.runtime.destroy()
         self._destroyed = True
+
+    def _ensure_legacy_buffer(self, hidden: int) -> UcclBuffer:
+        if self._legacy_buffer is not None:
+            return self._legacy_buffer
+
+        num_sms = 24 if torch.version.cuda else 64
+        hidden_bytes = hidden * 2
+        config = Config(num_sms, 8, 512, 16, 512)
+        align_to = 128
+
+        def align_buffer(size: int, margin: float = 1.2) -> int:
+            return ((int(size * margin) + align_to - 1) // align_to) * align_to
+
+        num_nvl_bytes = align_buffer(config.get_nvl_buffer_size_hint(hidden_bytes, self.num_ranks))
+        num_rdma_bytes = align_buffer(config.get_rdma_buffer_size_hint(hidden_bytes, self.num_ranks))
+        self._legacy_buffer = UcclBuffer(
+            self.group,
+            num_nvl_bytes=num_nvl_bytes,
+            num_rdma_bytes=num_rdma_bytes,
+            low_latency_mode=False,
+            num_qps_per_rank=num_sms,
+            explicitly_destroy=True,
+        )
+        return self._legacy_buffer
+
+    def _build_legacy_layout(self, topk_idx: torch.Tensor, num_experts: int):
+        num_ranks = self.num_ranks
+        num_nodes = max(1, self.num_scaleout_ranks)
+        experts_per_rank = num_experts // num_ranks
+        experts_per_node = num_experts // num_nodes
+
+        rank_idx = topk_idx // experts_per_rank
+        rank_idx = rank_idx.to(torch.int64)
+        rank_idx.masked_fill_(topk_idx == -1, -1)
+        inplace_unique(rank_idx, num_ranks)
+
+        rdma_rank_idx = topk_idx // experts_per_node
+        rdma_rank_idx = rdma_rank_idx.to(torch.int64)
+        rdma_rank_idx.masked_fill_(topk_idx == -1, -1)
+        inplace_unique(rdma_rank_idx, num_nodes)
+
+        num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int32, device=topk_idx.device)
+        num_tokens_per_rdma_rank = torch.empty((num_nodes,), dtype=torch.int32, device=topk_idx.device)
+        token_idx_in_rank = torch.full(
+            (num_ranks, topk_idx.size(0)), -1, dtype=torch.long, device=topk_idx.device
+        )
+        for rank in range(num_ranks):
+            num_tokens_per_rank[rank] = (rank_idx == rank).sum()
+            token_sel = (rank_idx == rank).max(dim=-1)[0]
+            count = token_sel.sum().item()
+            tokens = torch.sort(token_sel.to(torch.int32), descending=True)[1]
+            tokens[:count] = torch.sort(tokens[:count])[0]
+            token_idx_in_rank[rank][tokens[:count]] = torch.arange(
+                count, dtype=torch.long, device=topk_idx.device
+            )
+        for node in range(num_nodes):
+            num_tokens_per_rdma_rank[node] = (rdma_rank_idx == node).sum()
+        is_token_in_rank = token_idx_in_rank.T.contiguous().to(torch.int32) >= 0
+
+        num_tokens_per_expert = torch.empty((num_experts,), dtype=torch.int32, device=topk_idx.device)
+        for expert in range(num_experts):
+            num_tokens_per_expert[expert] = (topk_idx == expert).sum()
+        return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank
 
     def get_physical_domain_size(self) -> Tuple[int, int]:
         return self.num_rdma_ranks, self.num_nvlink_ranks
@@ -169,10 +241,67 @@ class ElasticBuffer:
         do_expand: bool = False,
         use_tma_aligned_col_major_sf: bool = False,
     ):
-        raise NotImplementedError(
-            "DeepEP V2 AWS dispatch is not wired yet. Next native step: replace "
-            "hybrid_dispatch.cuh remote Gin put/signal with TransferCmd submission."
+        if do_expand:
+            raise NotImplementedError("UCCL AWS backend does not support V2 expand mode yet")
+        if use_tma_aligned_col_major_sf:
+            raise NotImplementedError("UCCL AWS backend does not support V2 TMA-aligned scale factors yet")
+
+        x_tensor = x[0] if isinstance(x, tuple) else x
+        legacy = self._ensure_legacy_buffer(int(x_tensor.size(1)))
+        if handle is not None:
+            recv_x, recv_topk_idx, recv_topk_weights, recv_counts, legacy_handle, event = legacy.dispatch(
+                x,
+                handle=handle.proxy_handle,
+                config=legacy.get_dispatch_config(self.num_ranks),
+                previous_event=previous_event,
+                async_finish=async_with_compute_stream,
+                allocate_on_comm_stream=allocate_on_comm_stream,
+            )
+            handle.proxy_handle = legacy_handle
+            return recv_x, recv_topk_idx, recv_topk_weights, handle, event
+
+        if topk_idx is None or num_experts is None:
+            raise ValueError("topk_idx and num_experts are required for uncached dispatch")
+        num_max_tokens_per_rank = num_max_tokens_per_rank or self.num_max_tokens_per_rank or x_tensor.size(0)
+        expert_alignment = expert_alignment or 1
+        layout = self._build_legacy_layout(topk_idx, int(num_experts))
+        recv_x, recv_topk_idx, recv_topk_weights, recv_counts, legacy_handle, event = legacy.dispatch(
+            x,
+            num_tokens_per_rank=layout[0],
+            num_tokens_per_rdma_rank=layout[1],
+            is_token_in_rank=layout[3],
+            num_tokens_per_expert=layout[2],
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            expert_alignment=expert_alignment,
+            config=legacy.get_dispatch_config(self.num_ranks),
+            previous_event=previous_event,
+            async_finish=async_with_compute_stream,
+            allocate_on_comm_stream=allocate_on_comm_stream,
         )
+        psum_scaleup = torch.cumsum(layout[0].view(self.num_scaleout_ranks, self.num_scaleup_ranks)[self.scaleout_rank_idx], 0)
+        local_expert_begin = (self.rank_idx * int(num_experts)) // self.num_ranks
+        local_expert_end = ((self.rank_idx + 1) * int(num_experts)) // self.num_ranks
+        psum_expert = torch.cumsum(layout[2][local_expert_begin:local_expert_end], 0)
+        recv_src_metadata = legacy_handle[-2] if isinstance(legacy_handle, tuple) and len(legacy_handle) >= 2 else torch.empty(0, dtype=torch.int32, device=x_tensor.device)
+        dst_buffer_slot_idx = torch.empty(0, dtype=torch.int32, device=x_tensor.device)
+        new_handle = EPHandle(
+            False,
+            int(num_experts),
+            int(expert_alignment),
+            int(num_max_tokens_per_rank),
+            int(num_sms or UcclBuffer.num_sms),
+            topk_idx.clone() if do_handle_copy else topk_idx,
+            recv_counts,
+            psum_scaleup,
+            psum_expert,
+            recv_src_metadata,
+            dst_buffer_slot_idx,
+            None,
+            None,
+            proxy_handle=legacy_handle,
+        )
+        return recv_x, recv_topk_idx, recv_topk_weights, new_handle, event
 
     def combine(
         self,
@@ -187,9 +316,18 @@ class ElasticBuffer:
         async_with_compute_stream: bool = False,
         allocate_on_comm_stream: bool = False,
     ):
-        raise NotImplementedError(
-            "DeepEP V2 AWS combine is not wired yet. Next native step: port "
-            "combine internode writes and completion signaling to the proxy backend."
+        if handle.proxy_handle is None:
+            raise RuntimeError("UCCL AWS combine requires a dispatch handle from this backend")
+        legacy = self._ensure_legacy_buffer(int(x.size(1)))
+        return legacy.combine(
+            x,
+            handle.proxy_handle,
+            topk_weights=topk_weights,
+            bias=bias,
+            config=legacy.get_combine_config(self.num_ranks),
+            previous_event=previous_event,
+            async_finish=async_with_compute_stream,
+            allocate_on_comm_stream=allocate_on_comm_stream,
         )
 
 

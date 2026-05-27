@@ -365,3 +365,60 @@ DeepEP hybrid dispatch 代码路径：
 2. 在 venv 中构建 `uccl-ep`，确认 `import uccl.ep` 和 `hasattr(uccl.ep, "ElasticProxyBuffer")`。
 3. 增加 proxy RDMA microbenchmark：GPU 写 `WRITE TransferCmd`，CPU proxy 发 EFA verbs RDMA write，不经过 NCCL Gin。
 4. 在 `hybrid_dispatch.cuh` 的 EFA path 中接入 `TransferCmd` 提交流程。
+
+## 2026-05-27 UCCL proxy 路径构建与 benchmark
+
+本地进度提交：
+
+- `99a0d34 Fix elastic proxy skeleton build include`
+- `7356d6f Vendor UCCL utility headers for uccl-ep build`
+- `d6aeb26 Avoid libnuma dependency in uccl-ep build`
+
+远端构建：
+
+- `p5en_0` 和 `p5en_1` 都已在专用 venv `/home/ubuntu/.venvs/deepep-danyang-cu13` 中安装 `uccl.ep`。
+- 构建使用 `/usr/local/cuda-13.0`，因为 PyTorch wheel 是 CUDA 13.0；服务器 `/usr/local/cuda` 默认指向 12.9，会触发 CUDA 版本不匹配。
+- smoke:
+  - `import uccl.ep` 成功。
+  - `ElasticProxyBuffer` binding 可见。
+  - `FifoProxy` 构造后可拿到 listen port。
+  - `deep_ep_v2_wrapper` 可从 `PYTHONPATH` 导入，版本 `2.0.0+ucclaws`。
+
+新增/修改：
+
+- `uccl-ep/bench/proxy_rdma_fifo.py`
+  - 只测 GPU FIFO -> CPU FifoProxy -> EFA verbs RDMA WRITE，不经过 NCCL Gin。
+  - 修正 `FifoProxy`：构造时创建内部 `Proxy`，否则 Python 端无法先 exchange listen port 再 set peer meta。
+- `uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+  - 小规模 smoke test 的 topology 不再把 `torch.cuda.device_count()` 暴露成假的 scaleup 域。
+  - 初步接入 UCCL legacy high-throughput `Buffer`：V2 wrapper 可通过 UCCL layout/delegation 走 CPU proxy/EFA verbs；expanded dispatch 语义仍需补齐。
+- `uccl-ep/deep_ep_v2_wrapper/deep_ep/buffer.py` / `utils_uccl.py`
+  - 复用 UCCL-EP 原 `deep_ep_wrapper` 的方式，把 legacy `Buffer` 暴露给 V2 wrapper。
+
+Benchmark 结果：
+
+1. 单 GPU 对单 GPU FIFO microbench
+   - 命令：2 节点各 1 rank，`proxy_rdma_fifo.py --size-mb 512`。
+   - 日志：
+     - `/tmp/uccl_proxy_rdma_fifo_rank0.log`
+     - `/tmp/uccl_proxy_rdma_fifo_rank1.log`
+   - 配置：4 个 `FifoProxy`，每条命令 `kObjectSize=7168` bytes。
+   - 结果：`41.15 Gbps` total，约 `5.14 GB/s`。
+   - 解释：这是低延迟 FIFO、单 GPU0->GPU0、只看到 2 张 NIC 的路径，和 DeepEP V2 Gin small-message dispatch 同量级，不能代表 UCCL normal/high-throughput 上限。
+
+2. UCCL-EP high-throughput EP16 internode benchmark
+   - 命令：2 节点 x 8 rank，`test_internode.py --num-tokens 4096 --hidden 7168 --num-topk 8 --num-experts 256`。
+   - 日志：
+     - `/tmp/uccl_ep16_internode_rank0.log`
+     - `/tmp/uccl_ep16_internode_rank1.log`
+   - NIC 使用：两台机器日志都显示 16 张 EFA NIC 全部被选中，每张出现 2 次。
+   - 最佳结果：
+     - FP8 dispatch: `48.84 GB/s (RDMA)`, `159.41 GB/s (NVL)`, transmit `1236 us`, config `SMs=24, NVL chunk=12, RDMA chunk=20`。
+     - BF16 dispatch: `59.07 GB/s (RDMA)`, `192.79 GB/s (NVL)`, transmit `1982 us`, config `SMs=24, NVL chunk=8, RDMA chunk=12`。
+     - combine: `16.60 GB/s (RDMA)`, `54.17 GB/s (NVL)`, transmit `7054 us`, config `SMs=24, NVL chunk=7, RDMA chunk=32`。
+
+当前结论：
+
+- EFA 不是根本带宽上限；UCCL CPU proxy + EFA verbs + receiver-side ordering 在 EP16 上已经把 dispatch 拉到 `~50-60 GB/s RDMA`。
+- DeepEP V2 Gin proxy dispatch 的 `2-5 GB/s` 是协议/细粒度小消息路径问题。
+- 长期方向继续是把 V2 `ElasticBuffer` 的 scaleout transport 做成 UCCL-style backend；当前 wrapper delegation 已经证明 Python API 层可以挂到 UCCL 路径，剩余关键工作是补齐 V2 expanded/cached handle 语义，并把 layout/metadata 从 Python 原型下沉到 native kernel。

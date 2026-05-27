@@ -195,15 +195,7 @@ FifoProxy::FifoProxy(int thread_idx, uintptr_t gpu_buffer_addr,
       rank_(rank),
       node_idx_(node_idx),
       local_rank_(local_rank),
-      is_intranode_(is_intranode) {}
-
-FifoProxy::~FifoProxy() { stop(); }
-
-void FifoProxy::set_fifo(mscclpp::Fifo* fifo) { fifo_ = fifo; }
-
-void FifoProxy::set_peers_meta(std::vector<PeerMeta> const& meta) {
-  // Create Proxy::Config
-  // Note: we don't pass ring_buffers since we're using FIFO
+      is_intranode_(is_intranode) {
   Proxy::Config cfg;
   cfg.thread_idx = thread_idx;
   cfg.gpu_buffer = reinterpret_cast<void*>(gpu_buffer_addr_);
@@ -214,13 +206,21 @@ void FifoProxy::set_peers_meta(std::vector<PeerMeta> const& meta) {
   cfg.is_intranode = is_intranode_;
   cfg.pin_thread = true;
 
-  // Set RDMA parameters (for 2-node benchmarking)
+  // 这个 FIFO microbench 固定模拟两节点 scaleout：rank0 发，rank1 收。
+  // 提前创建 Proxy 的原因是 Python 需要先 all_gather listen_port，之后
+  // 才能调用 set_peers_meta；如果在 set_peers_meta 里才创建 Proxy，
+  // 端口交换阶段会解引用空指针。
   cfg.num_experts = 0;
   cfg.num_ranks = 2;
   cfg.num_nodes = 2;
-
-  // Create the underlying Proxy
   proxy_ = std::make_unique<Proxy>(cfg);
+}
+
+FifoProxy::~FifoProxy() { stop(); }
+
+void FifoProxy::set_fifo(mscclpp::Fifo* fifo) { fifo_ = fifo; }
+
+void FifoProxy::set_peers_meta(std::vector<PeerMeta> const& meta) {
   proxy_->set_peers_meta(meta);
 }
 
