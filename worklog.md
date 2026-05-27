@@ -422,3 +422,27 @@ Benchmark 结果：
 - EFA 不是根本带宽上限；UCCL CPU proxy + EFA verbs + receiver-side ordering 在 EP16 上已经把 dispatch 拉到 `~50-60 GB/s RDMA`。
 - DeepEP V2 Gin proxy dispatch 的 `2-5 GB/s` 是协议/细粒度小消息路径问题。
 - 长期方向继续是把 V2 `ElasticBuffer` 的 scaleout transport 做成 UCCL-style backend；当前 wrapper delegation 已经证明 Python API 层可以挂到 UCCL 路径，剩余关键工作是补齐 V2 expanded/cached handle 语义，并把 layout/metadata 从 Python 原型下沉到 native kernel。
+
+## 2026-05-27 V2 wrapper delegation smoke
+
+本地进度：
+
+- 新增 `uccl-ep/bench/v2_proxy_smoke.py`，用 V2 `deep_ep.ElasticBuffer` API 调 UCCL legacy HT `Buffer`。
+- 这个 smoke 刻意避开 V2 expanded dispatch，只验证长期后端形态：`ElasticBuffer.dispatch/combine -> UCCL HT kernels -> CPU proxy -> EFA verbs`。
+- 修正脚本退出顺序：先释放 CUDA tensor 引用，再销毁 UCCL buffer；不主动 `destroy_process_group()`，避免 PyTorch 在 CUDA context teardown 后析构 tensor 时触发 `invalid device context`。
+
+远端验证：
+
+- 命令：2 节点 x 8 rank，`v2_proxy_smoke.py --num-tokens 256 --hidden 7168 --num-topk 8 --num-experts 256 --iters 3`。
+- 日志：
+  - `/tmp/v2_proxy_smoke_rank0.log`
+  - `/tmp/v2_proxy_smoke_rank1.log`
+- 结果：
+  - `rank=0/16`: `recv=(1641, 7168)`, `combined=(256, 7168)`, `dispatch_avg_ms=16.257`
+  - `rank=8/16`: `recv=(1690, 7168)`, `combined=(256, 7168)`, `dispatch_avg_ms=16.216`
+- 日志未见 `Traceback`、`CUDA error`、`SIGABRT`、`SIGSEGV`。
+
+解释：
+
+- 这不是最终性能 benchmark；当前 layout 仍由 Python 循环构造，且 wrapper 还没有 V2 expanded metadata 语义。
+- 它证明了 V2 API 层可以稳定挂到 UCCL/EFA proxy transport，下一步要补齐官方 `tests/elastic/test_ep.py` 依赖的 expanded dispatch、`recv_src_metadata` 和 cached handle 语义。

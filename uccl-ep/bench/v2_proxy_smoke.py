@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Smoke benchmark for the AWS DeepEP V2 wrapper delegation path.
+
+Run with `PYTHONPATH=<uccl-ep>/deep_ep_v2_wrapper` so `import deep_ep`
+resolves to the AWS wrapper, not the upstream DeepEP package.
+
+This intentionally avoids V2 expanded dispatch.  The goal is to verify the
+long-term transport path:
+
+    deep_ep.ElasticBuffer API -> UCCL legacy HT Buffer -> CPU proxy -> EFA verbs
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import time
+
+import torch
+import torch.distributed as dist
+
+import deep_ep
+
+
+def wait_event(event) -> None:
+    if event is None:
+        return
+    if getattr(event, "event", None) is None:
+        torch.cuda.synchronize()
+        return
+    if hasattr(event, "current_stream_wait"):
+        event.current_stream_wait()
+
+
+def init_dist() -> tuple[int, int, dist.ProcessGroup]:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl", device_id=torch.device(f"cuda:{local_rank}"))
+    group = dist.new_group(list(range(dist.get_world_size())))
+    return dist.get_rank(), dist.get_world_size(), group
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-tokens", type=int, default=1024)
+    parser.add_argument("--hidden", type=int, default=7168)
+    parser.add_argument("--num-topk", type=int, default=8)
+    parser.add_argument("--num-experts", type=int, default=256)
+    parser.add_argument("--iters", type=int, default=5)
+    args = parser.parse_args()
+
+    rank, world, group = init_dist()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.manual_seed(1234 + rank)
+
+    buffer = deep_ep.ElasticBuffer(
+        group,
+        num_max_tokens_per_rank=args.num_tokens,
+        hidden=args.hidden,
+        num_topk=args.num_topk,
+        explicitly_destroy=True,
+    )
+
+    x = torch.randn((args.num_tokens, args.hidden), dtype=torch.bfloat16, device="cuda")
+    topk_idx = torch.topk(
+        torch.rand((args.num_tokens, args.num_experts), dtype=torch.float32, device="cuda"),
+        args.num_topk,
+        dim=-1,
+        largest=True,
+        sorted=False,
+    ).indices.to(torch.int64)
+    topk_weights = torch.ones((args.num_tokens, args.num_topk), dtype=torch.float32, device="cuda")
+
+    ok = False
+    recv_x = recv_topk_idx = recv_topk_weights = handle = combined_x = combined_topk_weights = None
+    try:
+        recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
+            x=x,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_experts=args.num_experts,
+            num_max_tokens_per_rank=args.num_tokens,
+            expert_alignment=1,
+        )
+        wait_event(event)
+        combined_x, combined_topk_weights, event = buffer.combine(
+            x=recv_x,
+            handle=handle,
+            topk_weights=recv_topk_weights,
+        )
+        wait_event(event)
+        torch.cuda.synchronize()
+        dist.barrier(group)
+
+        elapsed = []
+        for _ in range(args.iters):
+            dist.barrier(group)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
+                x=x,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                num_experts=args.num_experts,
+                num_max_tokens_per_rank=args.num_tokens,
+                expert_alignment=1,
+            )
+            wait_event(event)
+            torch.cuda.synchronize()
+            elapsed.append(time.perf_counter() - t0)
+
+        avg_ms = sum(elapsed) / len(elapsed) * 1e3
+        if rank % int(os.environ["LOCAL_WORLD_SIZE"]) == 0:
+            print(
+                f"[v2-proxy-smoke] rank={rank}/{world} local_rank={local_rank} "
+                f"recv={tuple(recv_x.shape)} combined={tuple(combined_x.shape)} "
+                f"dispatch_avg_ms={avg_ms:.3f}",
+                flush=True,
+            )
+        ok = True
+    finally:
+        if ok:
+            dist.barrier(group)
+        del recv_x, recv_topk_idx, recv_topk_weights, handle, combined_x, combined_topk_weights
+        del x, topk_idx, topk_weights
+        torch.cuda.synchronize()
+        buffer.destroy()
+
+
+if __name__ == "__main__":
+    main()
