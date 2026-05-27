@@ -532,3 +532,27 @@ Benchmark 结果：
   - 把 V2 metadata、source token id、expert prefix、expanded slot 生成下沉到 native/CUDA；
   - 避免 Python `num_recv_tokens * topk` 循环；
   - 给官方 perf 增加 UCCL kernel-name adapter，或让 UCCL backend 直接返回可计时的 event/kernel 名。
+
+## 2026-05-27 V2 expanded payload scatter 下沉
+
+本地代码改动：
+
+- commit: `6584479 Move V2 expanded payload scatter to CUDA`
+- 删除 wrapper 中的 Python `_make_expanded_dispatch()` indexing scatter。
+- 新增 native CUDA epilogue helper：
+  - `uccl-ep/include/internode.cuh`: `build_v2_expanded_payload(...)`
+  - `uccl-ep/src/internode.cu`: `v2_expanded_payload_kernel`
+  - `uccl-ep/src/uccl_ep.cc`: nanobind runtime method `build_v2_expanded_payload`
+  - `uccl-ep/deep_ep_v2_wrapper/deep_ep/buffer.py`: Python wrapper 只负责按最终 expert prefix 分配输出 tensor，然后调用 native kernel。
+- `ElasticBuffer.dispatch(..., do_expand=True)` 现在复用 native metadata slots，并用 CUDA kernel 把 `recv_x`、FP8 scale 和 `topk_weights` scatter 到 expanded expert-major layout。
+
+本地验证：
+
+- `python -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffer.py uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py uccl-ep/bench/v2_proxy_smoke.py`
+- `git diff --check -- uccl-ep`
+- 旧 Python scatter/fallback 关键词搜索为空。
+
+服务器状态：
+
+- 已检查 `p5en_0` 和 `p5en_1`，两台机器 GPU 都被 `sglang::scheduler_TP*` 进程占用，每张卡约 `124176 MiB`。
+- 按 AGENTS 约束，本轮没有同步服务器、没有构建、没有 benchmark。
