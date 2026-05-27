@@ -446,3 +446,42 @@ Benchmark 结果：
 
 - 这不是最终性能 benchmark；当前 layout 仍由 Python 循环构造，且 wrapper 还没有 V2 expanded metadata 语义。
 - 它证明了 V2 API 层可以稳定挂到 UCCL/EFA proxy transport，下一步要补齐官方 `tests/elastic/test_ep.py` 依赖的 expanded dispatch、`recv_src_metadata` 和 cached handle 语义。
+
+## 2026-05-27 V2 official first-case compatibility
+
+本地进度：
+
+- `deep_ep_v2_wrapper/deep_ep/__init__.py`
+  - 让 wrapper 的 `deep_ep` 包优先覆盖 `ElasticBuffer`，同时把上游 `deep_ep` 路径追加到 `__path__`，所以 `deep_ep.utils.math`、`deep_ep.utils.refs` 等官方 test 依赖仍可导入。
+  - 暴露 `Buffer`、`Config`、`EventHandle`、`topk_idx_t`，补齐官方 `tests/elastic/test_ep.py` 的入口符号。
+- `deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+  - 新增 `capture()`、`barrier()`、`get_theoretical_num_sms()`、`get_theoretical_num_qps()`。
+  - 构造 V2 `recv_src_metadata`、scaleup recv prefix、expert prefix 和 `dst_buffer_slot_idx`。
+  - 支持 expanded dispatch：用 UCCL non-expanded receive 结果生成 one-slot-per-expert 的 expanded tensor，并在 metadata 第 2 列之后记录 expanded slot。
+  - 支持 expanded combine：根据 metadata slot 把 expanded 输入折回 per-token reduced tensor，再委托 UCCL legacy combine。
+  - 修复 cached dispatch：UCCL legacy cached path 不返回新的 topk metadata，也不返回新 handle；V2 wrapper 保留首次 dispatch 的 `proxy_handle` 和 topk metadata。
+  - 所有传给 nanobind/native 的 async/allocate 标志显式转成 `bool`，避免 Python `0/1` 与 C++ `bool` 类型不匹配。
+
+远端验证：
+
+- 启动方式必须从 `/tmp` 运行测试，并设置：
+  - `PYTHONPATH=/home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/uccl-ep/deep_ep_v2_wrapper:/home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang:/home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/uccl-ep/bench:$PYTHONPATH`
+  - 原因：如果从 repo root 运行，Python 的当前目录会让上游 `deep_ep` 抢先被导入，wrapper 不生效。
+- 命令：2 节点 x 8 rank，官方 `tests/elastic/test_ep.py --num-processes 8 --test-first-only --skip-perf-test --num-tokens 256 --hidden 7168 --num-topk 8 --num-experts 256`。
+- 日志：
+  - `/tmp/v2_official_first_rank0.log`
+  - `/tmp/v2_official_first_rank1.log`
+- 结果：两端进程返回 `0`；日志显示已进入第一组官方 case：
+  - `do_handle_copy=1`
+  - `expert_alignment=128`
+  - `use_fp8_dispatch=1`
+  - `num_bias=0`
+  - `with_previous_event=0`
+  - `async_with_compute_stream=0`
+  - `allocate_on_comm_stream=0`
+
+当前限制：
+
+- 这是 Python 原型兼容层：metadata 构造、expanded scatter/fold 仍在 Python/PyTorch 里做，不是最终性能路径。
+- 官方全矩阵 case 尚未跑完；目前只保证 first-case correctness。
+- 下一步性能目标仍是把这些 V2 metadata/expanded 语义下沉到 native/CUDA，并复用已验证的 UCCL HT EFA proxy 数据面。

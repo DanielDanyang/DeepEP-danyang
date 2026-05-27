@@ -151,6 +151,25 @@ class ElasticBuffer:
             self.runtime.destroy()
         self._destroyed = True
 
+    @staticmethod
+    def capture() -> EventOverlap:
+        return UcclBuffer.capture()
+
+    @staticmethod
+    def get_theoretical_num_sms(num_experts: Optional[int] = None, num_topk: Optional[int] = None) -> int:
+        return 24 if torch.version.cuda else 64
+
+    @staticmethod
+    def get_theoretical_num_qps(num_sms: int) -> int:
+        return max(1, int(num_sms))
+
+    def barrier(self, use_comm_stream: bool = True, with_cpu_sync: bool = False) -> None:
+        if with_cpu_sync:
+            torch.cuda.synchronize()
+        dist.barrier(self.group)
+        if with_cpu_sync:
+            torch.cuda.synchronize()
+
     def _ensure_legacy_buffer(self, hidden: int) -> UcclBuffer:
         if self._legacy_buffer is not None:
             return self._legacy_buffer
@@ -214,6 +233,121 @@ class ElasticBuffer:
             num_tokens_per_expert[expert] = (topk_idx == expert).sum()
         return num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank
 
+    def _build_v2_metadata(
+        self,
+        topk_idx: torch.Tensor,
+        recv_topk_idx: torch.Tensor,
+        num_experts: int,
+        num_max_tokens_per_rank: int,
+        expert_alignment: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
+        num_topk = int(topk_idx.size(1))
+        experts_per_rank = num_experts // self.num_ranks
+        send_counts = torch.empty((self.num_ranks,), dtype=torch.int32, device=topk_idx.device)
+        send_src_chunks = []
+        for dst_rank in range(self.num_ranks):
+            expert_begin = dst_rank * experts_per_rank
+            expert_end = expert_begin + experts_per_rank
+            selected = ((topk_idx >= expert_begin) & (topk_idx < expert_end)).any(dim=1)
+            token_indices = selected.nonzero(as_tuple=True)[0].to(torch.int32)
+            send_counts[dst_rank] = token_indices.numel()
+            send_src_chunks.append(token_indices + self.rank_idx * int(num_max_tokens_per_rank))
+
+        recv_counts = torch.empty_like(send_counts)
+        dist.all_to_all_single(recv_counts, send_counts, group=self.group)
+        send_src = (
+            torch.cat(send_src_chunks, dim=0)
+            if send_src_chunks
+            else torch.empty((0,), dtype=torch.int32, device=topk_idx.device)
+        )
+        recv_src = torch.empty((int(recv_counts.sum().item()),), dtype=torch.int32, device=topk_idx.device)
+        dist.all_to_all_single(
+            recv_src,
+            send_src,
+            recv_counts.cpu().tolist(),
+            send_counts.cpu().tolist(),
+            group=self.group,
+        )
+
+        recv_metadata = torch.full(
+            (max(int(recv_src.numel()), 1), 2 + num_topk),
+            -1,
+            dtype=torch.int32,
+            device=topk_idx.device,
+        )
+        if recv_src.numel() > 0:
+            recv_metadata[: recv_src.numel(), 0] = recv_src
+            recv_metadata[: recv_src.numel(), 1] = torch.arange(
+                recv_src.numel(), dtype=torch.int32, device=topk_idx.device
+            )
+
+        scaleup_counts = torch.empty((self.num_scaleup_ranks,), dtype=torch.int32, device=topk_idx.device)
+        for scaleup_rank in range(self.num_scaleup_ranks):
+            scaleup_counts[scaleup_rank] = recv_counts[scaleup_rank::self.num_scaleup_ranks].sum()
+        psum_scaleup = torch.cumsum(scaleup_counts, 0)
+
+        num_local_experts = num_experts // self.num_ranks
+        raw_expert_counts = []
+        aligned_expert_counts = []
+        for expert in range(num_local_experts):
+            count = int((recv_topk_idx == expert).sum().item())
+            raw_expert_counts.append(count)
+            aligned_expert_counts.append(_align(count, expert_alignment))
+        aligned_tensor = torch.tensor(aligned_expert_counts, dtype=torch.int32, device=topk_idx.device)
+        psum_expert = torch.cumsum(aligned_tensor, 0)
+        dst_buffer_slot_idx = torch.arange(max(int(recv_src.numel()), 1), dtype=torch.int32, device=topk_idx.device)
+        return recv_metadata[: recv_src.numel()], psum_scaleup, psum_expert, dst_buffer_slot_idx, aligned_expert_counts, torch.tensor(raw_expert_counts, dtype=torch.int32, device=topk_idx.device)
+
+    def _make_expanded_dispatch(
+        self,
+        recv_x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        recv_topk_idx: torch.Tensor,
+        recv_topk_weights: Optional[torch.Tensor],
+        recv_metadata: torch.Tensor,
+        raw_expert_counts: torch.Tensor,
+        expert_alignment: int,
+    ) -> tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        x_tensor, sf = recv_x if isinstance(recv_x, tuple) else (recv_x, None)
+        num_recv_tokens, hidden = x_tensor.shape
+        num_topk = int(recv_topk_idx.size(1))
+        raw_counts = [int(v) for v in raw_expert_counts.cpu().tolist()]
+        starts = []
+        cursor = 0
+        psum_values = []
+        for count in raw_counts:
+            cursor = _align(cursor, expert_alignment)
+            starts.append(cursor)
+            cursor += count
+            psum_values.append(cursor)
+        num_expanded_tokens = max(cursor, 1)
+
+        expanded_x = torch.empty((num_expanded_tokens, hidden), dtype=x_tensor.dtype, device=x_tensor.device)
+        expanded_sf = (
+            None if sf is None else torch.empty((num_expanded_tokens,) + tuple(sf.shape[1:]), dtype=sf.dtype, device=sf.device)
+        )
+        expanded_weights = (
+            None if recv_topk_weights is None else torch.empty((num_expanded_tokens,), dtype=recv_topk_weights.dtype, device=recv_topk_weights.device)
+        )
+        expanded_metadata = recv_metadata.clone()
+        cursors = starts[:]
+        for token_idx in range(num_recv_tokens):
+            for topk_idx in range(num_topk):
+                expert = int(recv_topk_idx[token_idx, topk_idx].item())
+                if expert < 0:
+                    continue
+                slot = cursors[expert]
+                cursors[expert] += 1
+                expanded_metadata[token_idx, 2 + topk_idx] = slot
+                expanded_x[slot].copy_(x_tensor[token_idx])
+                if expanded_sf is not None:
+                    expanded_sf[slot].copy_(sf[token_idx])
+                if expanded_weights is not None:
+                    expanded_weights[slot].copy_(recv_topk_weights[token_idx, topk_idx])
+
+        psum_expert = torch.tensor(psum_values, dtype=torch.int32, device=x_tensor.device)
+        packed_x = (expanded_x, expanded_sf) if expanded_sf is not None else expanded_x
+        return packed_x, expanded_weights, expanded_metadata, psum_expert
+
     def get_physical_domain_size(self) -> Tuple[int, int]:
         return self.num_rdma_ranks, self.num_nvlink_ranks
 
@@ -241,11 +375,6 @@ class ElasticBuffer:
         do_expand: bool = False,
         use_tma_aligned_col_major_sf: bool = False,
     ):
-        if do_expand:
-            raise NotImplementedError("UCCL AWS backend does not support V2 expand mode yet")
-        if use_tma_aligned_col_major_sf:
-            raise NotImplementedError("UCCL AWS backend does not support V2 TMA-aligned scale factors yet")
-
         x_tensor = x[0] if isinstance(x, tuple) else x
         legacy = self._ensure_legacy_buffer(int(x_tensor.size(1)))
         if handle is not None:
@@ -254,10 +383,15 @@ class ElasticBuffer:
                 handle=handle.proxy_handle,
                 config=legacy.get_dispatch_config(self.num_ranks),
                 previous_event=previous_event,
-                async_finish=async_with_compute_stream,
-                allocate_on_comm_stream=allocate_on_comm_stream,
+                async_finish=bool(async_with_compute_stream),
+                allocate_on_comm_stream=bool(allocate_on_comm_stream),
             )
-            handle.proxy_handle = legacy_handle
+            if legacy_handle is not None:
+                handle.proxy_handle = legacy_handle
+            if recv_topk_idx is None and hasattr(handle, "_cached_recv_topk_idx"):
+                recv_topk_idx = handle._cached_recv_topk_idx
+            if recv_topk_weights is None and hasattr(handle, "_cached_recv_topk_weights"):
+                recv_topk_weights = handle._cached_recv_topk_weights
             return recv_x, recv_topk_idx, recv_topk_weights, handle, event
 
         if topk_idx is None or num_experts is None:
@@ -276,23 +410,29 @@ class ElasticBuffer:
             expert_alignment=expert_alignment,
             config=legacy.get_dispatch_config(self.num_ranks),
             previous_event=previous_event,
-            async_finish=async_with_compute_stream,
-            allocate_on_comm_stream=allocate_on_comm_stream,
+            async_finish=bool(async_with_compute_stream),
+            allocate_on_comm_stream=bool(allocate_on_comm_stream),
         )
-        psum_scaleup = torch.cumsum(layout[0].view(self.num_scaleout_ranks, self.num_scaleup_ranks)[self.scaleout_rank_idx], 0)
+        recv_src_metadata, psum_scaleup, psum_expert, dst_buffer_slot_idx, expert_counts, raw_expert_counts = \
+            self._build_v2_metadata(topk_idx, recv_topk_idx, int(num_experts), int(num_max_tokens_per_rank), int(expert_alignment))
+        if cumulative_local_expert_recv_stats is not None:
+            cumulative_local_expert_recv_stats.copy_(raw_expert_counts)
+        if do_expand:
+            recv_x, recv_topk_weights, recv_src_metadata, psum_expert = self._make_expanded_dispatch(
+                recv_x, recv_topk_idx, recv_topk_weights, recv_src_metadata, raw_expert_counts, int(expert_alignment)
+            )
+            recv_topk_idx = None
+            expert_counts = raw_expert_counts.cpu().tolist()
         local_expert_begin = (self.rank_idx * int(num_experts)) // self.num_ranks
         local_expert_end = ((self.rank_idx + 1) * int(num_experts)) // self.num_ranks
-        psum_expert = torch.cumsum(layout[2][local_expert_begin:local_expert_end], 0)
-        recv_src_metadata = legacy_handle[-2] if isinstance(legacy_handle, tuple) and len(legacy_handle) >= 2 else torch.empty(0, dtype=torch.int32, device=x_tensor.device)
-        dst_buffer_slot_idx = torch.empty(0, dtype=torch.int32, device=x_tensor.device)
         new_handle = EPHandle(
-            False,
+            bool(do_expand),
             int(num_experts),
             int(expert_alignment),
             int(num_max_tokens_per_rank),
             int(num_sms or UcclBuffer.num_sms),
             topk_idx.clone() if do_handle_copy else topk_idx,
-            recv_counts,
+            expert_counts,
             psum_scaleup,
             psum_expert,
             recv_src_metadata,
@@ -301,6 +441,9 @@ class ElasticBuffer:
             None,
             proxy_handle=legacy_handle,
         )
+        if not do_expand:
+            new_handle._cached_recv_topk_idx = recv_topk_idx
+            new_handle._cached_recv_topk_weights = recv_topk_weights
         return recv_x, recv_topk_idx, recv_topk_weights, new_handle, event
 
     def combine(
@@ -319,6 +462,15 @@ class ElasticBuffer:
         if handle.proxy_handle is None:
             raise RuntimeError("UCCL AWS combine requires a dispatch handle from this backend")
         legacy = self._ensure_legacy_buffer(int(x.size(1)))
+        if handle.do_expand:
+            num_topk = int(handle.topk_idx.size(1))
+            slots = handle.recv_src_metadata[:, 2 : 2 + num_topk].to(torch.long)
+            valid = slots >= 0
+            safe_slots = slots.clamp_min(0)
+            gathered = x[safe_slots]
+            gathered = gathered.masked_fill(~valid.unsqueeze(-1), 0)
+            x = gathered.sum(dim=1)
+            topk_weights = None
         return legacy.combine(
             x,
             handle.proxy_handle,
@@ -326,11 +478,17 @@ class ElasticBuffer:
             bias=bias,
             config=legacy.get_combine_config(self.num_ranks),
             previous_event=previous_event,
-            async_finish=async_with_compute_stream,
-            allocate_on_comm_stream=allocate_on_comm_stream,
+            async_finish=bool(async_with_compute_stream),
+            allocate_on_comm_stream=bool(allocate_on_comm_stream),
         )
 
 
 def _align_2mb(value: int) -> int:
     alignment = 2 * 1024 * 1024
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def _align(value: int, alignment: int) -> int:
+    if alignment <= 1:
+        return int(value)
+    return ((int(value) + alignment - 1) // alignment) * alignment
