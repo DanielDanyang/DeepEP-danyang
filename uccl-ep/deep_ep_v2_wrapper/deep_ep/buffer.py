@@ -125,7 +125,7 @@ class Buffer:
                     )
 
             if num_rdma_bytes > 0 and rdma_buffer_is_host_allocated:
-                # Host-pinned fallback for platforms/NICs that cannot register GPU memory.
+                # Host-pinned RDMA buffer for NICs that cannot register GPU memory.
                 self.scratch = torch.zeros(
                     (num_rdma_bytes,),
                     dtype=torch.uint8,
@@ -228,6 +228,86 @@ class Buffer:
 
     def connect_atomic_buffer(self, proxy: "ep.UcclProxy"):
         ep.connect_atomic_buffer(proxy, self.runtime)
+
+    def build_v2_dispatch_metadata(
+        self,
+        recv_src_meta: torch.Tensor,
+        recv_topk_idx: torch.Tensor,
+        num_scaleup_ranks: int,
+        num_local_experts: int,
+        num_max_tokens_per_rank: int,
+        expert_alignment: int,
+        previous_event: Optional[EventOverlap] = None,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ):
+        alloc_ctx = (
+            torch.cuda.stream(self.get_comm_stream())
+            if allocate_on_comm_stream
+            else nullcontext()
+        )
+        num_recv_tokens = int(recv_topk_idx.size(0))
+        num_topk = int(recv_topk_idx.size(1))
+        with alloc_ctx:
+            recv_src_metadata = torch.empty(
+                (max(num_recv_tokens, 1), 2 + num_topk),
+                dtype=torch.int32,
+                device=recv_topk_idx.device,
+            )
+            psum_scaleup = torch.empty(
+                (num_scaleup_ranks,), dtype=torch.int32, device=recv_topk_idx.device
+            )
+            psum_expert = torch.empty(
+                (num_local_experts,), dtype=torch.int32, device=recv_topk_idx.device
+            )
+            dst_buffer_slot_idx = torch.empty(
+                (max(num_recv_tokens, 1),), dtype=torch.int32, device=recv_topk_idx.device
+            )
+            raw_expert_counts = torch.empty(
+                (num_local_experts,), dtype=torch.int32, device=recv_topk_idx.device
+            )
+            expanded_expert_cursor = torch.empty(
+                (num_local_experts,), dtype=torch.int32, device=recv_topk_idx.device
+            )
+
+        event = self.runtime.build_v2_dispatch_metadata(
+            recv_src_meta.data_ptr(),
+            recv_topk_idx.data_ptr(),
+            num_recv_tokens,
+            num_topk,
+            int(num_scaleup_ranks),
+            int(num_local_experts),
+            int(num_max_tokens_per_rank),
+            int(expert_alignment),
+            recv_src_metadata.data_ptr(),
+            psum_scaleup.data_ptr(),
+            psum_expert.data_ptr(),
+            dst_buffer_slot_idx.data_ptr(),
+            raw_expert_counts.data_ptr(),
+            expanded_expert_cursor.data_ptr(),
+            getattr(previous_event, "event", None),
+            bool(async_finish),
+            bool(allocate_on_comm_stream),
+            self._ll_compute_stream_ptr(recv_topk_idx.device),
+        )
+        tensors_to_record = (
+            recv_src_meta,
+            recv_topk_idx,
+            recv_src_metadata,
+            psum_scaleup,
+            psum_expert,
+            dst_buffer_slot_idx,
+            raw_expert_counts,
+            expanded_expert_cursor,
+        )
+        return (
+            recv_src_metadata[:num_recv_tokens],
+            psum_scaleup,
+            psum_expert,
+            dst_buffer_slot_idx[:num_recv_tokens],
+            raw_expert_counts,
+            EventOverlap(event, tensors_to_record if async_finish else None),
+        )
 
     def destroy(self):
         """

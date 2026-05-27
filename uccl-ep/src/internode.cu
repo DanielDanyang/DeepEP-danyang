@@ -14,7 +14,7 @@ namespace uccl {
 namespace internode {
 
 struct SourceMeta {
-  int src_rdma_rank, is_token_in_nvl_rank_bits;
+  int src_rdma_rank, is_token_in_nvl_rank_bits, src_nvl_rank, src_token_idx;
 
   EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8,
                    "Invalid number of maximum NVL peers");
@@ -22,9 +22,12 @@ struct SourceMeta {
   __forceinline__ SourceMeta() = default;
 
   // TODO: faster encoding
-  __device__ __forceinline__ SourceMeta(int rdma_rank,
+  __device__ __forceinline__ SourceMeta(int rdma_rank, int nvl_rank,
+                                        int token_idx,
                                         bool const* is_token_in_nvl_ranks) {
     src_rdma_rank = rdma_rank;
+    src_nvl_rank = nvl_rank;
+    src_token_idx = token_idx;
     is_token_in_nvl_rank_bits = is_token_in_nvl_ranks[0];
 #pragma unroll
     for (int i = 1; i < NUM_MAX_NVL_PEERS; ++i)
@@ -40,6 +43,123 @@ EP_STATIC_ASSERT(sizeof(SourceMeta) % sizeof(int) == 0,
                  "Invalid size of `SourceMeta`");
 
 int get_source_meta_bytes() { return sizeof(SourceMeta); }
+
+__host__ __device__ __forceinline__ int v2_align_int(int value,
+                                                     int alignment) {
+  return alignment <= 1 ? value : (value + alignment - 1) / alignment * alignment;
+}
+
+__global__ void v2_metadata_count_kernel(
+    SourceMeta const* recv_src_meta, int64_t const* recv_topk_idx,
+    int num_recv_tokens, int num_topk, int num_scaleup_ranks,
+    int num_local_experts, int num_max_tokens_per_rank, int* recv_src_metadata,
+    int* scaleup_counts, int* raw_expert_counts, int* dst_buffer_slot_idx) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_recv_tokens) return;
+
+  SourceMeta meta = recv_src_meta[idx];
+  int src_rank = meta.src_rdma_rank * NUM_MAX_NVL_PEERS + meta.src_nvl_rank;
+  recv_src_metadata[idx * (2 + num_topk)] =
+      src_rank * num_max_tokens_per_rank + meta.src_token_idx;
+  recv_src_metadata[idx * (2 + num_topk) + 1] = idx;
+  dst_buffer_slot_idx[idx] = idx;
+  atomicAdd(scaleup_counts + (src_rank % num_scaleup_ranks), 1);
+
+  for (int i = 0; i < num_topk; ++i) {
+    int expert = static_cast<int>(recv_topk_idx[idx * num_topk + i]);
+    recv_src_metadata[idx * (2 + num_topk) + 2 + i] = -1;
+    if (0 <= expert && expert < num_local_experts)
+      atomicAdd(raw_expert_counts + expert, 1);
+  }
+}
+
+__global__ void v2_metadata_prefix_kernel(
+    int* scaleup_counts, int* raw_expert_counts, int* psum_scaleup,
+    int* psum_expert, int* expanded_expert_cursor, int num_scaleup_ranks,
+    int num_local_experts, int expert_alignment) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+  int sum = 0;
+  for (int i = 0; i < num_scaleup_ranks; ++i) {
+    sum += scaleup_counts[i];
+    psum_scaleup[i] = sum;
+  }
+
+  int cursor = 0;
+  for (int i = 0; i < num_local_experts; ++i) {
+    cursor = v2_align_int(cursor, expert_alignment);
+    expanded_expert_cursor[i] = cursor;
+    cursor += raw_expert_counts[i];
+    psum_expert[i] = cursor;
+  }
+}
+
+__global__ void v2_metadata_expanded_slot_kernel(
+    int64_t const* recv_topk_idx, int num_recv_tokens, int num_topk,
+    int num_local_experts, int* recv_src_metadata, int* expanded_expert_cursor) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_recv_tokens * num_topk) return;
+
+  int token_idx = idx / num_topk;
+  int topk_idx = idx % num_topk;
+  int expert = static_cast<int>(recv_topk_idx[idx]);
+  if (0 <= expert && expert < num_local_experts) {
+    int slot = atomicAdd(expanded_expert_cursor + expert, 1);
+    recv_src_metadata[token_idx * (2 + num_topk) + 2 + topk_idx] = slot;
+  }
+}
+
+void build_v2_dispatch_metadata(
+    void const* recv_src_meta, int64_t const* recv_topk_idx,
+    int num_recv_tokens, int num_topk, int num_scaleup_ranks,
+    int num_local_experts, int num_max_tokens_per_rank, int expert_alignment,
+    int* recv_src_metadata, int* psum_num_recv_tokens_per_scaleup_rank,
+    int* psum_num_recv_tokens_per_expert, int* dst_buffer_slot_idx,
+    int* raw_num_recv_tokens_per_expert, int* expanded_expert_cursor, int rank,
+    cudaStream_t stream) {
+  (void)rank;
+  if (num_recv_tokens <= 0) {
+    CUDA_CHECK(cudaMemsetAsync(psum_num_recv_tokens_per_scaleup_rank, 0,
+                              num_scaleup_ranks * sizeof(int), stream));
+    CUDA_CHECK(cudaMemsetAsync(psum_num_recv_tokens_per_expert, 0,
+                              num_local_experts * sizeof(int), stream));
+    CUDA_CHECK(cudaMemsetAsync(raw_num_recv_tokens_per_expert, 0,
+                              num_local_experts * sizeof(int), stream));
+    CUDA_CHECK(cudaMemsetAsync(expanded_expert_cursor, 0,
+                              num_local_experts * sizeof(int), stream));
+    return;
+  }
+
+  CUDA_CHECK(cudaMemsetAsync(psum_num_recv_tokens_per_scaleup_rank, 0,
+                            num_scaleup_ranks * sizeof(int), stream));
+  CUDA_CHECK(cudaMemsetAsync(raw_num_recv_tokens_per_expert, 0,
+                            num_local_experts * sizeof(int), stream));
+  CUDA_CHECK(cudaMemsetAsync(expanded_expert_cursor, 0,
+                            num_local_experts * sizeof(int), stream));
+
+  constexpr int kThreads = 256;
+  v2_metadata_count_kernel<<<(num_recv_tokens + kThreads - 1) / kThreads,
+                             kThreads, 0, stream>>>(
+      reinterpret_cast<SourceMeta const*>(recv_src_meta), recv_topk_idx,
+      num_recv_tokens, num_topk, num_scaleup_ranks, num_local_experts,
+      num_max_tokens_per_rank, recv_src_metadata,
+      psum_num_recv_tokens_per_scaleup_rank, raw_num_recv_tokens_per_expert,
+      dst_buffer_slot_idx);
+  CUDA_CHECK(cudaGetLastError());
+
+  v2_metadata_prefix_kernel<<<1, 1, 0, stream>>>(
+      psum_num_recv_tokens_per_scaleup_rank, raw_num_recv_tokens_per_expert,
+      psum_num_recv_tokens_per_scaleup_rank,
+      psum_num_recv_tokens_per_expert, expanded_expert_cursor,
+      num_scaleup_ranks, num_local_experts, expert_alignment);
+  CUDA_CHECK(cudaGetLastError());
+
+  v2_metadata_expanded_slot_kernel<<<
+      (num_recv_tokens * num_topk + kThreads - 1) / kThreads, kThreads, 0,
+      stream>>>(recv_topk_idx, num_recv_tokens, num_topk, num_local_experts,
+                recv_src_metadata, expanded_expert_cursor);
+  CUDA_CHECK(cudaGetLastError());
+}
 
 __host__ __device__ __forceinline__ int get_num_bytes_per_token(
     int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
@@ -864,7 +984,8 @@ __global__ void __launch_bounds__(
           auto recv_is_token_in_rank_values =
               reinterpret_cast<bool const*>(&recv_is_token_in_rank_uint64);
           if (lane_id == num_topk_ranks)
-            src_meta = SourceMeta(rdma_rank, recv_is_token_in_rank_values);
+            src_meta = SourceMeta(rdma_rank, nvl_rank, token_idx,
+                                  recv_is_token_in_rank_values);
           dst_send_buffers[num_topk_ranks++] =
               reinterpret_cast<uint8_t*>(broadcast(send_buffer, i)) +
               slot_idx * num_bytes_per_token;

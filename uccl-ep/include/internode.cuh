@@ -14,6 +14,15 @@ struct SourceMeta;
 
 int get_source_meta_bytes();
 
+void build_v2_dispatch_metadata(
+    void const* recv_src_meta, int64_t const* recv_topk_idx,
+    int num_recv_tokens, int num_topk, int num_scaleup_ranks,
+    int num_local_experts, int num_max_tokens_per_rank, int expert_alignment,
+    int* recv_src_metadata, int* psum_num_recv_tokens_per_scaleup_rank,
+    int* psum_num_recv_tokens_per_expert, int* dst_buffer_slot_idx,
+    int* raw_num_recv_tokens_per_expert, int* expanded_expert_cursor,
+    int rank, cudaStream_t stream);
+
 __host__ __device__ __forceinline__ int get_num_bytes_per_token(
     int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights);
 
