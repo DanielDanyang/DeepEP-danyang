@@ -234,41 +234,6 @@ class ElasticBuffer:
             raw_expert_counts,
         )
 
-    def _make_expanded_dispatch(
-        self,
-        recv_x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        recv_topk_idx: torch.Tensor,
-        recv_topk_weights: Optional[torch.Tensor],
-        recv_metadata: torch.Tensor,
-        psum_expert: torch.Tensor,
-    ) -> tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-        # TODO: move expanded payload scatter into the dispatch epilogue.
-        # Metadata slots are already generated in native code.
-        x_tensor, sf = recv_x if isinstance(recv_x, tuple) else (recv_x, None)
-        num_recv_tokens, hidden = x_tensor.shape
-        num_topk = int(recv_topk_idx.size(1))
-        num_expanded_tokens = max(int(psum_expert[-1].item()), 1)
-
-        expanded_x = torch.empty((num_expanded_tokens, hidden), dtype=x_tensor.dtype, device=x_tensor.device)
-        expanded_sf = (
-            None if sf is None else torch.empty((num_expanded_tokens,) + tuple(sf.shape[1:]), dtype=sf.dtype, device=sf.device)
-        )
-        expanded_weights = (
-            None if recv_topk_weights is None else torch.empty((num_expanded_tokens,), dtype=recv_topk_weights.dtype, device=recv_topk_weights.device)
-        )
-        slots = recv_metadata[:, 2 : 2 + num_topk].to(torch.long)
-        valid = slots >= 0
-        token_indices = torch.arange(num_recv_tokens, device=x_tensor.device).view(-1, 1).expand(-1, num_topk)
-        flat_slots = slots[valid]
-        flat_tokens = token_indices[valid]
-        expanded_x[flat_slots] = x_tensor[flat_tokens]
-        if expanded_sf is not None:
-            expanded_sf[flat_slots] = sf[flat_tokens]
-        if expanded_weights is not None:
-            expanded_weights[flat_slots] = recv_topk_weights[valid]
-        packed_x = (expanded_x, expanded_sf) if expanded_sf is not None else expanded_x
-        return packed_x, expanded_weights, recv_metadata, psum_expert
-
     def get_physical_domain_size(self) -> Tuple[int, int]:
         return self.num_rdma_ranks, self.num_nvlink_ranks
 
@@ -363,9 +328,16 @@ class ElasticBuffer:
             torch.tensor(expert_counts, dtype=torch.int32, device=x_tensor.device), 0
         )
         if do_expand:
-            recv_x, recv_topk_weights, recv_src_metadata, psum_expert = self._make_expanded_dispatch(
-                recv_x, recv_topk_idx, recv_topk_weights, recv_src_metadata, expanded_psum_expert
+            recv_x, recv_topk_weights, _payload_event = legacy.build_v2_expanded_payload(
+                recv_x,
+                recv_topk_idx,
+                recv_topk_weights,
+                recv_src_metadata,
+                expanded_psum_expert,
+                previous_event=None,
+                async_finish=False,
             )
+            psum_expert = expanded_psum_expert
             recv_topk_idx = None
             expert_counts = raw_expert_counts.cpu().tolist()
         new_handle = EPHandle(

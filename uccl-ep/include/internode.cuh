@@ -23,6 +23,13 @@ void build_v2_dispatch_metadata(
     int* raw_num_recv_tokens_per_expert, int* expanded_expert_cursor,
     int rank, cudaStream_t stream);
 
+void build_v2_expanded_payload(
+    void const* recv_x, float const* recv_x_scales,
+    float const* recv_topk_weights, int const* recv_src_metadata,
+    int num_recv_tokens, int num_topk, int hidden_bytes, int num_scales,
+    void* expanded_x, float* expanded_x_scales, float* expanded_topk_weights,
+    cudaStream_t stream);
+
 __host__ __device__ __forceinline__ int get_num_bytes_per_token(
     int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights);
 

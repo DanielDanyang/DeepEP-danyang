@@ -161,6 +161,58 @@ void build_v2_dispatch_metadata(
   CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void v2_expanded_payload_kernel(
+    uint8_t const* recv_x, float const* recv_x_scales,
+    float const* recv_topk_weights, int const* recv_src_metadata,
+    int num_recv_tokens, int num_topk, int hidden_int4, int hidden_bytes,
+    int num_scales, uint8_t* expanded_x, float* expanded_x_scales,
+    float* expanded_topk_weights) {
+  int pair_idx = blockIdx.x;
+  if (pair_idx >= num_recv_tokens * num_topk) return;
+
+  int token_idx = pair_idx / num_topk;
+  int topk_idx = pair_idx % num_topk;
+  int slot =
+      recv_src_metadata[token_idx * (2 + num_topk) + 2 + topk_idx];
+  if (slot < 0) return;
+
+  auto src_x = reinterpret_cast<int4 const*>(recv_x + token_idx * hidden_bytes);
+  auto dst_x = reinterpret_cast<int4*>(expanded_x + slot * hidden_bytes);
+  for (int i = threadIdx.x; i < hidden_int4; i += blockDim.x)
+    dst_x[i] = src_x[i];
+
+  if (recv_x_scales != nullptr && expanded_x_scales != nullptr) {
+    for (int i = threadIdx.x; i < num_scales; i += blockDim.x)
+      expanded_x_scales[slot * num_scales + i] =
+          recv_x_scales[token_idx * num_scales + i];
+  }
+
+  if (threadIdx.x == 0 && recv_topk_weights != nullptr &&
+      expanded_topk_weights != nullptr) {
+    expanded_topk_weights[slot] =
+        recv_topk_weights[token_idx * num_topk + topk_idx];
+  }
+}
+
+void build_v2_expanded_payload(
+    void const* recv_x, float const* recv_x_scales,
+    float const* recv_topk_weights, int const* recv_src_metadata,
+    int num_recv_tokens, int num_topk, int hidden_bytes, int num_scales,
+    void* expanded_x, float* expanded_x_scales, float* expanded_topk_weights,
+    cudaStream_t stream) {
+  if (num_recv_tokens <= 0) return;
+  EP_HOST_ASSERT(hidden_bytes % sizeof(int4) == 0);
+  constexpr int kThreads = 256;
+  v2_expanded_payload_kernel<<<num_recv_tokens * num_topk, kThreads, 0,
+                               stream>>>(
+      reinterpret_cast<uint8_t const*>(recv_x), recv_x_scales,
+      recv_topk_weights, recv_src_metadata, num_recv_tokens, num_topk,
+      hidden_bytes / static_cast<int>(sizeof(int4)), hidden_bytes, num_scales,
+      reinterpret_cast<uint8_t*>(expanded_x), expanded_x_scales,
+      expanded_topk_weights);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 __host__ __device__ __forceinline__ int get_num_bytes_per_token(
     int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
   return static_cast<int>(

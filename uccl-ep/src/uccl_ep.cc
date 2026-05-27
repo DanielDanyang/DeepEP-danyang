@@ -1224,6 +1224,57 @@ class Buffer {
     return event;
   }
 
+  std::optional<EventHandle> build_v2_expanded_payload(
+      std::uintptr_t recv_x_ptr, std::uintptr_t recv_x_scales_ptr,
+      std::uintptr_t recv_topk_weights_ptr,
+      std::uintptr_t recv_src_metadata_ptr, int num_recv_tokens, int num_topk,
+      int hidden_bytes, int num_scales, std::uintptr_t expanded_x_ptr,
+      std::uintptr_t expanded_x_scales_ptr,
+      std::uintptr_t expanded_topk_weights_ptr,
+      std::optional<EventHandle>& previous_event, bool async,
+      bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
+    EP_HOST_ASSERT(recv_x_ptr != 0);
+    EP_HOST_ASSERT(recv_src_metadata_ptr != 0);
+    EP_HOST_ASSERT(expanded_x_ptr != 0);
+    EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 && hidden_bytes > 0 &&
+                   num_scales >= 0);
+
+    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
+    static_cast<void>(allocate_on_comm_stream);
+    if (previous_event.has_value()) {
+      stream_wait(comm_stream, previous_event.value());
+    } else {
+      stream_wait(comm_stream, compute_stream);
+    }
+
+    uccl::internode::build_v2_expanded_payload(
+        reinterpret_cast<void const*>(recv_x_ptr),
+        recv_x_scales_ptr == 0 ? nullptr
+                               : reinterpret_cast<float const*>(
+                                     recv_x_scales_ptr),
+        recv_topk_weights_ptr == 0
+            ? nullptr
+            : reinterpret_cast<float const*>(recv_topk_weights_ptr),
+        reinterpret_cast<int const*>(recv_src_metadata_ptr), num_recv_tokens,
+        num_topk, hidden_bytes, num_scales,
+        reinterpret_cast<void*>(expanded_x_ptr),
+        expanded_x_scales_ptr == 0
+            ? nullptr
+            : reinterpret_cast<float*>(expanded_x_scales_ptr),
+        expanded_topk_weights_ptr == 0
+            ? nullptr
+            : reinterpret_cast<float*>(expanded_topk_weights_ptr),
+        comm_stream);
+
+    std::optional<EventHandle> event;
+    if (async) {
+      event = EventHandle(comm_stream);
+    } else {
+      stream_wait(compute_stream, comm_stream);
+    }
+    return event;
+  }
+
   std::optional<EventHandle> internode_combine(
       std::uintptr_t x_ptr, int num_tokens, int hidden, int x_dtype_code,
       int x_element_size, std::uintptr_t topk_weights_ptr, int num_topk,
@@ -2396,6 +2447,40 @@ NB_MODULE(ep, m) {
           nb::arg("dst_buffer_slot_idx_ptr"),
           nb::arg("raw_num_recv_tokens_per_expert_ptr"),
           nb::arg("expanded_expert_cursor_ptr"),
+          nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
+          nb::arg("allocate_on_comm_stream") = false,
+          nb::arg("compute_stream_ptr") = 0)
+      .def(
+          "build_v2_expanded_payload",
+          [](Buffer& self, std::uintptr_t recv_x_ptr,
+             std::uintptr_t recv_x_scales_ptr,
+             std::uintptr_t recv_topk_weights_ptr,
+             std::uintptr_t recv_src_metadata_ptr, int num_recv_tokens,
+             int num_topk, int hidden_bytes, int num_scales,
+             std::uintptr_t expanded_x_ptr,
+             std::uintptr_t expanded_x_scales_ptr,
+             std::uintptr_t expanded_topk_weights_ptr,
+             nb::object previous_event, bool async,
+             bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
+            std::optional<EventHandle> prev;
+            if (!previous_event.is_none()) {
+              EventHandle ev = nb::cast<EventHandle>(previous_event);
+              prev = ev;
+            }
+            return self.build_v2_expanded_payload(
+                recv_x_ptr, recv_x_scales_ptr, recv_topk_weights_ptr,
+                recv_src_metadata_ptr, num_recv_tokens, num_topk,
+                hidden_bytes, num_scales, expanded_x_ptr,
+                expanded_x_scales_ptr, expanded_topk_weights_ptr, prev,
+                async, allocate_on_comm_stream, compute_stream_ptr);
+          },
+          nb::arg("recv_x_ptr"), nb::arg("recv_x_scales_ptr"),
+          nb::arg("recv_topk_weights_ptr"),
+          nb::arg("recv_src_metadata_ptr"), nb::arg("num_recv_tokens"),
+          nb::arg("num_topk"), nb::arg("hidden_bytes"),
+          nb::arg("num_scales"), nb::arg("expanded_x_ptr"),
+          nb::arg("expanded_x_scales_ptr"),
+          nb::arg("expanded_topk_weights_ptr"),
           nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
           nb::arg("allocate_on_comm_stream") = false,
           nb::arg("compute_stream_ptr") = 0)

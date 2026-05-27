@@ -309,6 +309,96 @@ class Buffer:
             EventOverlap(event, tensors_to_record if async_finish else None),
         )
 
+    def build_v2_expanded_payload(
+        self,
+        recv_x,
+        recv_topk_idx: torch.Tensor,
+        recv_topk_weights: Optional[torch.Tensor],
+        recv_src_metadata: torch.Tensor,
+        psum_num_recv_tokens_per_expert: torch.Tensor,
+        previous_event: Optional[EventOverlap] = None,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ):
+        x_tensor, x_scales = recv_x if isinstance(recv_x, tuple) else (recv_x, None)
+        num_recv_tokens, hidden = x_tensor.shape
+        num_topk = int(recv_topk_idx.size(1))
+        num_expanded_tokens = max(int(psum_num_recv_tokens_per_expert[-1].item()), 1)
+        num_scales = 0
+        scale_tail_shape = ()
+        if x_scales is not None:
+            scale_tail_shape = tuple(x_scales.shape[1:])
+            num_scales = 1
+            for dim in scale_tail_shape:
+                num_scales *= int(dim)
+
+        alloc_ctx = (
+            torch.cuda.stream(self.get_comm_stream())
+            if allocate_on_comm_stream
+            else nullcontext()
+        )
+        with alloc_ctx:
+            expanded_x = torch.empty(
+                (num_expanded_tokens, hidden),
+                dtype=x_tensor.dtype,
+                device=x_tensor.device,
+            )
+            expanded_scales = (
+                None
+                if x_scales is None
+                else torch.empty(
+                    (num_expanded_tokens,) + scale_tail_shape,
+                    dtype=x_scales.dtype,
+                    device=x_scales.device,
+                )
+            )
+            expanded_weights = (
+                None
+                if recv_topk_weights is None
+                else torch.empty(
+                    (num_expanded_tokens,),
+                    dtype=recv_topk_weights.dtype,
+                    device=recv_topk_weights.device,
+                )
+            )
+
+        event = self.runtime.build_v2_expanded_payload(
+            x_tensor.data_ptr(),
+            0 if x_scales is None else x_scales.data_ptr(),
+            0 if recv_topk_weights is None else recv_topk_weights.data_ptr(),
+            recv_src_metadata.data_ptr(),
+            num_recv_tokens,
+            num_topk,
+            int(hidden * x_tensor.element_size()),
+            int(num_scales),
+            expanded_x.data_ptr(),
+            0 if expanded_scales is None else expanded_scales.data_ptr(),
+            0 if expanded_weights is None else expanded_weights.data_ptr(),
+            getattr(previous_event, "event", None),
+            bool(async_finish),
+            bool(allocate_on_comm_stream),
+            self._ll_compute_stream_ptr(x_tensor.device),
+        )
+        packed_x = (
+            (expanded_x, expanded_scales)
+            if expanded_scales is not None
+            else expanded_x
+        )
+        tensors_to_record = (
+            x_tensor,
+            x_scales,
+            recv_topk_idx,
+            recv_topk_weights,
+            recv_src_metadata,
+            psum_num_recv_tokens_per_expert,
+            expanded_x,
+            expanded_scales,
+            expanded_weights,
+        )
+        return packed_x, expanded_weights, EventOverlap(
+            event, tensors_to_record if async_finish else None
+        )
+
     def destroy(self):
         """
         Destroy the cpp runtime and release resources.
