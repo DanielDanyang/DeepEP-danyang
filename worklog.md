@@ -485,3 +485,42 @@ Benchmark 结果：
 - 这是 Python 原型兼容层：metadata 构造、expanded scatter/fold 仍在 Python/PyTorch 里做，不是最终性能路径。
 - 官方全矩阵 case 尚未跑完；目前只保证 first-case correctness。
 - 下一步性能目标仍是把这些 V2 metadata/expanded 语义下沉到 native/CUDA，并复用已验证的 UCCL HT EFA proxy 数据面。
+
+## 2026-05-27 V2 wrapper performance probe
+
+官方 perf 尝试：
+
+- 命令：官方 `tests/elastic/test_ep.py --num-processes 8 --test-first-only --skip-check --num-tokens 4096 --hidden 7168 --num-topk 8 --num-experts 256 --num-sms 24 --ignore-local-traffic`。
+- 日志：
+  - `/tmp/v2_official_perf_rank0.log`
+  - `/tmp/v2_official_perf_rank1.log`
+- 结果：失败在 perf 打印阶段，`bench_kineto` 按 DeepEP V2 原生 kernel 名 `dispatch_impl` / `dispatch_copy_epilogue_impl` 搜索，但 UCCL HT kernel 名不同，导致测得 `t=0`，最终 `ZeroDivisionError`。
+- 结论：这不是 transport 失败，而是官方 profiler 需要为 UCCL backend 增加 kernel-name adapter，或给 UCCL wrapper 单独写 benchmark 打印逻辑。
+
+自定义 V2 wrapper smoke benchmark：
+
+- 脚本：`uccl-ep/bench/v2_proxy_smoke.py`
+- 新增输出 cached dispatch wall time：cached path 复用 V2 handle，跳过 Python layout 和 V2 metadata 重建，主要测 UCCL legacy cached dispatch 数据面。
+- 4096 tokens:
+  - 日志：
+    - `/tmp/v2_proxy_smoke_4096_cached_rank0.log`
+    - `/tmp/v2_proxy_smoke_4096_cached_rank1.log`
+  - `rank=0/16`: `recv=(26718, 7168)`, `dispatch_avg_ms=21.110`, `cached_dispatch_avg_ms=2.344`
+  - `rank=8/16`: `recv=(26835, 7168)`, `dispatch_avg_ms=21.213`, `cached_dispatch_avg_ms=2.085`
+  - 粗略按远端 BF16 payload 估算，cached dispatch 约 `25-28 GB/s`。
+- 8192 tokens:
+  - 日志：
+    - `/tmp/v2_proxy_smoke_8192_cached_rank0.log`
+    - `/tmp/v2_proxy_smoke_8192_cached_rank1.log`
+  - `rank=0/16`: `recv=(53780, 7168)`, `dispatch_avg_ms=25.920`, `cached_dispatch_avg_ms=5.584`
+  - `rank=8/16`: `recv=(53412, 7168)`, `dispatch_avg_ms=25.722`, `cached_dispatch_avg_ms=5.637`
+  - 粗略按远端 BF16 payload 估算，cached dispatch 约 `21 GB/s`。
+
+性能解释：
+
+- uncached wrapper dispatch 被 Python `_build_legacy_layout()`、`_build_v2_metadata()`、额外 source-id all-to-all、expanded metadata/scatter 语义拖慢，不能代表 UCCL 数据面。
+- cached wrapper dispatch 已明显好于 DeepEP V2 Gin proxy 的 `~5 GB/s` dispatch，但仍低于直接 UCCL-EP HT BF16 dispatch 的 `~59 GB/s`。
+- 要继续逼近 README SM90 EP16，下一步不是调环境变量，而是：
+  - 把 V2 metadata、source token id、expert prefix、expanded slot 生成下沉到 native/CUDA；
+  - 避免 Python `num_recv_tokens * topk` 循环；
+  - 给官方 perf 增加 UCCL kernel-name adapter，或让 UCCL backend 直接返回可计时的 event/kernel 名。

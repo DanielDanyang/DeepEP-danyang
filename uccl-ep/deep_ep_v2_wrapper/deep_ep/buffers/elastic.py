@@ -241,6 +241,18 @@ class ElasticBuffer:
         num_max_tokens_per_rank: int,
         expert_alignment: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
+        # 这是当前 Python 原型里最重要的 V2 语义补丁：
+        #
+        # UCCL legacy HT dispatch 返回的是 DeepEP v1 风格的 token payload 和
+        # local expert topk，不会生成 DeepEP V2 `EPHandle` 需要的
+        # `recv_src_metadata` / scaleup prefix / expert prefix。官方 V2
+        # combine 和 correctness test 都依赖这些字段，所以这里用和
+        # `deep_ep.utils.refs.dispatch` 相同的发送顺序重新 all-to-all 一份
+        # source token id。
+        #
+        # 注意：这一步现在故意放在 Python 中，目的是先把 API 语义跑通；
+        # 真正追 README 性能时必须下沉到 native/CUDA，否则 uncached dispatch
+        # 会被 Python 循环、CPU sync 和额外 NCCL all-to-all 卡住。
         num_topk = int(topk_idx.size(1))
         experts_per_rank = num_experts // self.num_ranks
         send_counts = torch.empty((self.num_ranks,), dtype=torch.int32, device=topk_idx.device)
@@ -307,6 +319,15 @@ class ElasticBuffer:
         raw_expert_counts: torch.Tensor,
         expert_alignment: int,
     ) -> tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        # DeepEP V2 expanded dispatch 的语义是“一条收到的 token 按命中的
+        # local expert 拆成多个 slot”。每个 token 的 metadata 第 2 列之后
+        # 记录这些 expanded slot，combine 时再按这些 slot 折回 per-token
+        # reduced tensor。
+        #
+        # 当前实现用 PyTorch row copy 做 scatter，只适合作 correctness
+        # 原型。长期方案应复用 UCCL/DeepEP dispatch epilogue，在 GPU kernel
+        # 中直接写 expanded slot 和 metadata，避免 Python 对
+        # `num_recv_tokens * topk` 的逐元素循环。
         x_tensor, sf = recv_x if isinstance(recv_x, tuple) else (recv_x, None)
         num_recv_tokens, hidden = x_tensor.shape
         num_topk = int(recv_topk_idx.size(1))
@@ -463,6 +484,10 @@ class ElasticBuffer:
             raise RuntimeError("UCCL AWS combine requires a dispatch handle from this backend")
         legacy = self._ensure_legacy_buffer(int(x.size(1)))
         if handle.do_expand:
+            # expanded combine 收到的是按 expert slot 排列的输入；UCCL
+            # legacy combine 需要 per-token reduced 输入。这里根据 V2
+            # metadata 把有效 slot gather 回来并按 topk 顺序求和，然后交给
+            # UCCL proxy/EFA 数据面做真正跨节点 combine。
             num_topk = int(handle.topk_idx.size(1))
             slots = handle.recv_src_metadata[:, 2 : 2 + num_topk].to(torch.long)
             valid = slots >= 0

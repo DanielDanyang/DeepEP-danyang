@@ -73,6 +73,7 @@ def main() -> None:
 
     ok = False
     recv_x = recv_topk_idx = recv_topk_weights = handle = combined_x = combined_topk_weights = None
+    cached_recv_x = cached_recv_topk_idx = cached_recv_topk_weights = cached_handle = None
     try:
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
             x=x,
@@ -93,6 +94,7 @@ def main() -> None:
         dist.barrier(group)
 
         elapsed = []
+        cached_elapsed = []
         for _ in range(args.iters):
             dist.barrier(group)
             torch.cuda.synchronize()
@@ -109,12 +111,24 @@ def main() -> None:
             torch.cuda.synchronize()
             elapsed.append(time.perf_counter() - t0)
 
+            dist.barrier(group)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            cached_recv_x, cached_recv_topk_idx, cached_recv_topk_weights, cached_handle, event = buffer.dispatch(
+                x=x,
+                handle=handle,
+            )
+            wait_event(event)
+            torch.cuda.synchronize()
+            cached_elapsed.append(time.perf_counter() - t0)
+
         avg_ms = sum(elapsed) / len(elapsed) * 1e3
+        cached_avg_ms = sum(cached_elapsed) / len(cached_elapsed) * 1e3
         if rank % int(os.environ["LOCAL_WORLD_SIZE"]) == 0:
             print(
                 f"[v2-proxy-smoke] rank={rank}/{world} local_rank={local_rank} "
                 f"recv={tuple(recv_x.shape)} combined={tuple(combined_x.shape)} "
-                f"dispatch_avg_ms={avg_ms:.3f}",
+                f"dispatch_avg_ms={avg_ms:.3f} cached_dispatch_avg_ms={cached_avg_ms:.3f}",
                 flush=True,
             )
         ok = True
@@ -122,6 +136,7 @@ def main() -> None:
         if ok:
             dist.barrier(group)
         del recv_x, recv_topk_idx, recv_topk_weights, handle, combined_x, combined_topk_weights
+        del cached_recv_x, cached_recv_topk_idx, cached_recv_topk_weights, cached_handle
         del x, topk_idx, topk_weights
         torch.cuda.synchronize()
         buffer.destroy()
