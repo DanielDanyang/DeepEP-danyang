@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -99,10 +100,9 @@ class ElasticBuffer:
         self._destroyed = False
 
         # These are logical V2 topology values for the initial p5en EP16 scope.
-        # AWS p5en 的目标形态是 8 GPU/node；小规模 smoke test 可能只有
-        # 1-2 个 rank，所以这里不能直接把 `torch.cuda.device_count()` 当成
-        # scaleup 域大小，否则 wrapper 会在 world_size < 8 时暴露假的 EP8。
-        local_world = int(torch.cuda.device_count())
+        # Prefer the launcher-provided local world size so reduced smoke tests
+        # such as 2 nodes x 2 ranks still expose a real scaleout dimension.
+        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", torch.cuda.device_count()))
 
         if not hasattr(ep, "ElasticProxyBuffer"):
             raise RuntimeError("uccl.ep native extension is missing ElasticProxyBuffer; rebuild uccl-ep")
