@@ -51,273 +51,6 @@ static std::mutex g_proxies_mu;
 struct EventOverlap {};
 static cudaDataType_t cuda_dtype_from_code(int dtype);
 
-class ElasticProxyBuffer {
- public:
-  ElasticProxyBuffer(int rank, int num_ranks, long num_bytes, int local_world,
-                     bool explicitly_destroy)
-      : rank_(rank),
-        num_ranks_(num_ranks),
-        num_bytes_(num_bytes),
-        local_world_(std::max(1, local_world)),
-        explicitly_destroy_(explicitly_destroy) {
-    if (rank_ < 0 || rank_ >= num_ranks_) {
-      throw std::invalid_argument("ElasticProxyBuffer rank out of range");
-    }
-    if (num_bytes_ <= 0) {
-      throw std::invalid_argument("ElasticProxyBuffer requires positive buffer bytes");
-    }
-    CUDA_CHECK(cudaGetDevice(&device_index_));
-    int least_priority = 0, greatest_priority = 0;
-    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority,
-                                                &greatest_priority));
-    CUDA_CHECK(cudaStreamCreateWithPriority(
-        &comm_stream_, cudaStreamNonBlocking, greatest_priority));
-  }
-
-  ~ElasticProxyBuffer() {
-    if (!destroyed_ && !explicitly_destroy_) destroy();
-  }
-
-  void destroy() {
-    if (destroyed_) return;
-    if (comm_stream_ != nullptr) {
-      CUDA_CHECK(cudaStreamDestroy(comm_stream_));
-      comm_stream_ = nullptr;
-    }
-    destroyed_ = true;
-  }
-  bool is_available() const { return !destroyed_; }
-
-  std::tuple<int, int> get_physical_domain_size() const {
-    return {num_scaleout_ranks(), num_scaleup_ranks()};
-  }
-
-  std::tuple<int, int> get_logical_domain_size() const {
-    return {num_scaleout_ranks(), num_scaleup_ranks()};
-  }
-
-  int rank() const { return rank_; }
-  int num_ranks() const { return num_ranks_; }
-  long num_bytes() const { return num_bytes_; }
-  std::uintptr_t get_comm_stream() const {
-    return reinterpret_cast<std::uintptr_t>(comm_stream_);
-  }
-  int num_scaleout_ranks() const {
-    return std::max(1, num_ranks_ / num_scaleup_ranks());
-  }
-  int num_scaleup_ranks() const { return std::min(local_world_, num_ranks_); }
-  int scaleout_rank() const { return rank_ / num_scaleup_ranks(); }
-  int scaleup_rank() const { return rank_ % num_scaleup_ranks(); }
-
-  std::optional<EventHandle> build_v2_dispatch_metadata(
-      std::uintptr_t recv_src_meta_ptr, std::uintptr_t recv_topk_idx_ptr,
-      int num_recv_tokens, int num_topk, int num_scaleup_ranks,
-      int num_local_experts, int num_max_tokens_per_rank, int expert_alignment,
-      std::uintptr_t recv_src_metadata_ptr,
-      std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
-      std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
-      std::uintptr_t dst_buffer_slot_idx_ptr,
-      std::uintptr_t raw_num_recv_tokens_per_expert_ptr,
-      std::uintptr_t expanded_expert_cursor_ptr,
-      std::optional<EventHandle>& previous_event, bool async,
-      bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
-    EP_HOST_ASSERT(recv_src_metadata_ptr != 0);
-    EP_HOST_ASSERT(psum_num_recv_tokens_per_scaleup_rank_ptr != 0);
-    EP_HOST_ASSERT(psum_num_recv_tokens_per_expert_ptr != 0);
-    EP_HOST_ASSERT(dst_buffer_slot_idx_ptr != 0);
-    EP_HOST_ASSERT(raw_num_recv_tokens_per_expert_ptr != 0);
-    EP_HOST_ASSERT(expanded_expert_cursor_ptr != 0);
-    EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 &&
-                   num_scaleup_ranks > 0 && num_local_experts > 0 &&
-                   num_max_tokens_per_rank > 0);
-    if (num_recv_tokens > 0) {
-      EP_HOST_ASSERT(recv_src_meta_ptr != 0);
-      EP_HOST_ASSERT(recv_topk_idx_ptr != 0);
-    }
-
-    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    static_cast<void>(allocate_on_comm_stream);
-    if (previous_event.has_value()) {
-      stream_wait(comm_stream_, previous_event.value());
-    } else {
-      stream_wait(comm_stream_, compute_stream);
-    }
-
-    uccl::internode::build_v2_dispatch_metadata(
-        reinterpret_cast<void const*>(recv_src_meta_ptr),
-        reinterpret_cast<int64_t const*>(recv_topk_idx_ptr), num_recv_tokens,
-        num_topk, num_scaleup_ranks, num_local_experts,
-        num_max_tokens_per_rank, expert_alignment,
-        reinterpret_cast<int*>(recv_src_metadata_ptr),
-        reinterpret_cast<int*>(psum_num_recv_tokens_per_scaleup_rank_ptr),
-        reinterpret_cast<int*>(psum_num_recv_tokens_per_expert_ptr),
-        reinterpret_cast<int*>(dst_buffer_slot_idx_ptr),
-        reinterpret_cast<int*>(raw_num_recv_tokens_per_expert_ptr),
-        reinterpret_cast<int*>(expanded_expert_cursor_ptr), rank_,
-        comm_stream_);
-
-    std::optional<EventHandle> event;
-    if (async) {
-      event = EventHandle(comm_stream_);
-    } else {
-      stream_wait(compute_stream, comm_stream_);
-    }
-    return event;
-  }
-
-  std::optional<EventHandle> build_v2_intranode_dispatch_metadata(
-      std::uintptr_t recv_src_idx_ptr, std::uintptr_t rank_prefix_matrix_ptr,
-      std::uintptr_t recv_topk_idx_ptr, int num_recv_tokens, int num_topk,
-      int num_local_experts, int num_max_tokens_per_rank, int expert_alignment,
-      std::uintptr_t recv_src_metadata_ptr,
-      std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
-      std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
-      std::uintptr_t dst_buffer_slot_idx_ptr,
-      std::uintptr_t raw_num_recv_tokens_per_expert_ptr,
-      std::uintptr_t expanded_expert_cursor_ptr,
-      std::optional<EventHandle>& previous_event, bool async,
-      bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
-    EP_HOST_ASSERT(recv_src_metadata_ptr != 0);
-    EP_HOST_ASSERT(psum_num_recv_tokens_per_scaleup_rank_ptr != 0);
-    EP_HOST_ASSERT(psum_num_recv_tokens_per_expert_ptr != 0);
-    EP_HOST_ASSERT(dst_buffer_slot_idx_ptr != 0);
-    EP_HOST_ASSERT(raw_num_recv_tokens_per_expert_ptr != 0);
-    EP_HOST_ASSERT(expanded_expert_cursor_ptr != 0);
-    EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 &&
-                   num_local_experts > 0 && num_max_tokens_per_rank > 0);
-    if (num_recv_tokens > 0) {
-      EP_HOST_ASSERT(recv_src_idx_ptr != 0);
-      EP_HOST_ASSERT(rank_prefix_matrix_ptr != 0);
-      EP_HOST_ASSERT(recv_topk_idx_ptr != 0);
-    }
-
-    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    static_cast<void>(allocate_on_comm_stream);
-    if (previous_event.has_value()) {
-      stream_wait(comm_stream_, previous_event.value());
-    } else {
-      stream_wait(comm_stream_, compute_stream);
-    }
-
-    uccl::internode::build_v2_intranode_dispatch_metadata(
-        reinterpret_cast<int const*>(recv_src_idx_ptr),
-        reinterpret_cast<int const*>(rank_prefix_matrix_ptr),
-        reinterpret_cast<int64_t const*>(recv_topk_idx_ptr), num_recv_tokens,
-        num_topk, num_ranks_, num_scaleup_ranks(), num_local_experts,
-        num_max_tokens_per_rank, expert_alignment,
-        reinterpret_cast<int*>(recv_src_metadata_ptr),
-        reinterpret_cast<int*>(psum_num_recv_tokens_per_scaleup_rank_ptr),
-        reinterpret_cast<int*>(psum_num_recv_tokens_per_expert_ptr),
-        reinterpret_cast<int*>(dst_buffer_slot_idx_ptr),
-        reinterpret_cast<int*>(raw_num_recv_tokens_per_expert_ptr),
-        reinterpret_cast<int*>(expanded_expert_cursor_ptr), rank_,
-        comm_stream_);
-
-    std::optional<EventHandle> event;
-    if (async) {
-      event = EventHandle(comm_stream_);
-    } else {
-      stream_wait(compute_stream, comm_stream_);
-    }
-    return event;
-  }
-
-  std::optional<EventHandle> build_v2_expanded_payload(
-      std::uintptr_t recv_x_ptr, std::uintptr_t recv_x_scales_ptr,
-      std::uintptr_t recv_topk_weights_ptr,
-      std::uintptr_t recv_src_metadata_ptr, int num_recv_tokens, int num_topk,
-      int hidden_bytes, int num_scales, std::uintptr_t expanded_x_ptr,
-      std::uintptr_t expanded_x_scales_ptr,
-      std::uintptr_t expanded_topk_weights_ptr,
-      std::optional<EventHandle>& previous_event, bool async,
-      bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
-    EP_HOST_ASSERT(recv_x_ptr != 0);
-    EP_HOST_ASSERT(recv_src_metadata_ptr != 0);
-    EP_HOST_ASSERT(expanded_x_ptr != 0);
-    EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 && hidden_bytes > 0 &&
-                   num_scales >= 0);
-
-    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    static_cast<void>(allocate_on_comm_stream);
-    if (previous_event.has_value()) {
-      stream_wait(comm_stream_, previous_event.value());
-    } else {
-      stream_wait(comm_stream_, compute_stream);
-    }
-
-    uccl::internode::build_v2_expanded_payload(
-        reinterpret_cast<void const*>(recv_x_ptr),
-        recv_x_scales_ptr == 0
-            ? nullptr
-            : reinterpret_cast<float const*>(recv_x_scales_ptr),
-        recv_topk_weights_ptr == 0
-            ? nullptr
-            : reinterpret_cast<float const*>(recv_topk_weights_ptr),
-        reinterpret_cast<int const*>(recv_src_metadata_ptr), num_recv_tokens,
-        num_topk, hidden_bytes, num_scales,
-        reinterpret_cast<void*>(expanded_x_ptr),
-        expanded_x_scales_ptr == 0
-            ? nullptr
-            : reinterpret_cast<float*>(expanded_x_scales_ptr),
-        expanded_topk_weights_ptr == 0
-            ? nullptr
-            : reinterpret_cast<float*>(expanded_topk_weights_ptr),
-        comm_stream_);
-
-    std::optional<EventHandle> event;
-    if (async) {
-      event = EventHandle(comm_stream_);
-    } else {
-      stream_wait(compute_stream, comm_stream_);
-    }
-    return event;
-  }
-
-  std::optional<EventHandle> build_v2_reduced_combine_input(
-      std::uintptr_t expanded_x_ptr, std::uintptr_t recv_src_metadata_ptr,
-      int num_recv_tokens, int num_topk, int hidden, int dtype_code,
-      std::uintptr_t reduced_x_ptr, std::optional<EventHandle>& previous_event,
-      bool async, bool allocate_on_comm_stream,
-      std::uintptr_t compute_stream_ptr) {
-    EP_HOST_ASSERT(expanded_x_ptr != 0);
-    EP_HOST_ASSERT(recv_src_metadata_ptr != 0);
-    EP_HOST_ASSERT(reduced_x_ptr != 0);
-    EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 && hidden > 0);
-
-    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    static_cast<void>(allocate_on_comm_stream);
-    if (previous_event.has_value()) {
-      stream_wait(comm_stream_, previous_event.value());
-    } else {
-      stream_wait(comm_stream_, compute_stream);
-    }
-
-    uccl::internode::build_v2_reduced_combine_input(
-        reinterpret_cast<void const*>(expanded_x_ptr),
-        reinterpret_cast<int const*>(recv_src_metadata_ptr), num_recv_tokens,
-        num_topk, hidden, cuda_dtype_from_code(dtype_code),
-        reinterpret_cast<void*>(reduced_x_ptr), comm_stream_);
-
-    std::optional<EventHandle> event;
-    if (async) {
-      event = EventHandle(comm_stream_);
-    } else {
-      stream_wait(compute_stream, comm_stream_);
-    }
-    return event;
-  }
-
- private:
-  int rank_;
-  int num_ranks_;
-  long num_bytes_;
-  int local_world_;
-  bool explicitly_destroy_;
-  bool destroyed_{false};
-  int device_index_{0};
-  cudaStream_t comm_stream_{nullptr};
-};
-
 struct Ctx {
   long num_tokens{0};
   long hidden{0};
@@ -1441,6 +1174,62 @@ class Buffer {
     return event;
   }
 
+  std::optional<EventHandle> build_v2_intranode_dispatch_metadata(
+      std::uintptr_t recv_src_idx_ptr, std::uintptr_t rank_prefix_matrix_ptr,
+      std::uintptr_t recv_topk_idx_ptr, int num_recv_tokens, int num_topk,
+      int num_local_experts, int num_max_tokens_per_rank, int expert_alignment,
+      std::uintptr_t recv_src_metadata_ptr,
+      std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+      std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+      std::uintptr_t dst_buffer_slot_idx_ptr,
+      std::uintptr_t raw_num_recv_tokens_per_expert_ptr,
+      std::uintptr_t expanded_expert_cursor_ptr,
+      std::optional<EventHandle>& previous_event, bool async,
+      bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
+    EP_HOST_ASSERT(recv_src_metadata_ptr != 0);
+    EP_HOST_ASSERT(psum_num_recv_tokens_per_scaleup_rank_ptr != 0);
+    EP_HOST_ASSERT(psum_num_recv_tokens_per_expert_ptr != 0);
+    EP_HOST_ASSERT(dst_buffer_slot_idx_ptr != 0);
+    EP_HOST_ASSERT(raw_num_recv_tokens_per_expert_ptr != 0);
+    EP_HOST_ASSERT(expanded_expert_cursor_ptr != 0);
+    EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 &&
+                   num_local_experts > 0 && num_max_tokens_per_rank > 0);
+    if (num_recv_tokens > 0) {
+      EP_HOST_ASSERT(recv_src_idx_ptr != 0);
+      EP_HOST_ASSERT(rank_prefix_matrix_ptr != 0);
+      EP_HOST_ASSERT(recv_topk_idx_ptr != 0);
+    }
+
+    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
+    static_cast<void>(allocate_on_comm_stream);
+    if (previous_event.has_value()) {
+      stream_wait(comm_stream, previous_event.value());
+    } else {
+      stream_wait(comm_stream, compute_stream);
+    }
+
+    uccl::internode::build_v2_intranode_dispatch_metadata(
+        reinterpret_cast<int const*>(recv_src_idx_ptr),
+        reinterpret_cast<int const*>(rank_prefix_matrix_ptr),
+        reinterpret_cast<int64_t const*>(recv_topk_idx_ptr), num_recv_tokens,
+        num_topk, num_ranks, get_num_nvl_ranks(), num_local_experts,
+        num_max_tokens_per_rank, expert_alignment,
+        reinterpret_cast<int*>(recv_src_metadata_ptr),
+        reinterpret_cast<int*>(psum_num_recv_tokens_per_scaleup_rank_ptr),
+        reinterpret_cast<int*>(psum_num_recv_tokens_per_expert_ptr),
+        reinterpret_cast<int*>(dst_buffer_slot_idx_ptr),
+        reinterpret_cast<int*>(raw_num_recv_tokens_per_expert_ptr),
+        reinterpret_cast<int*>(expanded_expert_cursor_ptr), rank, comm_stream);
+
+    std::optional<EventHandle> event;
+    if (async) {
+      event = EventHandle(comm_stream);
+    } else {
+      stream_wait(compute_stream, comm_stream);
+    }
+    return event;
+  }
+
   std::optional<EventHandle> build_v2_expanded_payload(
       std::uintptr_t recv_x_ptr, std::uintptr_t recv_x_scales_ptr,
       std::uintptr_t recv_topk_weights_ptr,
@@ -1649,6 +1438,7 @@ class Buffer {
   }
 
   int get_num_rdma_ranks() const { return num_rdma_ranks; }
+  int get_num_nvl_ranks() const { return num_nvl_ranks; }
   int get_num_max_nvl_peers() const { return NUM_MAX_NVL_PEERS; }
   int get_source_meta_bytes() const {
     return uccl::internode::get_source_meta_bytes();
@@ -1882,6 +1672,41 @@ class Buffer {
       nullptr};  // Device pointer to array of IPC base addresses
 };
 
+class NativeElasticProxyBuffer : public Buffer {
+ public:
+  NativeElasticProxyBuffer(int rank, int num_ranks, long num_nvl_bytes,
+                           long num_rdma_bytes, bool proxy_mode,
+                           bool explicitly_destroy, int num_local_ranks)
+      : Buffer(rank, num_ranks, num_nvl_bytes, num_rdma_bytes, proxy_mode,
+               explicitly_destroy, num_local_ranks),
+        rank_(rank),
+        num_ranks_(num_ranks),
+        local_world_(num_local_ranks < 0 ? NUM_MAX_NVL_PEERS
+                                         : std::max(1, num_local_ranks)) {}
+
+  std::tuple<int, int> get_physical_domain_size() const {
+    return {get_num_rdma_ranks(), get_num_nvl_ranks()};
+  }
+
+  std::tuple<int, int> get_logical_domain_size() const {
+    return {num_scaleout_ranks(), num_scaleup_ranks()};
+  }
+
+  int rank() const { return rank_; }
+  int num_ranks() const { return num_ranks_; }
+  int num_scaleout_ranks() const {
+    return std::max(1, num_ranks_ / num_scaleup_ranks());
+  }
+  int num_scaleup_ranks() const { return std::min(local_world_, num_ranks_); }
+  int scaleout_rank() const { return rank_ / num_scaleup_ranks(); }
+  int scaleup_rank() const { return rank_ % num_scaleup_ranks(); }
+
+ private:
+  int rank_;
+  int num_ranks_;
+  int local_world_;
+};
+
 NB_MODULE(ep, m) {
   m.doc() = "Minimal DeepEP-compatible shim with UCCL";
 
@@ -2068,172 +1893,7 @@ NB_MODULE(ep, m) {
   });
 
   nb::class_<EventOverlap>(m, "EventOverlap").def(nb::init<>());
-  nb::class_<ElasticProxyBuffer>(m, "ElasticProxyBuffer")
-      .def(nb::init<int, int, long, int, bool>(), nb::arg("rank"),
-           nb::arg("num_ranks"), nb::arg("num_bytes"),
-           nb::arg("local_world"), nb::arg("explicitly_destroy") = false)
-      .def("destroy", &ElasticProxyBuffer::destroy)
-      .def("is_available", &ElasticProxyBuffer::is_available)
-      .def("get_physical_domain_size",
-           &ElasticProxyBuffer::get_physical_domain_size)
-      .def("get_logical_domain_size",
-           &ElasticProxyBuffer::get_logical_domain_size)
-      .def("rank", &ElasticProxyBuffer::rank)
-      .def("num_ranks", &ElasticProxyBuffer::num_ranks)
-      .def("num_bytes", &ElasticProxyBuffer::num_bytes)
-      .def("get_comm_stream", &ElasticProxyBuffer::get_comm_stream)
-      .def("num_scaleout_ranks", &ElasticProxyBuffer::num_scaleout_ranks)
-      .def("num_scaleup_ranks", &ElasticProxyBuffer::num_scaleup_ranks)
-      .def("scaleout_rank", &ElasticProxyBuffer::scaleout_rank)
-      .def("scaleup_rank", &ElasticProxyBuffer::scaleup_rank)
-      .def(
-          "build_v2_dispatch_metadata",
-          [](ElasticProxyBuffer& self, std::uintptr_t recv_src_meta_ptr,
-             std::uintptr_t recv_topk_idx_ptr, int num_recv_tokens,
-             int num_topk, int num_scaleup_ranks, int num_local_experts,
-             int num_max_tokens_per_rank, int expert_alignment,
-             std::uintptr_t recv_src_metadata_ptr,
-             std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
-             std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
-             std::uintptr_t dst_buffer_slot_idx_ptr,
-             std::uintptr_t raw_num_recv_tokens_per_expert_ptr,
-             std::uintptr_t expanded_expert_cursor_ptr,
-             nb::object previous_event, bool async,
-             bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
-            std::optional<EventHandle> prev;
-            if (!previous_event.is_none()) {
-              EventHandle ev = nb::cast<EventHandle>(previous_event);
-              prev = ev;
-            }
-            return self.build_v2_dispatch_metadata(
-                recv_src_meta_ptr, recv_topk_idx_ptr, num_recv_tokens,
-                num_topk, num_scaleup_ranks, num_local_experts,
-                num_max_tokens_per_rank, expert_alignment,
-                recv_src_metadata_ptr,
-                psum_num_recv_tokens_per_scaleup_rank_ptr,
-                psum_num_recv_tokens_per_expert_ptr, dst_buffer_slot_idx_ptr,
-                raw_num_recv_tokens_per_expert_ptr,
-                expanded_expert_cursor_ptr, prev, async,
-                allocate_on_comm_stream, compute_stream_ptr);
-          },
-          nb::arg("recv_src_meta_ptr"), nb::arg("recv_topk_idx_ptr"),
-          nb::arg("num_recv_tokens"), nb::arg("num_topk"),
-          nb::arg("num_scaleup_ranks"), nb::arg("num_local_experts"),
-          nb::arg("num_max_tokens_per_rank"), nb::arg("expert_alignment"),
-          nb::arg("recv_src_metadata_ptr"),
-          nb::arg("psum_num_recv_tokens_per_scaleup_rank_ptr"),
-          nb::arg("psum_num_recv_tokens_per_expert_ptr"),
-          nb::arg("dst_buffer_slot_idx_ptr"),
-          nb::arg("raw_num_recv_tokens_per_expert_ptr"),
-          nb::arg("expanded_expert_cursor_ptr"),
-          nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
-          nb::arg("allocate_on_comm_stream") = false,
-          nb::arg("compute_stream_ptr") = 0)
-      .def(
-          "build_v2_intranode_dispatch_metadata",
-          [](ElasticProxyBuffer& self, std::uintptr_t recv_src_idx_ptr,
-             std::uintptr_t rank_prefix_matrix_ptr,
-             std::uintptr_t recv_topk_idx_ptr, int num_recv_tokens,
-             int num_topk, int num_local_experts,
-             int num_max_tokens_per_rank, int expert_alignment,
-             std::uintptr_t recv_src_metadata_ptr,
-             std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
-             std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
-             std::uintptr_t dst_buffer_slot_idx_ptr,
-             std::uintptr_t raw_num_recv_tokens_per_expert_ptr,
-             std::uintptr_t expanded_expert_cursor_ptr,
-             nb::object previous_event, bool async,
-             bool allocate_on_comm_stream,
-             std::uintptr_t compute_stream_ptr) {
-            std::optional<EventHandle> prev;
-            if (!previous_event.is_none()) {
-              EventHandle ev = nb::cast<EventHandle>(previous_event);
-              prev = ev;
-            }
-            return self.build_v2_intranode_dispatch_metadata(
-                recv_src_idx_ptr, rank_prefix_matrix_ptr, recv_topk_idx_ptr,
-                num_recv_tokens, num_topk, num_local_experts,
-                num_max_tokens_per_rank, expert_alignment,
-                recv_src_metadata_ptr,
-                psum_num_recv_tokens_per_scaleup_rank_ptr,
-                psum_num_recv_tokens_per_expert_ptr, dst_buffer_slot_idx_ptr,
-                raw_num_recv_tokens_per_expert_ptr,
-                expanded_expert_cursor_ptr, prev, async,
-                allocate_on_comm_stream, compute_stream_ptr);
-          },
-          nb::arg("recv_src_idx_ptr"), nb::arg("rank_prefix_matrix_ptr"),
-          nb::arg("recv_topk_idx_ptr"), nb::arg("num_recv_tokens"),
-          nb::arg("num_topk"), nb::arg("num_local_experts"),
-          nb::arg("num_max_tokens_per_rank"), nb::arg("expert_alignment"),
-          nb::arg("recv_src_metadata_ptr"),
-          nb::arg("psum_num_recv_tokens_per_scaleup_rank_ptr"),
-          nb::arg("psum_num_recv_tokens_per_expert_ptr"),
-          nb::arg("dst_buffer_slot_idx_ptr"),
-          nb::arg("raw_num_recv_tokens_per_expert_ptr"),
-          nb::arg("expanded_expert_cursor_ptr"),
-          nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
-          nb::arg("allocate_on_comm_stream") = false,
-          nb::arg("compute_stream_ptr") = 0)
-      .def(
-          "build_v2_expanded_payload",
-          [](ElasticProxyBuffer& self, std::uintptr_t recv_x_ptr,
-             std::uintptr_t recv_x_scales_ptr,
-             std::uintptr_t recv_topk_weights_ptr,
-             std::uintptr_t recv_src_metadata_ptr, int num_recv_tokens,
-             int num_topk, int hidden_bytes, int num_scales,
-             std::uintptr_t expanded_x_ptr,
-             std::uintptr_t expanded_x_scales_ptr,
-             std::uintptr_t expanded_topk_weights_ptr,
-             nb::object previous_event, bool async,
-             bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
-            std::optional<EventHandle> prev;
-            if (!previous_event.is_none()) {
-              EventHandle ev = nb::cast<EventHandle>(previous_event);
-              prev = ev;
-            }
-            return self.build_v2_expanded_payload(
-                recv_x_ptr, recv_x_scales_ptr, recv_topk_weights_ptr,
-                recv_src_metadata_ptr, num_recv_tokens, num_topk,
-                hidden_bytes, num_scales, expanded_x_ptr,
-                expanded_x_scales_ptr, expanded_topk_weights_ptr, prev,
-                async, allocate_on_comm_stream, compute_stream_ptr);
-          },
-          nb::arg("recv_x_ptr"), nb::arg("recv_x_scales_ptr"),
-          nb::arg("recv_topk_weights_ptr"),
-          nb::arg("recv_src_metadata_ptr"), nb::arg("num_recv_tokens"),
-          nb::arg("num_topk"), nb::arg("hidden_bytes"),
-          nb::arg("num_scales"), nb::arg("expanded_x_ptr"),
-          nb::arg("expanded_x_scales_ptr"),
-          nb::arg("expanded_topk_weights_ptr"),
-          nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
-          nb::arg("allocate_on_comm_stream") = false,
-          nb::arg("compute_stream_ptr") = 0)
-      .def(
-          "build_v2_reduced_combine_input",
-          [](ElasticProxyBuffer& self, std::uintptr_t expanded_x_ptr,
-             std::uintptr_t recv_src_metadata_ptr, int num_recv_tokens,
-             int num_topk, int hidden, int dtype_code,
-             std::uintptr_t reduced_x_ptr, nb::object previous_event,
-             bool async, bool allocate_on_comm_stream,
-             std::uintptr_t compute_stream_ptr) {
-            std::optional<EventHandle> prev;
-            if (!previous_event.is_none()) {
-              EventHandle ev = nb::cast<EventHandle>(previous_event);
-              prev = ev;
-            }
-            return self.build_v2_reduced_combine_input(
-                expanded_x_ptr, recv_src_metadata_ptr, num_recv_tokens,
-                num_topk, hidden, dtype_code, reduced_x_ptr, prev, async,
-                allocate_on_comm_stream, compute_stream_ptr);
-          },
-          nb::arg("expanded_x_ptr"), nb::arg("recv_src_metadata_ptr"),
-          nb::arg("num_recv_tokens"), nb::arg("num_topk"),
-          nb::arg("hidden"), nb::arg("dtype_code"),
-          nb::arg("reduced_x_ptr"), nb::arg("previous_event") = nb::none(),
-          nb::arg("async") = false,
-          nb::arg("allocate_on_comm_stream") = false,
-          nb::arg("compute_stream_ptr") = 0);
-  nb::class_<Buffer>(m, "Buffer")
+  nb::class_<Buffer>(m, "_LegacyProxyBuffer")
       .def(nb::init<int, int, long, long, bool, bool, int>(), nb::arg("rank"),
            nb::arg("num_ranks"), nb::arg("num_nvl_bytes") = 0,
            nb::arg("num_rdma_bytes") = 0, nb::arg("proxy_mode") = false,
@@ -2564,6 +2224,51 @@ NB_MODULE(ep, m) {
           nb::arg("allocate_on_comm_stream") = false,
           nb::arg("compute_stream_ptr") = 0)
       .def(
+          "build_v2_intranode_dispatch_metadata",
+          [](Buffer& self, std::uintptr_t recv_src_idx_ptr,
+             std::uintptr_t rank_prefix_matrix_ptr,
+             std::uintptr_t recv_topk_idx_ptr, int num_recv_tokens,
+             int num_topk, int num_local_experts,
+             int num_max_tokens_per_rank, int expert_alignment,
+             std::uintptr_t recv_src_metadata_ptr,
+             std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+             std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+             std::uintptr_t dst_buffer_slot_idx_ptr,
+             std::uintptr_t raw_num_recv_tokens_per_expert_ptr,
+             std::uintptr_t expanded_expert_cursor_ptr,
+             nb::object previous_event, bool async,
+             bool allocate_on_comm_stream,
+             std::uintptr_t compute_stream_ptr) {
+            std::optional<EventHandle> prev;
+            if (!previous_event.is_none()) {
+              EventHandle ev = nb::cast<EventHandle>(previous_event);
+              prev = ev;
+            }
+            return self.build_v2_intranode_dispatch_metadata(
+                recv_src_idx_ptr, rank_prefix_matrix_ptr, recv_topk_idx_ptr,
+                num_recv_tokens, num_topk, num_local_experts,
+                num_max_tokens_per_rank, expert_alignment,
+                recv_src_metadata_ptr,
+                psum_num_recv_tokens_per_scaleup_rank_ptr,
+                psum_num_recv_tokens_per_expert_ptr, dst_buffer_slot_idx_ptr,
+                raw_num_recv_tokens_per_expert_ptr,
+                expanded_expert_cursor_ptr, prev, async,
+                allocate_on_comm_stream, compute_stream_ptr);
+          },
+          nb::arg("recv_src_idx_ptr"), nb::arg("rank_prefix_matrix_ptr"),
+          nb::arg("recv_topk_idx_ptr"), nb::arg("num_recv_tokens"),
+          nb::arg("num_topk"), nb::arg("num_local_experts"),
+          nb::arg("num_max_tokens_per_rank"), nb::arg("expert_alignment"),
+          nb::arg("recv_src_metadata_ptr"),
+          nb::arg("psum_num_recv_tokens_per_scaleup_rank_ptr"),
+          nb::arg("psum_num_recv_tokens_per_expert_ptr"),
+          nb::arg("dst_buffer_slot_idx_ptr"),
+          nb::arg("raw_num_recv_tokens_per_expert_ptr"),
+          nb::arg("expanded_expert_cursor_ptr"),
+          nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
+          nb::arg("allocate_on_comm_stream") = false,
+          nb::arg("compute_stream_ptr") = 0)
+      .def(
           "build_v2_expanded_payload",
           [](Buffer& self, std::uintptr_t recv_x_ptr,
              std::uintptr_t recv_x_scales_ptr,
@@ -2669,6 +2374,22 @@ NB_MODULE(ep, m) {
           nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
           nb::arg("allocate_on_comm_stream") = false,
           nb::arg("compute_stream_ptr") = 0);
+  nb::class_<NativeElasticProxyBuffer, Buffer>(m, "NativeElasticProxyBuffer")
+      .def(nb::init<int, int, long, long, bool, bool, int>(), nb::arg("rank"),
+           nb::arg("num_ranks"), nb::arg("num_nvl_bytes") = 0,
+           nb::arg("num_rdma_bytes") = 0, nb::arg("proxy_mode") = false,
+           nb::arg("explicitly_destroy") = false,
+           nb::arg("num_local_ranks") = -1)
+      .def("get_physical_domain_size",
+           &NativeElasticProxyBuffer::get_physical_domain_size)
+      .def("get_logical_domain_size",
+           &NativeElasticProxyBuffer::get_logical_domain_size)
+      .def("rank", &NativeElasticProxyBuffer::rank)
+      .def("num_ranks", &NativeElasticProxyBuffer::num_ranks)
+      .def("num_scaleout_ranks", &NativeElasticProxyBuffer::num_scaleout_ranks)
+      .def("num_scaleup_ranks", &NativeElasticProxyBuffer::num_scaleup_ranks)
+      .def("scaleout_rank", &NativeElasticProxyBuffer::scaleout_rank)
+      .def("scaleup_rank", &NativeElasticProxyBuffer::scaleup_rank);
   m.def("alloc_cmd_ring", &alloc_cmd_ring);
   m.def("free_cmd_ring", &free_cmd_ring);
   m.def("launch_gpu_issue_kernel", [](int blocks, int threads_per_block,

@@ -157,7 +157,10 @@ class ProxyTransport:
         self.proxy_mode = proxy_mode
         self.explicitly_destroy = explicitly_destroy
         self._next_proxy_combine_buffer = None
-        self.runtime = ep.Buffer(
+        runtime_cls = getattr(ep, "NativeElasticProxyBuffer", None)
+        if runtime_cls is None:
+            raise RuntimeError("uccl.ep is missing NativeElasticProxyBuffer; rebuild uccl-ep")
+        self.runtime = runtime_cls(
             self.rank,
             self.group_size,
             num_nvl_bytes,
@@ -583,13 +586,27 @@ class ProxyTransport:
         """
 
         # TODO: automatically tune
+        def env_int(name: str, default: int) -> int:
+            return int(os.environ.get(name, str(default)))
+
+        efa = ProxyTransport._is_efa()
+        efa_nvl_send = env_int("EP_UCCL_NVL_SEND_TOKENS", 36)
+        efa_nvl_recv = env_int("EP_UCCL_NVL_RECV_TOKENS", 288)
+        efa_rdma_send = env_int("EP_UCCL_RDMA_SEND_TOKENS", 20)
+        efa_rdma_recv = env_int("EP_UCCL_RDMA_RECV_TOKENS", 512)
         config_map = {
             2: Config(ProxyTransport.num_sms, 24, 256, 6, 128),
             4: Config(ProxyTransport.num_sms, 6, 256, 6, 128),
             8: Config(ProxyTransport.num_sms, 6, 256, 6, 128),
-            16: Config(ProxyTransport.num_sms, 36, 288, 20, 512 if ProxyTransport._is_efa() else 128),
+            16: Config(
+                ProxyTransport.num_sms,
+                efa_nvl_send if efa else 36,
+                efa_nvl_recv if efa else 288,
+                efa_rdma_send if efa else 20,
+                efa_rdma_recv if efa else 128,
+            ),
             24: Config(ProxyTransport.num_sms, 8, 288, 32, 128),
-            32: Config(ProxyTransport.num_sms, 32, 288, 32, 512 if ProxyTransport._is_efa() else 128),
+            32: Config(ProxyTransport.num_sms, 32, 288, 32, 512 if efa else 128),
             64: Config(ProxyTransport.num_sms, 20, 288, 28, 128),
             128: Config(ProxyTransport.num_sms, 20, 560, 32, 128),
             144: Config(ProxyTransport.num_sms, 32, 720, 12, 128),
@@ -611,19 +628,27 @@ class ProxyTransport:
         """
 
         # TODO: automatically tune
+        def env_int(name: str, default: int) -> int:
+            return int(os.environ.get(name, str(default)))
+
+        efa = ProxyTransport._is_efa()
+        efa_nvl_send = env_int("EP_UCCL_COMBINE_NVL_SEND_TOKENS", 36)
+        efa_nvl_recv = env_int("EP_UCCL_COMBINE_NVL_RECV_TOKENS", 288)
+        efa_rdma_send = env_int("EP_UCCL_COMBINE_RDMA_SEND_TOKENS", 20)
+        efa_rdma_recv = env_int("EP_UCCL_COMBINE_RDMA_RECV_TOKENS", 512)
         config_map = {
             2: Config(ProxyTransport.num_sms, 10, 256, 6, 128),
             4: Config(ProxyTransport.num_sms, 9, 256, 6, 128),
             8: Config(ProxyTransport.num_sms, 4, 256, 6, 128),
             16: Config(
                 ProxyTransport.num_sms,
-                36 if ProxyTransport._is_efa() else 4,
-                288,
-                20 if ProxyTransport._is_efa() else 12,
-                512 if ProxyTransport._is_efa() else 128,
+                efa_nvl_send if efa else 4,
+                efa_nvl_recv if efa else 288,
+                efa_rdma_send if efa else 12,
+                efa_rdma_recv if efa else 128,
             ),
             24: Config(ProxyTransport.num_sms, 1, 288, 8, 128),
-            32: Config(ProxyTransport.num_sms, 1, 288, 8, 512 if ProxyTransport._is_efa() else 128),
+            32: Config(ProxyTransport.num_sms, 1, 288, 8, 512 if efa else 128),
             64: Config(ProxyTransport.num_sms, 1, 288, 20, 128),
             128: Config(ProxyTransport.num_sms, 1, 560, 12, 128),
             144: Config(ProxyTransport.num_sms, 2, 720, 8, 128),

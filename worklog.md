@@ -873,3 +873,99 @@ README 形状、RDMA-only benchmark：
   目标。
 - 当前主要瓶颈不是同节点 scale-up，而是跨节点 EFA 数据面的 V2 combine/dispatch
   语义仍复用了 legacy token/chunk staging 与 per-token head/tail 协议。
+
+## 2026-05-28 native V2 runtime 统一与 EP 8 x 2 复测
+
+代码清理：
+
+- 删除 C++ 里的轻量 `ElasticProxyBuffer` shim，不再维护一个只负责 V2
+  metadata/epilogue 的独立 comm stream。
+- `ElasticBuffer` 初始化时只计算逻辑拓扑，不再创建单独 shim runtime；
+  第一次 dispatch/combine 时通过 `ProxyTransport` 创建
+  `NativeElasticProxyBuffer`，之后 metadata、expanded payload、reduced-combine
+  input 和 UCCL proxy 数据面共用同一个 native runtime/comm stream。
+- `uccl.ep.Buffer` 不再以 public 名称暴露；legacy base 仅以
+  `uccl.ep._LegacyProxyBuffer` 存在，用作 `NativeElasticProxyBuffer` 的内部
+  nanobind base。
+- `uccl.ep.ElasticProxyBuffer` 已移除；`uccl.ep.NativeElasticProxyBuffer`
+  暴露并继承 V2 metadata/expanded/reduced helper。
+- `ProxyTransport` 增加 EFA chunk config 环境变量，方便后续稳定扫参：
+  - `EP_UCCL_NVL_SEND_TOKENS`
+  - `EP_UCCL_NVL_RECV_TOKENS`
+  - `EP_UCCL_RDMA_SEND_TOKENS`
+  - `EP_UCCL_RDMA_RECV_TOKENS`
+  - `EP_UCCL_COMBINE_NVL_SEND_TOKENS`
+  - `EP_UCCL_COMBINE_NVL_RECV_TOKENS`
+  - `EP_UCCL_COMBINE_RDMA_SEND_TOKENS`
+  - `EP_UCCL_COMBINE_RDMA_RECV_TOKENS`
+
+构建与 API 验证：
+
+- 两台机器均重新安装 `uccl.ep`：
+  - `p5en_0`: `/tmp/uccl_ep_build_native_runtime_unified_bind_p5en0.log`
+  - `p5en_1`: `/tmp/uccl_ep_build_native_runtime_unified_bind_p5en1.log`
+- `/tmp` 下 import wrapper 验证：
+  - `deep_ep.__file__` 指向
+    `uccl-ep/deep_ep_v2_wrapper/deep_ep/__init__.py`
+  - `hasattr(deep_ep, "Buffer") == False`
+  - `hasattr(ep, "Buffer") == False`
+  - `hasattr(ep, "ElasticProxyBuffer") == False`
+  - `hasattr(ep, "NativeElasticProxyBuffer") == True`
+  - `hasattr(ep.NativeElasticProxyBuffer,
+    "build_v2_intranode_dispatch_metadata") == True`
+
+正确性 smoke：
+
+- 单机 EP2：
+  - 命令：`torchrun --standalone --nproc_per_node=2
+    uccl-ep/bench/v2_proxy_smoke.py --num-tokens 16 --hidden 128
+    --num-topk 2 --num-experts 8 --iters 1 --num-sms 4`
+  - 日志：`/tmp/v2_native_unified_ep2_smoke.log`
+  - 通过。
+  - rank0：dispatch `0.641 ms`，expanded dispatch `0.542 ms`，
+    cached dispatch `0.142 ms`，combine `0.110 ms`，reduced combine
+    `0.188 ms`。
+
+README 形状 EP 8 x 2 RDMA/SO 复测：
+
+- 命令核心参数：
+  - `torchrun --nnodes=2 --nproc_per_node=8`
+  - `--num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256`
+  - `--iters 5 --use-fp8-dispatch --ignore-local-traffic`
+  - 默认 EFA config：RDMA send `20` tokens，RDMA recv `512` tokens。
+- 日志：
+  - `/tmp/v2_native_unified_ep8x2_rank0.log`
+  - `/tmp/v2_native_unified_ep8x2_rank1.log`
+- `rank=0/16`：
+  - `* dispatch`: `11 GB/s (SO)`, `62 GB/s (SU)`, `5633.701 us`
+  - `- expanded dispatch`: `15 GB/s (SO)`, `85 GB/s (SU)`,
+    `4147.691 us`
+  - `# cached dispatch`: `23 GB/s (SO)`, `133 GB/s (SU)`,
+    `2633.618 us`
+  - `@ combine`: `7 GB/s (SO)`, `42 GB/s (SU)`, `15975.414 us`
+  - `+ reduced combine`: `6 GB/s (SO)`, `35 GB/s (SU)`, `19417.827 us`
+- `rank=8/16`：
+  - `* dispatch`: `11 GB/s (SO)`, `62 GB/s (SU)`, `5682.878 us`
+  - `- expanded dispatch`: `15 GB/s (SO)`, `88 GB/s (SU)`,
+    `3995.730 us`
+  - `# cached dispatch`: `24 GB/s (SO)`, `134 GB/s (SU)`,
+    `2602.202 us`
+  - `@ combine`: `7 GB/s (SO)`, `42 GB/s (SU)`, `15845.487 us`
+  - `+ reduced combine`: `6 GB/s (SO)`, `35 GB/s (SU)`, `19282.031 us`
+
+chunk sweep 观察：
+
+- 尝试把 RDMA chunk 调到 send `64` tokens、recv `1024` tokens：
+  - 环境变量：
+    `EP_UCCL_RDMA_SEND_TOKENS=64`,
+    `EP_UCCL_RDMA_RECV_TOKENS=1024`,
+    `EP_UCCL_COMBINE_RDMA_SEND_TOKENS=64`,
+    `EP_UCCL_COMBINE_RDMA_RECV_TOKENS=1024`
+  - 日志：
+    `/tmp/v2_native_unified_ep8x2_chunk64_rank0.log`,
+    `/tmp/v2_native_unified_ep8x2_chunk64_rank1.log`
+  - 结果：失败，多个 rank SIGABRT，根因日志是
+    `CUDA error: an illegal memory access was encountered`。
+- 结论：当前 legacy UCCL internode kernels 对 chunk 尺寸有隐含布局/流控约束，
+  不能简单靠放大 chunk 跑满 EFA；下一步应继续真正重写 V2-native
+  dispatch/combine 数据面，而不是在 V1 staging 参数上扫太远。

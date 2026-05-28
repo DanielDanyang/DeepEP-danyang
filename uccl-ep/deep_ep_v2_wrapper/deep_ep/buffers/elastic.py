@@ -105,19 +105,13 @@ class ElasticBuffer:
         # such as 2 nodes x 2 ranks still expose a real scaleout dimension.
         local_world = int(os.environ.get("LOCAL_WORLD_SIZE", torch.cuda.device_count()))
 
-        if not hasattr(ep, "ElasticProxyBuffer"):
-            raise RuntimeError("uccl.ep native extension is missing ElasticProxyBuffer; rebuild uccl-ep")
-        self.runtime = ep.ElasticProxyBuffer(
-            self.rank_idx,
-            self.num_ranks,
-            int(self.num_bytes),
-            int(local_world),
-            bool(explicitly_destroy),
-        )
-        self.num_scaleout_ranks, self.num_scaleup_ranks = self.runtime.get_logical_domain_size()
-        self.num_rdma_ranks, self.num_nvlink_ranks = self.runtime.get_physical_domain_size()
-        self.scaleout_rank_idx = self.runtime.scaleout_rank()
-        self.scaleup_rank_idx = self.runtime.scaleup_rank()
+        self.num_scaleup_ranks = min(max(1, local_world), self.num_ranks)
+        self.num_scaleout_ranks = max(1, self.num_ranks // self.num_scaleup_ranks)
+        self.num_rdma_ranks = self.num_scaleout_ranks
+        self.num_nvlink_ranks = self.num_scaleup_ranks
+        self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
+        self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
+        self.runtime = None
         self._transport: Optional[ProxyTransport] = None
         self._transport_hidden = int(hidden)
 
@@ -145,8 +139,7 @@ class ElasticBuffer:
         if self._transport is not None:
             self._transport.destroy()
             self._transport = None
-        if self.runtime is not None and hasattr(self.runtime, "destroy"):
-            self.runtime.destroy()
+        self.runtime = None
         self._destroyed = True
 
     @staticmethod
@@ -259,6 +252,8 @@ class ElasticBuffer:
             torch.cuda.synchronize()
 
     def get_comm_stream(self) -> torch.Stream:
+        if self.runtime is None:
+            self._ensure_transport(max(1, self._transport_hidden))
         return torch.cuda.ExternalStream(int(self.runtime.get_comm_stream()))
 
     @staticmethod
@@ -308,6 +303,11 @@ class ElasticBuffer:
             num_qps_per_rank=num_sms,
             explicitly_destroy=True,
         )
+        self.runtime = self._transport.runtime
+        self.num_scaleout_ranks, self.num_scaleup_ranks = self.runtime.get_logical_domain_size()
+        self.num_rdma_ranks, self.num_nvlink_ranks = self.runtime.get_physical_domain_size()
+        self.scaleout_rank_idx = self.runtime.scaleout_rank()
+        self.scaleup_rank_idx = self.runtime.scaleup_rank()
         return self._transport
 
     def _build_v2_metadata(
