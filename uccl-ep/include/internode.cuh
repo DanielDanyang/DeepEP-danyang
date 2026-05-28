@@ -23,6 +23,16 @@ void build_v2_dispatch_metadata(
     int* raw_num_recv_tokens_per_expert, int* expanded_expert_cursor,
     int rank, cudaStream_t stream);
 
+void build_v2_intranode_dispatch_metadata(
+    int const* recv_src_idx, int const* rank_prefix_matrix,
+    int64_t const* recv_topk_idx, int num_recv_tokens, int num_topk,
+    int num_ranks, int num_scaleup_ranks, int num_local_experts,
+    int num_max_tokens_per_rank, int expert_alignment, int* recv_src_metadata,
+    int* psum_num_recv_tokens_per_scaleup_rank,
+    int* psum_num_recv_tokens_per_expert, int* dst_buffer_slot_idx,
+    int* raw_num_recv_tokens_per_expert, int* expanded_expert_cursor, int rank,
+    cudaStream_t stream);
+
 void build_v2_expanded_payload(
     void const* recv_x, float const* recv_x_scales,
     float const* recv_topk_weights, int const* recv_src_metadata,

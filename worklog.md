@@ -830,3 +830,46 @@ API 验证：
 - 这说明清理后的主目标已经转向 AWS EP16 internode V2 backend；如果还要保留单机
   EP2/EP8 smoke，需要补一个 intranode V2 source-metadata native helper，不能再靠
   旧 wrapper 语义兜底。
+
+## 2026-05-28 EP 8 x 2 指标口径修正
+
+口径修正：
+
+- 当前双机测试拓扑是 `EP 8 x 2`：每台 p5en 机器 8 个 local ranks，一共 2 个
+  scaleout 节点。
+- `v2_proxy_smoke.py` 同时打印：
+  - `SO`: scale-out，跨节点 EFA/RDMA 方向，是用户要看的 `EP 8 x 2`
+    网络指标。
+  - `SU`: scale-up，同节点 NVLink 方向，只能反映本机 8 卡内部转发/聚合。
+- 之前记录里多次强调 `SU`，这是汇报口径错误；后续 EP 8 x 2 性能目标以
+  `SO/RDMA` 为主。
+
+README 形状、RDMA-only benchmark：
+
+- 命令核心参数：
+  - `torchrun --nnodes=2 --nproc_per_node=8`
+  - `--num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256`
+  - `--iters 10 --use-fp8-dispatch --ignore-local-traffic`
+- 日志：
+  - `/tmp/v2_native_ep8x2_rdma_only_rank0.log`
+  - `/tmp/v2_native_ep8x2_rdma_only_rank1.log`
+- `rank=0/16`:
+  - `* dispatch`: `16 GB/s (SO)`, `3752.333 us`
+  - `- expanded dispatch`: `16 GB/s (SO)`, `3875.835 us`
+  - `# cached dispatch`: `22 GB/s (SO)`, `2779.841 us`
+  - `@ combine`: `8 GB/s (SO)`, `15544.473 us`
+  - `+ reduced combine`: `6 GB/s (SO)`, `18769.342 us`
+- `rank=8/16`:
+  - `* dispatch`: `16 GB/s (SO)`, `3719.465 us`
+  - `- expanded dispatch`: `15 GB/s (SO)`, `4071.116 us`
+  - `# cached dispatch`: `22 GB/s (SO)`, `2758.616 us`
+  - `@ combine`: `8 GB/s (SO)`, `15575.101 us`
+  - `+ reduced combine`: `6 GB/s (SO)`, `18936.930 us`
+
+结论：
+
+- 真正按 `EP 8 x 2` 的 RDMA/SO 口径看，当前 native V2 UCCL wrapper 仍很低，
+  远低于 README SM90 CX7 `EP 8 x 2` 的 dispatch `90 GB/s`、combine `81 GB/s`
+  目标。
+- 当前主要瓶颈不是同节点 scale-up，而是跨节点 EFA 数据面的 V2 combine/dispatch
+  语义仍复用了 legacy token/chunk staging 与 per-token head/tail 协议。

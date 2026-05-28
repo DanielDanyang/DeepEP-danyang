@@ -75,6 +75,39 @@ __global__ void v2_metadata_count_kernel(
   }
 }
 
+__global__ void v2_intranode_metadata_count_kernel(
+    int const* recv_src_idx, int const* rank_prefix_matrix,
+    int64_t const* recv_topk_idx, int num_recv_tokens, int num_topk,
+    int num_ranks, int num_scaleup_ranks, int num_local_experts,
+    int num_max_tokens_per_rank, int rank, int* recv_src_metadata,
+    int* scaleup_counts, int* raw_expert_counts, int* dst_buffer_slot_idx) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_recv_tokens) return;
+
+  int src_rank = 0;
+  for (int i = 0; i < num_ranks; ++i) {
+    int prefix = rank_prefix_matrix[i * num_ranks + rank];
+    if (idx < prefix) {
+      src_rank = i;
+      break;
+    }
+  }
+
+  int src_token_idx = recv_src_idx[idx];
+  recv_src_metadata[idx * (2 + num_topk)] =
+      src_rank * num_max_tokens_per_rank + src_token_idx;
+  recv_src_metadata[idx * (2 + num_topk) + 1] = idx;
+  dst_buffer_slot_idx[idx] = idx;
+  atomicAdd(scaleup_counts + (src_rank % num_scaleup_ranks), 1);
+
+  for (int i = 0; i < num_topk; ++i) {
+    int expert = static_cast<int>(recv_topk_idx[idx * num_topk + i]);
+    recv_src_metadata[idx * (2 + num_topk) + 2 + i] = -1;
+    if (0 <= expert && expert < num_local_experts)
+      atomicAdd(raw_expert_counts + expert, 1);
+  }
+}
+
 __global__ void v2_metadata_prefix_kernel(
     int* scaleup_counts, int* raw_expert_counts, int* psum_scaleup,
     int* psum_expert, int* expanded_expert_cursor, int num_scaleup_ranks,
@@ -145,6 +178,58 @@ void build_v2_dispatch_metadata(
       reinterpret_cast<SourceMeta const*>(recv_src_meta), recv_topk_idx,
       num_recv_tokens, num_topk, num_scaleup_ranks, num_local_experts,
       num_max_tokens_per_rank, recv_src_metadata,
+      psum_num_recv_tokens_per_scaleup_rank, raw_num_recv_tokens_per_expert,
+      dst_buffer_slot_idx);
+  CUDA_CHECK(cudaGetLastError());
+
+  v2_metadata_prefix_kernel<<<1, 1, 0, stream>>>(
+      psum_num_recv_tokens_per_scaleup_rank, raw_num_recv_tokens_per_expert,
+      psum_num_recv_tokens_per_scaleup_rank,
+      psum_num_recv_tokens_per_expert, expanded_expert_cursor,
+      num_scaleup_ranks, num_local_experts, expert_alignment);
+  CUDA_CHECK(cudaGetLastError());
+
+  v2_metadata_expanded_slot_kernel<<<
+      (num_recv_tokens * num_topk + kThreads - 1) / kThreads, kThreads, 0,
+      stream>>>(recv_topk_idx, num_recv_tokens, num_topk, num_local_experts,
+                recv_src_metadata, expanded_expert_cursor);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void build_v2_intranode_dispatch_metadata(
+    int const* recv_src_idx, int const* rank_prefix_matrix,
+    int64_t const* recv_topk_idx, int num_recv_tokens, int num_topk,
+    int num_ranks, int num_scaleup_ranks, int num_local_experts,
+    int num_max_tokens_per_rank, int expert_alignment, int* recv_src_metadata,
+    int* psum_num_recv_tokens_per_scaleup_rank,
+    int* psum_num_recv_tokens_per_expert, int* dst_buffer_slot_idx,
+    int* raw_num_recv_tokens_per_expert, int* expanded_expert_cursor, int rank,
+    cudaStream_t stream) {
+  if (num_recv_tokens <= 0) {
+    CUDA_CHECK(cudaMemsetAsync(psum_num_recv_tokens_per_scaleup_rank, 0,
+                              num_scaleup_ranks * sizeof(int), stream));
+    CUDA_CHECK(cudaMemsetAsync(psum_num_recv_tokens_per_expert, 0,
+                              num_local_experts * sizeof(int), stream));
+    CUDA_CHECK(cudaMemsetAsync(raw_num_recv_tokens_per_expert, 0,
+                              num_local_experts * sizeof(int), stream));
+    CUDA_CHECK(cudaMemsetAsync(expanded_expert_cursor, 0,
+                              num_local_experts * sizeof(int), stream));
+    return;
+  }
+
+  CUDA_CHECK(cudaMemsetAsync(psum_num_recv_tokens_per_scaleup_rank, 0,
+                            num_scaleup_ranks * sizeof(int), stream));
+  CUDA_CHECK(cudaMemsetAsync(raw_num_recv_tokens_per_expert, 0,
+                            num_local_experts * sizeof(int), stream));
+  CUDA_CHECK(cudaMemsetAsync(expanded_expert_cursor, 0,
+                            num_local_experts * sizeof(int), stream));
+
+  constexpr int kThreads = 256;
+  v2_intranode_metadata_count_kernel<<<
+      (num_recv_tokens + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+      recv_src_idx, rank_prefix_matrix, recv_topk_idx, num_recv_tokens,
+      num_topk, num_ranks, num_scaleup_ranks, num_local_experts,
+      num_max_tokens_per_rank, rank, recv_src_metadata,
       psum_num_recv_tokens_per_scaleup_rank, raw_num_recv_tokens_per_expert,
       dst_buffer_slot_idx);
   CUDA_CHECK(cudaGetLastError());

@@ -319,11 +319,7 @@ class ElasticBuffer:
         expert_alignment: int,
         previous_event=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
-        # UCCL 数据包里的 SourceMeta 已携带 source rank/token；V2 metadata
-        # 由 ElasticProxyBuffer 的 native CUDA helper 生成，不再依赖 compatibility
-        # Buffer 类里的 V1 wrapper 方法。
         num_local_experts = num_experts // self.num_ranks
-        recv_src_meta = transport_handle[9]
         num_recv_tokens = int(recv_topk_idx.size(0))
         num_topk = int(recv_topk_idx.size(1))
         recv_metadata = torch.empty(
@@ -346,26 +342,56 @@ class ElasticBuffer:
         expanded_expert_cursor = torch.empty(
             (num_local_experts,), dtype=torch.int32, device=recv_topk_idx.device
         )
-        self.runtime.build_v2_dispatch_metadata(
-            recv_src_meta.data_ptr(),
-            recv_topk_idx.data_ptr(),
-            num_recv_tokens,
-            num_topk,
-            self.num_scaleup_ranks,
-            num_local_experts,
-            int(num_max_tokens_per_rank),
-            int(expert_alignment),
-            recv_metadata.data_ptr(),
-            psum_scaleup.data_ptr(),
-            psum_expert.data_ptr(),
-            dst_buffer_slot_idx.data_ptr(),
-            raw_expert_counts.data_ptr(),
-            expanded_expert_cursor.data_ptr(),
-            getattr(previous_event, "event", None),
-            False,
-            False,
-            self._compute_stream_ptr(),
-        )
+        if len(transport_handle) >= 10:
+            # Internode path: UCCL packet metadata carries source RDMA rank,
+            # source NVL rank, and source token index.
+            recv_src_meta = transport_handle[9]
+            self.runtime.build_v2_dispatch_metadata(
+                recv_src_meta.data_ptr(),
+                recv_topk_idx.data_ptr(),
+                num_recv_tokens,
+                num_topk,
+                self.num_scaleup_ranks,
+                num_local_experts,
+                int(num_max_tokens_per_rank),
+                int(expert_alignment),
+                recv_metadata.data_ptr(),
+                psum_scaleup.data_ptr(),
+                psum_expert.data_ptr(),
+                dst_buffer_slot_idx.data_ptr(),
+                raw_expert_counts.data_ptr(),
+                expanded_expert_cursor.data_ptr(),
+                getattr(previous_event, "event", None),
+                False,
+                False,
+                self._compute_stream_ptr(),
+            )
+        else:
+            # Intranode path: transport returns source token indices plus a
+            # rank-prefix matrix. The native helper reconstructs V2 global
+            # source token ids from those two tensors.
+            rank_prefix_matrix = transport_handle[0]
+            recv_src_idx = transport_handle[4]
+            self.runtime.build_v2_intranode_dispatch_metadata(
+                recv_src_idx.data_ptr(),
+                rank_prefix_matrix.data_ptr(),
+                recv_topk_idx.data_ptr(),
+                num_recv_tokens,
+                num_topk,
+                num_local_experts,
+                int(num_max_tokens_per_rank),
+                int(expert_alignment),
+                recv_metadata.data_ptr(),
+                psum_scaleup.data_ptr(),
+                psum_expert.data_ptr(),
+                dst_buffer_slot_idx.data_ptr(),
+                raw_expert_counts.data_ptr(),
+                expanded_expert_cursor.data_ptr(),
+                getattr(previous_event, "event", None),
+                False,
+                False,
+                self._compute_stream_ptr(),
+            )
         recv_metadata = recv_metadata[:num_recv_tokens]
         dst_buffer_slot_idx = dst_buffer_slot_idx[:num_recv_tokens]
         aligned_expert_counts = [
