@@ -1699,13 +1699,14 @@ __global__ void __launch_bounds__(
         auto shifted =
             nvl_channel_x.buffer() + token_idx_in_buffer * num_bytes_per_token;
         SourceMeta meta;
-        meta.src_rdma_rank = ld_acquire_sys_global(
-            reinterpret_cast<int const*>(shifted + hidden_bytes + scale_bytes));
+        auto meta_ptr =
+            reinterpret_cast<int const*>(shifted + hidden_bytes + scale_bytes);
+        meta.src_rdma_rank = ld_acquire_sys_global(meta_ptr);
         meta.is_token_in_nvl_rank_bits =
-            ld_acquire_sys_global(reinterpret_cast<int const*>(
-                                      shifted + hidden_bytes + scale_bytes) +
-                                  1) &
+            ld_acquire_sys_global(meta_ptr + 1) &
             0xFF;  // mask out epoch tag, keep lower 8 routing bits
+        meta.src_nvl_rank = ld_acquire_sys_global(meta_ptr + 2);
+        meta.src_token_idx = ld_acquire_sys_global(meta_ptr + 3);
         int64_t recv_token_idx =
             __shfl_sync(WARP_MASK, total_offset, meta.src_rdma_rank);
         (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
