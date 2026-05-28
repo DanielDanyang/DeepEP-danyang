@@ -6,6 +6,8 @@
 #include "uccl_ibgda.cuh"
 #include <functional>
 #include <optional>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 // #include "ibgda_device.cuh"
 #include "internode.cuh"
 
@@ -210,6 +212,91 @@ void build_v2_expanded_payload(
       hidden_bytes / static_cast<int>(sizeof(int4)), hidden_bytes, num_scales,
       reinterpret_cast<uint8_t*>(expanded_x), expanded_x_scales,
       expanded_topk_weights);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+__device__ __forceinline__ float v2_to_float(T value) {
+  return static_cast<float>(value);
+}
+
+template <>
+__device__ __forceinline__ float v2_to_float<__half>(__half value) {
+  return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float v2_to_float<__nv_bfloat16>(
+    __nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T v2_from_float(float value) {
+  return static_cast<T>(value);
+}
+
+template <>
+__device__ __forceinline__ __half v2_from_float<__half>(float value) {
+  return __float2half(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 v2_from_float<__nv_bfloat16>(
+    float value) {
+  return __float2bfloat16(value);
+}
+
+template <typename T>
+__global__ void v2_reduced_combine_input_kernel(
+    T const* expanded_x, int const* recv_src_metadata, int num_recv_tokens,
+    int num_topk, int hidden, T* reduced_x) {
+  int token_idx = blockIdx.x;
+  int hidden_idx = blockIdx.y * blockDim.x + threadIdx.x;
+  if (token_idx >= num_recv_tokens || hidden_idx >= hidden) return;
+
+  float acc = 0.0f;
+  int const* slots = recv_src_metadata + token_idx * (2 + num_topk) + 2;
+  for (int i = 0; i < num_topk; ++i) {
+    int slot = slots[i];
+    if (slot >= 0) acc += v2_to_float(expanded_x[slot * hidden + hidden_idx]);
+  }
+  reduced_x[token_idx * hidden + hidden_idx] = v2_from_float<T>(acc);
+}
+
+void build_v2_reduced_combine_input(
+    void const* expanded_x, int const* recv_src_metadata, int num_recv_tokens,
+    int num_topk, int hidden, cudaDataType_t type, void* reduced_x,
+    cudaStream_t stream) {
+  EP_HOST_ASSERT(expanded_x != nullptr);
+  EP_HOST_ASSERT(recv_src_metadata != nullptr);
+  EP_HOST_ASSERT(reduced_x != nullptr);
+  EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 && hidden > 0);
+  if (num_recv_tokens <= 0) return;
+
+  constexpr int kThreads = 256;
+  dim3 grid(num_recv_tokens, (hidden + kThreads - 1) / kThreads);
+  switch (type) {
+    case CUDA_R_16BF:
+      v2_reduced_combine_input_kernel<<<grid, kThreads, 0, stream>>>(
+          reinterpret_cast<__nv_bfloat16 const*>(expanded_x),
+          recv_src_metadata, num_recv_tokens, num_topk, hidden,
+          reinterpret_cast<__nv_bfloat16*>(reduced_x));
+      break;
+    case CUDA_R_16F:
+      v2_reduced_combine_input_kernel<<<grid, kThreads, 0, stream>>>(
+          reinterpret_cast<__half const*>(expanded_x), recv_src_metadata,
+          num_recv_tokens, num_topk, hidden,
+          reinterpret_cast<__half*>(reduced_x));
+      break;
+    case CUDA_R_32F:
+      v2_reduced_combine_input_kernel<<<grid, kThreads, 0, stream>>>(
+          reinterpret_cast<float const*>(expanded_x), recv_src_metadata,
+          num_recv_tokens, num_topk, hidden, reinterpret_cast<float*>(reduced_x));
+      break;
+    default:
+      EP_HOST_ASSERT(false && "Unsupported V2 reduced combine input dtype");
+  }
   CUDA_CHECK(cudaGetLastError());
 }
 

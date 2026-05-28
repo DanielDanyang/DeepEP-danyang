@@ -1275,6 +1275,40 @@ class Buffer {
     return event;
   }
 
+  std::optional<EventHandle> build_v2_reduced_combine_input(
+      std::uintptr_t expanded_x_ptr, std::uintptr_t recv_src_metadata_ptr,
+      int num_recv_tokens, int num_topk, int hidden, int dtype_code,
+      std::uintptr_t reduced_x_ptr, std::optional<EventHandle>& previous_event,
+      bool async, bool allocate_on_comm_stream,
+      std::uintptr_t compute_stream_ptr) {
+    EP_HOST_ASSERT(expanded_x_ptr != 0);
+    EP_HOST_ASSERT(recv_src_metadata_ptr != 0);
+    EP_HOST_ASSERT(reduced_x_ptr != 0);
+    EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 && hidden > 0);
+
+    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
+    static_cast<void>(allocate_on_comm_stream);
+    if (previous_event.has_value()) {
+      stream_wait(comm_stream, previous_event.value());
+    } else {
+      stream_wait(comm_stream, compute_stream);
+    }
+
+    uccl::internode::build_v2_reduced_combine_input(
+        reinterpret_cast<void const*>(expanded_x_ptr),
+        reinterpret_cast<int const*>(recv_src_metadata_ptr), num_recv_tokens,
+        num_topk, hidden, cuda_dtype_from_code(dtype_code),
+        reinterpret_cast<void*>(reduced_x_ptr), comm_stream);
+
+    std::optional<EventHandle> event;
+    if (async) {
+      event = EventHandle(comm_stream);
+    } else {
+      stream_wait(compute_stream, comm_stream);
+    }
+    return event;
+  }
+
   std::optional<EventHandle> internode_combine(
       std::uintptr_t x_ptr, int num_tokens, int hidden, int x_dtype_code,
       int x_element_size, std::uintptr_t topk_weights_ptr, int num_topk,
@@ -2482,6 +2516,31 @@ NB_MODULE(ep, m) {
           nb::arg("expanded_x_scales_ptr"),
           nb::arg("expanded_topk_weights_ptr"),
           nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
+          nb::arg("allocate_on_comm_stream") = false,
+          nb::arg("compute_stream_ptr") = 0)
+      .def(
+          "build_v2_reduced_combine_input",
+          [](Buffer& self, std::uintptr_t expanded_x_ptr,
+             std::uintptr_t recv_src_metadata_ptr, int num_recv_tokens,
+             int num_topk, int hidden, int dtype_code,
+             std::uintptr_t reduced_x_ptr, nb::object previous_event,
+             bool async, bool allocate_on_comm_stream,
+             std::uintptr_t compute_stream_ptr) {
+            std::optional<EventHandle> prev;
+            if (!previous_event.is_none()) {
+              EventHandle ev = nb::cast<EventHandle>(previous_event);
+              prev = ev;
+            }
+            return self.build_v2_reduced_combine_input(
+                expanded_x_ptr, recv_src_metadata_ptr, num_recv_tokens,
+                num_topk, hidden, dtype_code, reduced_x_ptr, prev, async,
+                allocate_on_comm_stream, compute_stream_ptr);
+          },
+          nb::arg("expanded_x_ptr"), nb::arg("recv_src_metadata_ptr"),
+          nb::arg("num_recv_tokens"), nb::arg("num_topk"),
+          nb::arg("hidden"), nb::arg("dtype_code"),
+          nb::arg("reduced_x_ptr"), nb::arg("previous_event") = nb::none(),
+          nb::arg("async") = false,
           nb::arg("allocate_on_comm_stream") = false,
           nb::arg("compute_stream_ptr") = 0)
       .def(

@@ -30,6 +30,11 @@ void build_v2_expanded_payload(
     void* expanded_x, float* expanded_x_scales, float* expanded_topk_weights,
     cudaStream_t stream);
 
+void build_v2_reduced_combine_input(
+    void const* expanded_x, int const* recv_src_metadata, int num_recv_tokens,
+    int num_topk, int hidden, cudaDataType_t type, void* reduced_x,
+    cudaStream_t stream);
+
 __host__ __device__ __forceinline__ int get_num_bytes_per_token(
     int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights);
 

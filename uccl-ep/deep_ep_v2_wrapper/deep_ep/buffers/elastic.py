@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -152,13 +153,103 @@ class ElasticBuffer:
     def capture() -> EventOverlap:
         return UcclBuffer.capture()
 
-    @staticmethod
-    def get_theoretical_num_sms(num_experts: Optional[int] = None, num_topk: Optional[int] = None) -> int:
-        return 24 if torch.version.cuda else 64
+    def get_theoretical_num_sms(
+        self,
+        num_experts: Optional[int] = None,
+        num_topk: Optional[int] = None,
+        num_scaleout_topk: int = 0,
+        rdma_gbs: float = 0,
+        nvlink_gbs: float = 0,
+        sm_read_gbs: float = 200,
+        sm_write_gbs: float = 50,
+    ) -> int:
+        if num_experts is None or num_topk is None:
+            return min(torch.cuda.get_device_properties("cuda").multi_processor_count, 64)
+        if num_scaleout_topk != 0:
+            raise NotImplementedError("group-limited gate SM modeling is not implemented")
 
-    @staticmethod
-    def get_theoretical_num_qps(num_sms: int) -> int:
-        return max(1, int(num_sms))
+        if rdma_gbs == 0 and self.num_rdma_ranks > 1:
+            rdma_gbs = float(os.environ.get("EP_RDMA_GBS", "400"))
+        if nvlink_gbs == 0:
+            nvlink_gbs = float(os.environ.get("EP_NVLINK_GBS", "900"))
+
+        def expected_topk(num_groups: int) -> float:
+            if num_groups <= 1:
+                return 1.0
+            return num_groups * (
+                1
+                - math.comb(num_experts - num_experts // num_groups, num_topk)
+                / math.comb(num_experts, num_topk)
+            )
+
+        num_expected_scaleout_topk = (
+            expected_topk(self.num_scaleout_ranks) if self.num_scaleout_ranks > 1 else 0
+        )
+        num_expected_topk = expected_topk(self.num_ranks)
+
+        sm_read = 1 / num_expected_topk
+        sm_write = 0.0
+        rdma_traffic = 0.0
+        nvlink_traffic = 0.0
+
+        if self.num_scaleout_ranks > 1:
+            sm_write += 1 / num_expected_topk
+            sm_write += (
+                (1 / num_expected_topk)
+                * (num_expected_scaleout_topk / self.num_scaleout_ranks)
+            )
+            rdma_traffic += (
+                (1 / num_expected_topk)
+                * (num_expected_scaleout_topk * (1 - 1 / self.num_scaleout_ranks))
+            )
+            sm_read += num_expected_scaleout_topk / num_expected_topk
+            sm_write += 1
+            nvlink_traffic += 1 - (1 / self.num_scaleup_ranks)
+        else:
+            if self.num_rdma_ranks > 1:
+                sm_write += 1 / num_expected_topk
+            sm_write += self.num_nvlink_ranks / self.num_ranks
+            nvlink_traffic += (
+                self.num_nvlink_ranks / self.num_ranks * (1 - 1 / self.num_nvlink_ranks)
+            )
+            rdma_traffic += (self.num_ranks - self.num_nvlink_ranks) / self.num_ranks
+
+        if self.num_scaleout_ranks > 1 and rdma_gbs > 0 and (
+            rdma_traffic / rdma_gbs
+        ) > (nvlink_traffic / nvlink_gbs):
+            bounded_traffic, bounded_gbs = rdma_traffic, rdma_gbs
+        else:
+            bounded_traffic, bounded_gbs = nvlink_traffic, nvlink_gbs
+
+        num_device_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+        num_sms = num_device_sms
+        if bounded_traffic > 0:
+            num_sms = max(
+                bounded_gbs / bounded_traffic * sm_read / sm_read_gbs,
+                bounded_gbs / bounded_traffic * sm_write / sm_write_gbs,
+            )
+        num_sms = _align(max(4, math.ceil(num_sms * 1.25)), 2)
+        num_sms = num_sms if self.prefer_overlap_with_compute else max(num_sms, 64)
+        num_sms = min(num_sms, num_device_sms)
+        legacy_cap = int(os.environ.get("EP_UCCL_MAX_AUTO_SMS", "32"))
+        if legacy_cap > 0:
+            num_sms = min(num_sms, legacy_cap)
+
+        if os.environ.get("EP_BUFFER_DEBUG", "0") != "0" and self.rank_idx == 0:
+            print(
+                "EP SM approximation: "
+                f"{sm_read=}, {sm_write=}, {rdma_traffic=}, {nvlink_traffic=}, "
+                f"{rdma_gbs=}, {nvlink_gbs=}, {num_expected_scaleout_topk=}, "
+                f"{num_expected_topk=}, {bounded_traffic=}, {bounded_gbs=}, {num_sms=}",
+                flush=True,
+            )
+        return int(num_sms)
+
+    def get_theoretical_num_qps(self, num_sms: int) -> int:
+        num_qps = min(int(num_sms), 9)
+        if self.allow_hybrid_mode:
+            num_qps = int(num_sms) * 16 + 1
+        return min(num_qps, self.num_allocated_qps) if self.num_allocated_qps else num_qps
 
     def barrier(self, use_comm_stream: bool = True, with_cpu_sync: bool = False) -> None:
         if with_cpu_sync:
@@ -263,6 +354,11 @@ class ElasticBuffer:
         use_tma_aligned_col_major_sf: bool = False,
     ):
         x_tensor = x[0] if isinstance(x, tuple) else x
+        if num_sms == 0:
+            if handle is not None:
+                num_sms = handle.num_sms
+            elif num_experts is not None and topk_idx is not None:
+                num_sms = self.get_theoretical_num_sms(int(num_experts), int(topk_idx.size(1)))
         legacy = self._ensure_legacy_buffer(int(x_tensor.size(1)), int(num_sms))
         if num_sms:
             UcclBuffer.set_num_sms(int(num_sms))
@@ -383,17 +479,16 @@ class ElasticBuffer:
         if num_sms or handle.num_sms:
             UcclBuffer.set_num_sms(int(num_sms or handle.num_sms))
         if handle.do_expand:
-            # expanded combine 收到的是按 expert slot 排列的输入；UCCL
-            # legacy combine 需要 per-token reduced 输入。这里根据 V2
-            # metadata 把有效 slot gather 回来并按 topk 顺序求和，然后交给
-            # UCCL proxy/EFA 数据面做真正跨节点 combine。
             num_topk = int(handle.topk_idx.size(1))
-            slots = handle.recv_src_metadata[:, 2 : 2 + num_topk].to(torch.long)
-            valid = slots >= 0
-            safe_slots = slots.clamp_min(0)
-            gathered = x[safe_slots]
-            gathered = gathered.masked_fill(~valid.unsqueeze(-1), 0)
-            x = gathered.sum(dim=1)
+            x, reduce_event = legacy.build_v2_reduced_combine_input(
+                x,
+                handle.recv_src_metadata,
+                num_topk,
+                previous_event=previous_event,
+                async_finish=False,
+                allocate_on_comm_stream=bool(allocate_on_comm_stream),
+            )
+            previous_event = reduce_event
             topk_weights = None
         return legacy.combine(
             x,

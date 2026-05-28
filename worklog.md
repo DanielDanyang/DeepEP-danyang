@@ -691,3 +691,71 @@ DeepEP V2 风格 EP16 结果：
 - 普通 dispatch 和 cached dispatch 还可以，`~94-95 GB/s (SU)` 和 `~112 GB/s (SU)`。
 - expanded dispatch、combine、reduced combine 明显暴露 wrapper 方案的问题，尤其 reduced combine 只有 `~25 GB/s (SU)`。
 - 下一步应该继续把 V2 expanded/reduced-combine 路径下沉到 native/CUDA，而不是再用 Python wrapper 把 V1/UCCL legacy 语义拼成 V2。
+
+## 2026-05-28 V2 reduced-combine 下沉到 native/CUDA
+
+代码改动：
+
+- 新增 native CUDA helper `build_v2_reduced_combine_input`：
+  - `uccl-ep/include/internode.cuh`
+  - `uccl-ep/src/internode.cu`
+  - `uccl-ep/src/uccl_ep.cc`
+  - `uccl-ep/deep_ep_v2_wrapper/deep_ep/buffer.py`
+- `ElasticBuffer.combine(handle.do_expand=True)` 不再用 Python `x[slots].sum(dim=1)` 构造 reduced combine 输入，改为调用 CUDA kernel：
+  - 输入：expanded expert-slot layout `[num_expanded_tokens, hidden]`
+  - metadata：`recv_src_metadata[:, 2:2+topk]` 中的 expanded slot
+  - 输出：legacy combine 需要的 per-token reduced layout `[num_recv_tokens, hidden]`
+- `ElasticBuffer.get_theoretical_num_sms()` 不再固定返回 24：
+  - 移植 DeepEP V2 的 bandwidth model，根据 `num_experts/topk/scaleout/scaleup/RDMA/NVLink` 推导 SM 数。
+  - AWS 默认 `EP_RDMA_GBS=400`、`EP_NVLINK_GBS=900`；可用环境变量覆盖。
+  - 因为当前数据面仍复用 UCCL legacy/V1 staging buffer，自动 SM 最后加 `EP_UCCL_MAX_AUTO_SMS` 上限，默认 32，避免 V1 buffer layout 的 int32 size 限制。显式 `--num-sms` 不走这个自动上限。
+
+构建：
+
+- 两台机器都重新安装 UCCL extension：
+  - `CUDA_HOME=/usr/local/cuda-13.0`
+  - `USE_DMABUF=1`
+  - `MAX_JOBS=16`
+- 构建日志：
+  - `/tmp/uccl_ep_build_v2_native_rank0.log`
+  - `/tmp/uccl_ep_build_v2_native_rank1.log`
+
+验证：
+
+- 错误启动记录：最初误用 `torchrun --nproc_per_node=8 tests/elastic/test_ep.py --num-processes 8`，导致每节点 64 个进程，NCCL 报 `too many XML nodes (max 256)`；这不是代码语义错误。
+- 正确 correctness 启动方式：两台各跑一个 Python 进程，由 `test_ep.py --num-processes 8` 内部 spawn 本机 8 个 local ranks。
+- EP16 correctness 通过：
+  - `tests/elastic/test_ep.py --num-processes 8 --test-first-only --skip-perf-test --num-tokens 256 --hidden 7168 --num-topk 8 --num-experts 256`
+  - 日志：
+    - `/tmp/v2_native_reduced_correctness_cap_rank0.log`
+    - `/tmp/v2_native_reduced_correctness_cap_rank1.log`
+
+DeepEP V2 风格 EP16 benchmark，自动 SM：
+
+- 命令核心参数：
+  - `torchrun --nnodes=2 --nproc_per_node=8`
+  - `--num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256`
+  - `--iters 10 --use-fp8-dispatch`
+  - 未传 `--num-sms`，自动选择 `#SM=32`、`#QPs=513/0`
+- 日志：
+  - `/tmp/v2_native_auto_sm_bench_rank0.log`
+  - `/tmp/v2_native_auto_sm_bench_rank1.log`
+- `rank=0/16`:
+  - `* dispatch`: `20 GB/s (SO), 66 GB/s (SU), 6106.753 us, 402704640 bytes`
+  - `- expanded dispatch`: `31 GB/s (SO), 102 GB/s (SU), 3934.980 us, 402704640 bytes`
+  - `# cached dispatch`: `46 GB/s (SO), 151 GB/s (SU), 2667.677 us, 402704640 bytes`
+  - `@ combine`: `13 GB/s (SO), 42 GB/s (SU), 18186.205 us, 772711040 bytes`
+  - `+ reduced combine`: `10 GB/s (SO), 35 GB/s (SU), 22370.132 us, 772711040 bytes`
+- `rank=8/16`:
+  - `* dispatch`: `20 GB/s (SO), 67 GB/s (SU), 6000.972 us, 399949056 bytes`
+  - `- expanded dispatch`: `30 GB/s (SO), 99 GB/s (SU), 4053.083 us, 399949056 bytes`
+  - `# cached dispatch`: `47 GB/s (SO), 155 GB/s (SU), 2577.602 us, 399949056 bytes`
+  - `@ combine`: `13 GB/s (SO), 42 GB/s (SU), 18293.443 us, 767423616 bytes`
+  - `+ reduced combine`: `10 GB/s (SO), 34 GB/s (SU), 22382.804 us, 767423616 bytes`
+
+观察：
+
+- native reduced-combine gather 把 reduced combine 从上一版 `~30.4 ms / ~25 GB/s (SU)` 提升到 `~22.4 ms / ~34-35 GB/s (SU)`。
+- expanded dispatch 在自动 `#SM=32` 下回到 `~99-102 GB/s (SU)`，cached dispatch 到 `~151-155 GB/s (SU)`。
+- 普通 uncached dispatch 变慢到 `~66-67 GB/s (SU)`，主要因为自动 SM=32 改变了 legacy dispatch config 和 layout/metadata overhead；后续需要把 uncached layout/metadata 也继续 native 化，而不是依赖 V1 layout path。
+- combine 本身仍只有 `~42 GB/s (SU)`，说明下一个大瓶颈是 UCCL legacy combine 数据面和 V2 combine/reduce 语义没有真正融合。

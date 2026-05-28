@@ -399,6 +399,51 @@ class Buffer:
             event, tensors_to_record if async_finish else None
         )
 
+    def build_v2_reduced_combine_input(
+        self,
+        expanded_x: torch.Tensor,
+        recv_src_metadata: torch.Tensor,
+        num_topk: int,
+        previous_event: Optional[EventOverlap] = None,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ):
+        num_recv_tokens = int(recv_src_metadata.size(0))
+        hidden = int(expanded_x.size(1))
+        alloc_ctx = (
+            torch.cuda.stream(self.get_comm_stream())
+            if allocate_on_comm_stream
+            else nullcontext()
+        )
+        with alloc_ctx:
+            reduced_x = torch.empty(
+                (max(num_recv_tokens, 1), hidden),
+                dtype=expanded_x.dtype,
+                device=expanded_x.device,
+            )
+
+        event = self.runtime.build_v2_reduced_combine_input(
+            expanded_x.data_ptr(),
+            recv_src_metadata.data_ptr(),
+            num_recv_tokens,
+            int(num_topk),
+            hidden,
+            Buffer._dtype_code(expanded_x.dtype),
+            reduced_x.data_ptr(),
+            getattr(previous_event, "event", None),
+            bool(async_finish),
+            bool(allocate_on_comm_stream),
+            self._ll_compute_stream_ptr(expanded_x.device),
+        )
+        tensors_to_record = (
+            expanded_x,
+            recv_src_metadata,
+            reduced_x,
+        )
+        return reduced_x[:num_recv_tokens], EventOverlap(
+            event, tensors_to_record if async_finish else None
+        )
+
     def destroy(self):
         """
         Destroy the cpp runtime and release resources.
