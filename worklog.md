@@ -556,3 +556,39 @@ Benchmark 结果：
 
 - 已检查 `p5en_0` 和 `p5en_1`，两台机器 GPU 都被 `sglang::scheduler_TP*` 进程占用，每张卡约 `124176 MiB`。
 - 按 AGENTS 约束，本轮没有同步服务器、没有构建、没有 benchmark。
+
+## 2026-05-28 expanded dispatch EP16 验证
+
+本地代码改动：
+
+- commit: `4d09c05 Respect local world size in V2 wrapper`
+  - `ElasticBuffer` 改为优先读取 `LOCAL_WORLD_SIZE`，避免 2 节点 x 2 rank smoke 被误判为 `Ranks: 1 x 4`。
+- commit: `759bc85 Preserve V2 source token metadata through NVL`
+  - NVL receiver 读取完整 `SourceMeta` 四个字段，保留 `src_nvl_rank` 和 `src_token_idx`；仍对 routing bits mask 掉 RDMA epoch tag。
+- commit: `745d928 Report expanded V2 dispatch timing`
+  - `uccl-ep/bench/v2_proxy_smoke.py` 增加 `expanded_dispatch_avg_ms`。
+
+服务器构建：
+
+- 两台机器均在 `/home/ubuntu/.venvs/deepep-danyang-cu13` 中安装 wrapper。
+- PyTorch 是 CUDA 13.0 build，所以扩展用 `/usr/local/cuda-13.0` 构建。
+- UCCL 扩展用 `USE_DMABUF=1` 重建；EP16 日志确认 GPU RDMA buffer 通过 DMA-BUF 注册，单 rank RDMA buffer 约 `484131712` bytes。
+
+验证结果：
+
+- EP16 correctness：
+  - 命令：`tests/elastic/test_ep.py --num-processes 8 --test-first-only --skip-perf-test --num-tokens 256 --hidden 7168 --num-topk 8 --num-experts 256 --num-sms 20`
+  - 结果：`p5en_0` 和 `p5en_1` 均 exit code `0`。
+  - 覆盖普通 dispatch、expanded dispatch、cached dispatch、combine、reduced combine 的 first case correctness。
+- EP16 FP8 smoke benchmark：
+  - 命令：`torchrun --nnodes=2 --nproc_per_node=8 ... uccl-ep/bench/v2_proxy_smoke.py --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 --iters 3 --use-fp8-dispatch`
+  - 日志：
+    - `/tmp/v2_proxy_smoke_8192_fp8_expanded_rank0.log`
+    - `/tmp/v2_proxy_smoke_8192_fp8_expanded_rank1.log`
+  - `rank=0/16`: `recv=(53780, 7168)`, `dispatch_avg_ms=4.009`, `expanded_dispatch_avg_ms=5.281`, `cached_dispatch_avg_ms=3.088`
+  - `rank=8/16`: `recv=(53412, 7168)`, `dispatch_avg_ms=3.874`, `expanded_dispatch_avg_ms=5.124`, `cached_dispatch_avg_ms=3.098`
+
+备注：
+
+- 2 节点 x 2 rank smoke 仍不适合当前 UCCL legacy HT path，因为 `Config.get_rdma_buffer_size_hint(hidden_bytes, num_ranks)` 对 `num_ranks < 8` 返回 0；EP16 是当前有效目标形态。
+- 最后检查两台机器 `nvidia-smi --query-compute-apps` 为空，没有残留 benchmark 进程。
