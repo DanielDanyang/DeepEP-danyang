@@ -82,6 +82,7 @@ def main() -> None:
 
     ok = False
     recv_x = recv_topk_idx = recv_topk_weights = handle = combined_x = combined_topk_weights = None
+    expanded_recv_x = expanded_recv_topk_idx = expanded_recv_topk_weights = expanded_handle = None
     cached_recv_x = cached_recv_topk_idx = cached_recv_topk_weights = cached_handle = None
     try:
         recv_x, recv_topk_idx, recv_topk_weights, handle, event = buffer.dispatch(
@@ -91,6 +92,17 @@ def main() -> None:
             num_experts=args.num_experts,
             num_max_tokens_per_rank=args.num_tokens,
             expert_alignment=1,
+        )
+        wait_event(event)
+        expanded_recv_x, expanded_recv_topk_idx, expanded_recv_topk_weights, expanded_handle, event = buffer.dispatch(
+            x=x,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_experts=args.num_experts,
+            num_max_tokens_per_rank=args.num_tokens,
+            expert_alignment=1,
+            do_expand=True,
+            use_tma_aligned_col_major_sf=True,
         )
         wait_event(event)
         if args.use_fp8_dispatch:
@@ -106,6 +118,7 @@ def main() -> None:
         dist.barrier(group)
 
         elapsed = []
+        expanded_elapsed = []
         cached_elapsed = []
         for _ in range(args.iters):
             dist.barrier(group)
@@ -126,6 +139,23 @@ def main() -> None:
             dist.barrier(group)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
+            expanded_recv_x, expanded_recv_topk_idx, expanded_recv_topk_weights, expanded_handle, event = buffer.dispatch(
+                x=x,
+                topk_idx=topk_idx,
+                topk_weights=topk_weights,
+                num_experts=args.num_experts,
+                num_max_tokens_per_rank=args.num_tokens,
+                expert_alignment=1,
+                do_expand=True,
+                use_tma_aligned_col_major_sf=True,
+            )
+            wait_event(event)
+            torch.cuda.synchronize()
+            expanded_elapsed.append(time.perf_counter() - t0)
+
+            dist.barrier(group)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
             cached_recv_x, cached_recv_topk_idx, cached_recv_topk_weights, cached_handle, event = buffer.dispatch(
                 x=x,
                 handle=handle,
@@ -135,12 +165,14 @@ def main() -> None:
             cached_elapsed.append(time.perf_counter() - t0)
 
         avg_ms = sum(elapsed) / len(elapsed) * 1e3
+        expanded_avg_ms = sum(expanded_elapsed) / len(expanded_elapsed) * 1e3
         cached_avg_ms = sum(cached_elapsed) / len(cached_elapsed) * 1e3
         if rank % int(os.environ["LOCAL_WORLD_SIZE"]) == 0:
             print(
                 f"[v2-proxy-smoke] rank={rank}/{world} local_rank={local_rank} "
                 f"recv={tensor_shape(recv_x)} combined={None if combined_x is None else tuple(combined_x.shape)} "
-                f"dispatch_avg_ms={avg_ms:.3f} cached_dispatch_avg_ms={cached_avg_ms:.3f}",
+                f"dispatch_avg_ms={avg_ms:.3f} expanded_dispatch_avg_ms={expanded_avg_ms:.3f} "
+                f"cached_dispatch_avg_ms={cached_avg_ms:.3f}",
                 flush=True,
             )
         ok = True
@@ -148,6 +180,7 @@ def main() -> None:
         if ok:
             dist.barrier(group)
         del recv_x, recv_topk_idx, recv_topk_weights, handle, combined_x, combined_topk_weights
+        del expanded_recv_x, expanded_recv_topk_idx, expanded_recv_topk_weights, expanded_handle
         del cached_recv_x, cached_recv_topk_idx, cached_recv_topk_weights, cached_handle
         del x, x_bf16, topk_idx, topk_weights
         torch.cuda.synchronize()
