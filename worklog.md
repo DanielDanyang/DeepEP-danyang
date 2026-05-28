@@ -635,3 +635,59 @@ Benchmark 结果：
 - expanded dispatch 已达到 README SM90 EP16 量级的 `~90 GB/s (SU)`；cached dispatch 约 `125-126 GB/s (SU)`。
 - combine 仍明显低，约 `43-44 GB/s (SU)`，是下一步主要瓶颈。
 - 首次 `--iters 3` 中 rank0 uncached dispatch 有明显 outlier，平均到 `16.988 ms`；`--iters 10` 后回到 `4.0-4.2 ms`，因此后续记录优先使用 `iters=10` 或更高迭代数。
+
+## 2026-05-28 DeepEP V2 风格 benchmark 修正
+
+问题修正：
+
+- 用户指出前一版“README 风格”不够 DeepEP V2：这个判断是对的。
+- 前一版主要是 UCCL legacy transport smoke，只把 wall-time 包成 README 类似格式；没有完整按 V2 的五段路径组织，也没有 reduced combine。
+- 本轮修改 `uccl-ep/bench/v2_proxy_smoke.py`：
+  - 输出改成官方 `tests/elastic/test_ep.py` 的五段符号风格：`* dispatch`、`- expanded dispatch`、`# cached dispatch`、`@ combine`、`+ reduced combine`。
+  - combine 输入改成按 V2 source metadata 生成的 pre-combine data，并用 `ordered_accumulate` 构造普通 combine 输入。
+  - reduced combine 输入改成 expanded handle slot 语义，不再用随机 tensor 当 smoke。
+  - 增加 `--num-sms` / `--num-qps` / `--expert-alignment`。
+- 本轮修改 `uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`：
+  - `_ensure_legacy_buffer()` 不再写死 24 SM，改成使用传入 `num_sms` 或 `get_theoretical_num_sms()`。
+  - dispatch / combine 会把 `num_sms` 下发到 UCCL `Buffer.set_num_sms()` 和 config 路径。
+
+验证：
+
+- 本地：
+  - `python -m py_compile uccl-ep/bench/v2_proxy_smoke.py uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+  - `git diff --check -- uccl-ep/bench/v2_proxy_smoke.py uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+- 服务器：
+  - 两台机器运行前 `nvidia-smi --query-compute-apps` 为空。
+  - 已同步 Python 文件到 `/home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/`，无需重建 C++ 扩展。
+
+DeepEP V2 风格 EP16 结果：
+
+- 命令核心参数：
+  - `torchrun --nnodes=2 --nproc_per_node=8`
+  - `--num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256`
+  - `--iters 10 --num-sms 20 --use-fp8-dispatch`
+  - 未开启 `--ignore-local-traffic`
+- 日志：
+  - `/tmp/v2_proxy_deepep_style_8192_fp8_sm20_iters10_rank0.log`
+  - `/tmp/v2_proxy_deepep_style_8192_fp8_sm20_iters10_rank1.log`
+- `rank=0/16`:
+  - smoke: `dispatch_avg_ms=4.293`, `expanded_dispatch_avg_ms=8.278`, `cached_dispatch_avg_ms=3.588`, `combine_avg_ms=15.894`, `reduced_combine_avg_ms=30.417`
+  - `* dispatch`: `28 GB/s (SO), 94 GB/s (SU), 4293.182 us, 402704640 bytes`
+  - `- expanded dispatch`: `15 GB/s (SO), 49 GB/s (SU), 8278.449 us, 402704640 bytes`
+  - `# cached dispatch`: `34 GB/s (SO), 112 GB/s (SU), 3588.032 us, 402704640 bytes`
+  - `@ combine`: `15 GB/s (SO), 49 GB/s (SU), 15893.593 us, 772711040 bytes`
+  - `+ reduced combine`: `8 GB/s (SO), 25 GB/s (SU), 30416.621 us, 772711040 bytes`
+- `rank=8/16`:
+  - smoke: `dispatch_avg_ms=4.221`, `expanded_dispatch_avg_ms=8.421`, `cached_dispatch_avg_ms=3.584`, `combine_avg_ms=15.777`, `reduced_combine_avg_ms=30.370`
+  - `* dispatch`: `29 GB/s (SO), 95 GB/s (SU), 4220.511 us, 399949056 bytes`
+  - `- expanded dispatch`: `15 GB/s (SO), 47 GB/s (SU), 8420.880 us, 399949056 bytes`
+  - `# cached dispatch`: `34 GB/s (SO), 112 GB/s (SU), 3584.325 us, 399949056 bytes`
+  - `@ combine`: `15 GB/s (SO), 49 GB/s (SU), 15777.364 us, 767423616 bytes`
+  - `+ reduced combine`: `8 GB/s (SO), 25 GB/s (SU), 30370.005 us, 767423616 bytes`
+
+结论：
+
+- 这组结果比上一版更诚实：一旦按 DeepEP V2 的完整语义测，当前 UCCL wrapper 还不是一个真正 native V2 backend。
+- 普通 dispatch 和 cached dispatch 还可以，`~94-95 GB/s (SU)` 和 `~112 GB/s (SU)`。
+- expanded dispatch、combine、reduced combine 明显暴露 wrapper 方案的问题，尤其 reduced combine 只有 `~25 GB/s (SU)`。
+- 下一步应该继续把 V2 expanded/reduced-combine 路径下沉到 native/CUDA，而不是再用 Python wrapper 把 V1/UCCL legacy 语义拼成 V2。

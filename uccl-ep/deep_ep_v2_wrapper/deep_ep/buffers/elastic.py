@@ -167,11 +167,12 @@ class ElasticBuffer:
         if with_cpu_sync:
             torch.cuda.synchronize()
 
-    def _ensure_legacy_buffer(self, hidden: int) -> UcclBuffer:
+    def _ensure_legacy_buffer(self, hidden: int, num_sms: int = 0) -> UcclBuffer:
         if self._legacy_buffer is not None:
             return self._legacy_buffer
 
-        num_sms = 24 if torch.version.cuda else 64
+        num_sms = int(num_sms or self.get_theoretical_num_sms())
+        UcclBuffer.set_num_sms(num_sms)
         hidden_bytes = hidden * 2
         config = Config(num_sms, 8, 512, 16, 512)
         align_to = 128
@@ -262,7 +263,9 @@ class ElasticBuffer:
         use_tma_aligned_col_major_sf: bool = False,
     ):
         x_tensor = x[0] if isinstance(x, tuple) else x
-        legacy = self._ensure_legacy_buffer(int(x_tensor.size(1)))
+        legacy = self._ensure_legacy_buffer(int(x_tensor.size(1)), int(num_sms))
+        if num_sms:
+            UcclBuffer.set_num_sms(int(num_sms))
         if handle is not None:
             recv_x, recv_topk_idx, recv_topk_weights, recv_counts, legacy_handle, event = legacy.dispatch(
                 x,
@@ -376,7 +379,9 @@ class ElasticBuffer:
     ):
         if handle.proxy_handle is None:
             raise RuntimeError("UCCL AWS combine requires a dispatch handle from this backend")
-        legacy = self._ensure_legacy_buffer(int(x.size(1)))
+        legacy = self._ensure_legacy_buffer(int(x.size(1)), int(num_sms or handle.num_sms))
+        if num_sms or handle.num_sms:
+            UcclBuffer.set_num_sms(int(num_sms or handle.num_sms))
         if handle.do_expand:
             # expanded combine 收到的是按 expert slot 排列的输入；UCCL
             # legacy combine 需要 per-token reduced 输入。这里根据 V2
