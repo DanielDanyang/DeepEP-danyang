@@ -9,9 +9,10 @@ receiver-side ordering is reconstructed with immediate data.
 
 ## Goal
 
-Expose a DeepEP-compatible package in the same style as UCCL-EP's
-`deep_ep_wrapper`, but targeting DeepEP V2 `ElasticBuffer` instead of the
-legacy DeepEP `Buffer` API.
+Expose a DeepEP-compatible package targeting DeepEP V2 `ElasticBuffer`.
+This workspace intentionally no longer carries UCCL-EP's original DeepEP V1
+`deep_ep_wrapper`; any compatibility with the proxy transport API must stay out
+of the V2 package.
 
 The AWS path should not use NCCL Gin for cross-node dispatch/combine data or
 tail signaling. NCCL Gin remains useful as the baseline and as the upstream
@@ -37,19 +38,18 @@ GPU forwarder consumes published control state
 ## Current Layout
 
 - `include/`, `src/`: copied UCCL-EP proxy/RDMA/kernel implementation.
-- `bench/`: trimmed UCCL-EP EP benchmarks used as references while porting.
-- `deep_ep_wrapper/`: original UCCL-EP DeepEP V1-style wrapper kept as a
-  reference.
-- `deep_ep_v2_wrapper/`: DeepEP V2 wrapper/adapter layer under development.
+- `bench/`: AWS/V2-focused proxy and EP16 benchmarks.
+- `deep_ep_v2_wrapper/`: DeepEP V2 wrapper/native adapter layer under
+  development.
 
 ## Development Phases
 
 1. Build the copied UCCL-EP core in the DeepEP server environment.
 2. Add a standalone proxy RDMA microbenchmark that does not depend on NCCL Gin.
-3. Implement `deep_ep_v2_wrapper.deep_ep.ElasticBuffer` with V2-compatible
+3. Implement `deep_ep_v2_wrapper.deep_ep.ElasticBuffer` with V2-native
    constructor, dispatch, combine, and handle objects.
-4. Replace cross-node V2 Gin operations with `TransferCmd` submission.
+4. Replace cross-node V2 Gin operations with `TransferCmd` submission and
+   remove the remaining proxy transport compatibility path.
 5. Add receiver-side ordering and host-mapped tail/count publication.
 6. Run `tests/elastic/test_ep.py` EP16 and iterate toward the UCCL-EP p5en
    reference bandwidth.
-

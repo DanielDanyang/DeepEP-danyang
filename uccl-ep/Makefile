@@ -87,21 +87,13 @@ ifeq ($(USE_INTEL_RDMA_NIC),1)
   override NVCCFLAGS += -DINTEL_RDMA_NIC
 endif
 
-# Enable per-expert batching path in dispatch-LL (default: disabled)
-PER_EXPERT_BATCHING ?= 0
-ifeq ($(PER_EXPERT_BATCHING),1)
-  override CXXFLAGS += -DPER_EXPERT_BATCHING
-  override NVCCFLAGS += -DPER_EXPERT_BATCHING
-endif
-
-
 CXXFLAGS  += $(EFA_CFLAGS) $(GH_CFLAGS) $(DMABUF_CFLAGS) $(NORMAL_CFLAGS)
 NVCCFLAGS += $(EFA_CFLAGS) $(GH_CFLAGS) $(DMABUF_CFLAGS) $(NORMAL_CFLAGS)
 LDFLAGS   += $(EFA_LDFLAGS)
 INCLUDES  += $(EFA_CFLAGS) $(GH_CFLAGS) $(DMABUF_CFLAGS) $(NORMAL_CFLAGS)
 
 SRC_CPP := src/proxy.cpp src/rdma.cpp src/common.cpp src/uccl_proxy.cpp src/uccl_bench.cpp src/fifo.cpp
-SRC_CU  := src/bench_kernel.cu src/internode_ll.cu src/internode.cu src/layout.cu src/intranode.cu src/ep_runtime.cu
+SRC_CU  := src/bench_kernel.cu src/internode.cu src/layout.cu src/intranode.cu src/ep_runtime.cu
 # Non-binding .cc translation units linked into the shared library.
 SRC_CC_LIB := src/adaptive_sleeper.cc
 

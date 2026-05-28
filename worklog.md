@@ -759,3 +759,74 @@ DeepEP V2 风格 EP16 benchmark，自动 SM：
 - expanded dispatch 在自动 `#SM=32` 下回到 `~99-102 GB/s (SU)`，cached dispatch 到 `~151-155 GB/s (SU)`。
 - 普通 uncached dispatch 变慢到 `~66-67 GB/s (SU)`，主要因为自动 SM=32 改变了 legacy dispatch config 和 layout/metadata overhead；后续需要把 uncached layout/metadata 也继续 native 化，而不是依赖 V1 layout path。
 - combine 本身仍只有 `~42 GB/s (SU)`，说明下一个大瓶颈是 UCCL legacy combine 数据面和 V2 combine/reduce 语义没有真正融合。
+
+## 2026-05-28 清理 V1/NVSHMEM 暴露面，转向 native V2 backend
+
+代码清理：
+
+- 删除旧 DeepEP V1 wrapper：
+  - `uccl-ep/deep_ep_wrapper/`
+- 删除旧 V1/LL benchmark：
+  - `uccl-ep/bench/buffer.py`
+  - `uccl-ep/bench/test_intranode.py`
+  - `uccl-ep/bench/test_internode.py`
+  - `uccl-ep/bench/test_low_latency*.py`
+  - `uccl-ep/bench/test_dual_mode.py`
+  - `uccl-ep/bench/run_ep.sh`
+  - `uccl-ep/bench/utils.py`
+- `deep_ep_v2_wrapper/deep_ep/buffer.py` 改为内部
+  `deep_ep_v2_wrapper/deep_ep/proxy_transport.py`，不再作为 public `Buffer`
+  API 暴露。
+- `deep_ep_v2_wrapper/deep_ep/__init__.py` 只导出 `ElasticBuffer` / V2
+  handle，不再导出旧 `Buffer`。
+- 原来软链接到 `bench/utils.py` 的 `utils_uccl.py` 改成真实精简模块，只保留
+  proxy 初始化、销毁、拓扑检测、FP8 dtype 等 V2 backend 必需逻辑。
+- CUDA facade 中 `nvshmemi_*` 命名改为 `uccl_proxy_*`：
+  - `uccl_proxy_put_nbi_warp`
+  - `uccl_proxy_amo_nonfetch_add`
+  - `uccl_proxy_quiet`
+  - `uccl_proxy_sync_same_gpu_idx`
+- 删除低延迟 V1 native path：
+  - `uccl-ep/src/internode_ll.cu`
+  - `uccl-ep/include/internode_ll.cuh`
+  - `uccl-ep/src/uccl_ep.cc` 中的 `low_latency_dispatch` /
+    `low_latency_combine` / `clean_low_latency_buffer` methods 和 bindings
+  - `uccl-ep/Makefile` 不再编译 `internode_ll.cu`
+- `ElasticBuffer` 中 V2 metadata / expanded payload / reduced combine input
+  已经直接调用 `ElasticProxyBuffer` native helper，而不是通过旧 wrapper
+  helper。
+
+构建：
+
+- 两台机器均在隔离 venv 中重新安装 `uccl.ep`：
+  - `cd /home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/uccl-ep`
+  - `CUDA_HOME=/usr/local/cuda-13.0`
+  - `USE_DMABUF=1`
+  - `MAX_JOBS=16`
+- 构建结果：
+  - `p5en_0`: 通过，14 个 source、107 个 header，日志
+    `/tmp/uccl_ep_build_native_v2_no_ll_p5en0.log`
+  - `p5en_1`: 通过，14 个 source、107 个 header，日志
+    `/tmp/uccl_ep_build_native_v2_no_ll_p5en1.log`
+
+API 验证：
+
+- 两台机器均从 `uccl-ep/deep_ep_v2_wrapper` 独立 import：
+  - `deep_ep.__file__` 指向
+    `/home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/uccl-ep/deep_ep_v2_wrapper/deep_ep/__init__.py`
+  - `hasattr(deep_ep, "Buffer") == False`
+  - `ElasticProxyBuffer` 暴露
+    `build_v2_dispatch_metadata` / `build_v2_expanded_payload` /
+    `build_v2_reduced_combine_input` / `get_comm_stream`
+  - `ep.Buffer` 不再暴露 `low_latency_dispatch` / `low_latency_combine`
+
+额外 smoke 尝试：
+
+- `torchrun --standalone --nproc_per_node=1 uccl-ep/bench/v2_proxy_smoke.py ...`
+  失败原因：当前 config map 不支持 EP1。
+- `torchrun --standalone --nproc_per_node=2 uccl-ep/bench/v2_proxy_smoke.py ...`
+  失败原因：单机 intranode transport handle 没有 internode `SourceMeta`，
+  而当前 V2 metadata helper 仍按 internode handle 读取 `transport_handle[9]`。
+- 这说明清理后的主目标已经转向 AWS EP16 internode V2 backend；如果还要保留单机
+  EP2/EP8 smoke，需要补一个 intranode V2 source-metadata native helper，不能再靠
+  旧 wrapper 语义兜底。

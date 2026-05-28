@@ -7,14 +7,12 @@ _UPSTREAM_DEEP_EP = Path(__file__).resolve().parents[3] / "deep_ep"
 if _UPSTREAM_DEEP_EP.exists():
     __path__.append(str(_UPSTREAM_DEEP_EP))
 
-from .buffer import Buffer
 from .buffers.elastic import EPHandle, ElasticBuffer
 from .utils.event import EventOverlap
 
 topk_idx_t = torch.int64
 
 __all__ = [
-    "Buffer",
     "Config",
     "EventHandle",
     "EventOverlap",

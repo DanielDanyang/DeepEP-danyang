@@ -9,7 +9,6 @@
 #include "ep_runtime.cuh"
 #include "ep_util.hpp"
 #include "internode.cuh"
-#include "internode_ll.cuh"
 #include "intranode.cuh"
 #include "layout.hpp"
 #include "rdma.hpp"
@@ -50,6 +49,8 @@ namespace nb = nanobind;
 static std::mutex g_proxies_mu;
 
 struct EventOverlap {};
+static cudaDataType_t cuda_dtype_from_code(int dtype);
+
 class ElasticProxyBuffer {
  public:
   ElasticProxyBuffer(int rank, int num_ranks, long num_bytes, int local_world,
@@ -65,13 +66,26 @@ class ElasticProxyBuffer {
     if (num_bytes_ <= 0) {
       throw std::invalid_argument("ElasticProxyBuffer requires positive buffer bytes");
     }
+    CUDA_CHECK(cudaGetDevice(&device_index_));
+    int least_priority = 0, greatest_priority = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority,
+                                                &greatest_priority));
+    CUDA_CHECK(cudaStreamCreateWithPriority(
+        &comm_stream_, cudaStreamNonBlocking, greatest_priority));
   }
 
   ~ElasticProxyBuffer() {
     if (!destroyed_ && !explicitly_destroy_) destroy();
   }
 
-  void destroy() { destroyed_ = true; }
+  void destroy() {
+    if (destroyed_) return;
+    if (comm_stream_ != nullptr) {
+      CUDA_CHECK(cudaStreamDestroy(comm_stream_));
+      comm_stream_ = nullptr;
+    }
+    destroyed_ = true;
+  }
   bool is_available() const { return !destroyed_; }
 
   std::tuple<int, int> get_physical_domain_size() const {
@@ -85,12 +99,156 @@ class ElasticProxyBuffer {
   int rank() const { return rank_; }
   int num_ranks() const { return num_ranks_; }
   long num_bytes() const { return num_bytes_; }
+  std::uintptr_t get_comm_stream() const {
+    return reinterpret_cast<std::uintptr_t>(comm_stream_);
+  }
   int num_scaleout_ranks() const {
     return std::max(1, num_ranks_ / num_scaleup_ranks());
   }
   int num_scaleup_ranks() const { return std::min(local_world_, num_ranks_); }
   int scaleout_rank() const { return rank_ / num_scaleup_ranks(); }
   int scaleup_rank() const { return rank_ % num_scaleup_ranks(); }
+
+  std::optional<EventHandle> build_v2_dispatch_metadata(
+      std::uintptr_t recv_src_meta_ptr, std::uintptr_t recv_topk_idx_ptr,
+      int num_recv_tokens, int num_topk, int num_scaleup_ranks,
+      int num_local_experts, int num_max_tokens_per_rank, int expert_alignment,
+      std::uintptr_t recv_src_metadata_ptr,
+      std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+      std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+      std::uintptr_t dst_buffer_slot_idx_ptr,
+      std::uintptr_t raw_num_recv_tokens_per_expert_ptr,
+      std::uintptr_t expanded_expert_cursor_ptr,
+      std::optional<EventHandle>& previous_event, bool async,
+      bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
+    EP_HOST_ASSERT(recv_src_metadata_ptr != 0);
+    EP_HOST_ASSERT(psum_num_recv_tokens_per_scaleup_rank_ptr != 0);
+    EP_HOST_ASSERT(psum_num_recv_tokens_per_expert_ptr != 0);
+    EP_HOST_ASSERT(dst_buffer_slot_idx_ptr != 0);
+    EP_HOST_ASSERT(raw_num_recv_tokens_per_expert_ptr != 0);
+    EP_HOST_ASSERT(expanded_expert_cursor_ptr != 0);
+    EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 &&
+                   num_scaleup_ranks > 0 && num_local_experts > 0 &&
+                   num_max_tokens_per_rank > 0);
+    if (num_recv_tokens > 0) {
+      EP_HOST_ASSERT(recv_src_meta_ptr != 0);
+      EP_HOST_ASSERT(recv_topk_idx_ptr != 0);
+    }
+
+    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
+    static_cast<void>(allocate_on_comm_stream);
+    if (previous_event.has_value()) {
+      stream_wait(comm_stream_, previous_event.value());
+    } else {
+      stream_wait(comm_stream_, compute_stream);
+    }
+
+    uccl::internode::build_v2_dispatch_metadata(
+        reinterpret_cast<void const*>(recv_src_meta_ptr),
+        reinterpret_cast<int64_t const*>(recv_topk_idx_ptr), num_recv_tokens,
+        num_topk, num_scaleup_ranks, num_local_experts,
+        num_max_tokens_per_rank, expert_alignment,
+        reinterpret_cast<int*>(recv_src_metadata_ptr),
+        reinterpret_cast<int*>(psum_num_recv_tokens_per_scaleup_rank_ptr),
+        reinterpret_cast<int*>(psum_num_recv_tokens_per_expert_ptr),
+        reinterpret_cast<int*>(dst_buffer_slot_idx_ptr),
+        reinterpret_cast<int*>(raw_num_recv_tokens_per_expert_ptr),
+        reinterpret_cast<int*>(expanded_expert_cursor_ptr), rank_,
+        comm_stream_);
+
+    std::optional<EventHandle> event;
+    if (async) {
+      event = EventHandle(comm_stream_);
+    } else {
+      stream_wait(compute_stream, comm_stream_);
+    }
+    return event;
+  }
+
+  std::optional<EventHandle> build_v2_expanded_payload(
+      std::uintptr_t recv_x_ptr, std::uintptr_t recv_x_scales_ptr,
+      std::uintptr_t recv_topk_weights_ptr,
+      std::uintptr_t recv_src_metadata_ptr, int num_recv_tokens, int num_topk,
+      int hidden_bytes, int num_scales, std::uintptr_t expanded_x_ptr,
+      std::uintptr_t expanded_x_scales_ptr,
+      std::uintptr_t expanded_topk_weights_ptr,
+      std::optional<EventHandle>& previous_event, bool async,
+      bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
+    EP_HOST_ASSERT(recv_x_ptr != 0);
+    EP_HOST_ASSERT(recv_src_metadata_ptr != 0);
+    EP_HOST_ASSERT(expanded_x_ptr != 0);
+    EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 && hidden_bytes > 0 &&
+                   num_scales >= 0);
+
+    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
+    static_cast<void>(allocate_on_comm_stream);
+    if (previous_event.has_value()) {
+      stream_wait(comm_stream_, previous_event.value());
+    } else {
+      stream_wait(comm_stream_, compute_stream);
+    }
+
+    uccl::internode::build_v2_expanded_payload(
+        reinterpret_cast<void const*>(recv_x_ptr),
+        recv_x_scales_ptr == 0
+            ? nullptr
+            : reinterpret_cast<float const*>(recv_x_scales_ptr),
+        recv_topk_weights_ptr == 0
+            ? nullptr
+            : reinterpret_cast<float const*>(recv_topk_weights_ptr),
+        reinterpret_cast<int const*>(recv_src_metadata_ptr), num_recv_tokens,
+        num_topk, hidden_bytes, num_scales,
+        reinterpret_cast<void*>(expanded_x_ptr),
+        expanded_x_scales_ptr == 0
+            ? nullptr
+            : reinterpret_cast<float*>(expanded_x_scales_ptr),
+        expanded_topk_weights_ptr == 0
+            ? nullptr
+            : reinterpret_cast<float*>(expanded_topk_weights_ptr),
+        comm_stream_);
+
+    std::optional<EventHandle> event;
+    if (async) {
+      event = EventHandle(comm_stream_);
+    } else {
+      stream_wait(compute_stream, comm_stream_);
+    }
+    return event;
+  }
+
+  std::optional<EventHandle> build_v2_reduced_combine_input(
+      std::uintptr_t expanded_x_ptr, std::uintptr_t recv_src_metadata_ptr,
+      int num_recv_tokens, int num_topk, int hidden, int dtype_code,
+      std::uintptr_t reduced_x_ptr, std::optional<EventHandle>& previous_event,
+      bool async, bool allocate_on_comm_stream,
+      std::uintptr_t compute_stream_ptr) {
+    EP_HOST_ASSERT(expanded_x_ptr != 0);
+    EP_HOST_ASSERT(recv_src_metadata_ptr != 0);
+    EP_HOST_ASSERT(reduced_x_ptr != 0);
+    EP_HOST_ASSERT(num_recv_tokens >= 0 && num_topk > 0 && hidden > 0);
+
+    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
+    static_cast<void>(allocate_on_comm_stream);
+    if (previous_event.has_value()) {
+      stream_wait(comm_stream_, previous_event.value());
+    } else {
+      stream_wait(comm_stream_, compute_stream);
+    }
+
+    uccl::internode::build_v2_reduced_combine_input(
+        reinterpret_cast<void const*>(expanded_x_ptr),
+        reinterpret_cast<int const*>(recv_src_metadata_ptr), num_recv_tokens,
+        num_topk, hidden, cuda_dtype_from_code(dtype_code),
+        reinterpret_cast<void*>(reduced_x_ptr), comm_stream_);
+
+    std::optional<EventHandle> event;
+    if (async) {
+      event = EventHandle(comm_stream_);
+    } else {
+      stream_wait(compute_stream, comm_stream_);
+    }
+    return event;
+  }
 
  private:
   int rank_;
@@ -99,6 +257,8 @@ class ElasticProxyBuffer {
   int local_world_;
   bool explicitly_destroy_;
   bool destroyed_{false};
+  int device_index_{0};
+  cudaStream_t comm_stream_{nullptr};
 };
 
 struct Ctx {
@@ -338,9 +498,9 @@ std::tuple<nb::object, bool> allocate_rdma_buffer_dlpack(
 }  // namespace
 
 static std::vector<uint64_t> collect_d2h_channel_addrs_for_device(
-    int device_index, bool low_latency_mode) {
+    int device_index, bool proxy_mode) {
   std::lock_guard<std::mutex> lk(g_proxies_mu);
-  auto it = uccl::g_proxies_by_dev.find({device_index, low_latency_mode});
+  auto it = uccl::g_proxies_by_dev.find({device_index, proxy_mode});
   EP_HOST_ASSERT(it != uccl::g_proxies_by_dev.end() && !it->second.empty());
 
   std::vector<uint64_t> all_addrs;
@@ -369,12 +529,12 @@ bool is_sm90_compiled() {
 class Buffer {
  public:
   Buffer(int rank, int num_ranks, long num_nvl_bytes, long num_rdma_bytes,
-         bool low_latency_mode, bool explicitly_destroy, int num_local_ranks)
+         bool proxy_mode, bool explicitly_destroy, int num_local_ranks)
       : rank(rank),
         num_ranks(num_ranks),
         num_nvl_bytes(num_nvl_bytes),
         num_rdma_bytes(num_rdma_bytes),
-        low_latency_mode(low_latency_mode),
+        proxy_mode(proxy_mode),
         explicitly_destroy(explicitly_destroy) {
     if (num_local_ranks == -1) num_local_ranks = get_num_max_nvl_peers();
     max_nvl_peers = num_local_ranks;
@@ -382,16 +542,16 @@ class Buffer {
       cudaGetDevice(&device_index);
       {
         std::lock_guard<std::mutex> lk(g_proxies_mu);
-        auto it = uccl::g_proxies_by_dev.find({device_index, low_latency_mode});
+        auto it = uccl::g_proxies_by_dev.find({device_index, proxy_mode});
         if (it == uccl::g_proxies_by_dev.end() || it->second.empty()) {
           throw std::runtime_error(
               "ep.Buffer: no UcclProxy registered for device " +
               std::to_string(device_index) +
-              std::string(low_latency_mode ? " (low-latency mode)"
+              std::string(proxy_mode ? " (proxy mode)"
                                            : " (high-throughput mode)") +
               ". Call uccl.ep.register_proxies(device_index, proxies) "
               "first with proxies built with use_normal_mode=" +
-              (low_latency_mode ? "False" : "True") + ".");
+              (proxy_mode ? "False" : "True") + ".");
         }
       }
 
@@ -403,7 +563,7 @@ class Buffer {
         CUDA_CHECK(cudaStreamCreateWithPriority(
             &comm_stream, cudaStreamNonBlocking, greatest_priority));
         auto host_addrs = collect_d2h_channel_addrs_for_device(
-            device_index, low_latency_mode);
+            device_index, proxy_mode);
         num_d2h_channel_addrs = static_cast<int>(host_addrs.size());
         if (num_d2h_channel_addrs > 0) {
           CUDA_CHECK(cudaMallocManaged(
@@ -474,23 +634,23 @@ class Buffer {
                    (num_nvl_bytes <= std::numeric_limits<int64_t>::max() ||
                     num_rdma_bytes == 0));
     EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 &&
-                   (low_latency_mode ||
+                   (proxy_mode ||
                     num_rdma_bytes <= std::numeric_limits<int64_t>::max()));
 #else
     EP_HOST_ASSERT(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 &&
                    (num_nvl_bytes <= std::numeric_limits<int>::max() ||
                     num_rdma_bytes == 0));
     EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 &&
-                   (low_latency_mode ||
+                   (proxy_mode ||
                     num_rdma_bytes <= std::numeric_limits<int>::max()));
 #endif
     EP_HOST_ASSERT(
         0 <= rank && rank < num_ranks &&
-        (num_ranks <= max_nvl_peers * NUM_MAX_RDMA_PEERS || low_latency_mode));
+        (num_ranks <= max_nvl_peers * NUM_MAX_RDMA_PEERS || proxy_mode));
     EP_HOST_ASSERT(num_ranks < max_nvl_peers ||
                    (num_ranks % max_nvl_peers) == 0);
     // if (num_rdma_bytes > 0)
-    //   EP_HOST_ASSERT(num_ranks > max_nvl_peers || low_latency_mode);
+    //   EP_HOST_ASSERT(num_ranks > max_nvl_peers || proxy_mode);
 
     rdma_rank = rank / max_nvl_peers;
     nvl_rank = rank % max_nvl_peers;
@@ -1015,7 +1175,7 @@ class Buffer {
         config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank,
         comm_stream,
         config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-        num_nvl_bytes, low_latency_mode, d_handles, num_d2h_channel_addrs,
+        num_nvl_bytes, proxy_mode, d_handles, num_d2h_channel_addrs,
         atomic_buffer_ptr);
 
     int num_recv_tokens = -1;
@@ -1108,7 +1268,7 @@ class Buffer {
           barrier_signal_ptrs_gpu, rank, comm_stream,
           config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4),
                                            num_ranks),
-          num_nvl_bytes, true, low_latency_mode, d_handles,
+          num_nvl_bytes, true, proxy_mode, d_handles,
           num_d2h_channel_addrs, atomic_buffer_ptr);
     } else {
       EP_HOST_ASSERT(recv_src_meta_ptr != 0);
@@ -1157,7 +1317,7 @@ class Buffer {
         config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
         config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, cached_mode,
-        comm_stream, num_channels, low_latency_mode, d_handles,
+        comm_stream, num_channels, proxy_mode, d_handles,
         num_d2h_channel_addrs, atomic_buffer_ptr);
 
     std::optional<EventHandle> event;
@@ -1358,7 +1518,7 @@ class Buffer {
         config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank,
         comm_stream,
         config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-        num_nvl_bytes, false, low_latency_mode, d_handles,
+        num_nvl_bytes, false, proxy_mode, d_handles,
         num_d2h_channel_addrs, atomic_buffer_ptr);
 
     void* bias_ptrs[2] = {
@@ -1391,7 +1551,7 @@ class Buffer {
         config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
         config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, comm_stream,
-        num_channels, low_latency_mode, d_handles, num_d2h_channel_addrs,
+        num_channels, proxy_mode, d_handles, num_d2h_channel_addrs,
         atomic_buffer_ptr);
 
     std::optional<EventHandle> event;
@@ -1401,277 +1561,6 @@ class Buffer {
       stream_wait(compute_stream, comm_stream);
     }
     return event;
-  }
-
-  void clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank,
-                                int hidden, int num_experts,
-                                std::uintptr_t stream_ptr) {
-    EP_HOST_ASSERT(low_latency_mode);
-
-    auto layout = uccl::LowLatencyLayout(rdma_buffer_ptr,
-                                         num_max_dispatch_tokens_per_rank,
-                                         hidden, num_ranks, num_experts);
-    auto clean_meta_0 = layout.buffers[0].clean_meta();
-    auto clean_meta_1 = layout.buffers[1].clean_meta();
-    auto [ptr0, ptr_internode0, count0] = clean_meta_0;
-    auto [ptr1, ptr_internode1, count1] = clean_meta_1;
-
-    auto check_boundary = [=](void* ptr, size_t num_bytes) {
-      auto offset = reinterpret_cast<int64_t>(ptr) -
-                    reinterpret_cast<int64_t>(rdma_buffer_ptr);
-      EP_HOST_ASSERT(0 <= offset &&
-                     offset + num_bytes <= static_cast<size_t>(num_rdma_bytes));
-    };
-    check_boundary(ptr0, count0 * sizeof(int));
-    check_boundary(ptr1, count1 * sizeof(int));
-
-    auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    uccl::internode_ll::clean_low_latency_buffer(ptr0, count0, ptr1, count1,
-                                                 stream);
-  }
-
-  std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
-  low_latency_dispatch(std::uintptr_t x_ptr, int x_rows, int x_cols,
-                       std::uintptr_t topk_idx_ptr, int topk_rows,
-                       int topk_cols, std::uintptr_t packed_recv_x_ptr,
-                       std::uintptr_t packed_recv_x_scales_ptr,
-                       std::uintptr_t packed_recv_count_ptr,
-                       std::uintptr_t packed_recv_src_info_ptr,
-                       std::uintptr_t packed_recv_layout_range_ptr,
-                       std::uintptr_t cumulative_local_expert_recv_stats_ptr,
-                       std::uintptr_t dispatch_wait_recv_cost_stats_ptr,
-                       std::uintptr_t compute_stream_ptr,
-                       int num_max_dispatch_tokens_per_rank, int num_experts,
-                       bool use_fp8, bool round_scale, bool use_ue8m0,
-                       bool async, bool return_recv_hook) {
-    EP_HOST_ASSERT(low_latency_mode);
-    // Handle empty token case: when x_rows == 0, this rank has no tokens
-    // to dispatch. PyTorch returns data_ptr() == 0 for zero-element tensors,
-    // so x_ptr and topk_idx_ptr will legitimately be 0.
-    if (x_rows == 0) {
-      auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-      std::optional<EventHandle> event;
-      if (async) {
-        event = EventHandle(comm_stream);
-      } else {
-        stream_wait(compute_stream, comm_stream);
-      }
-      std::optional<std::function<void()>> hook;
-      return {event, hook};
-    }
-    EP_HOST_ASSERT(x_ptr != 0 && topk_idx_ptr != 0);
-    EP_HOST_ASSERT(packed_recv_x_ptr != 0 && packed_recv_count_ptr != 0);
-    EP_HOST_ASSERT(packed_recv_src_info_ptr != 0 &&
-                   packed_recv_layout_range_ptr != 0);
-    EP_HOST_ASSERT(x_rows == topk_rows);
-    EP_HOST_ASSERT(x_rows <= num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(x_cols % static_cast<int>(sizeof(int4)) == 0 &&
-                   x_cols % 128 == 0);
-    EP_HOST_ASSERT(num_experts % num_ranks == 0);
-    EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 &&
-                   "TMA requires the number of tokens to be multiple of 4");
-    if (use_fp8) {
-      EP_HOST_ASSERT(packed_recv_x_scales_ptr != 0);
-      EP_HOST_ASSERT(x_cols % 512 == 0);
-      if (use_ue8m0) EP_HOST_ASSERT(round_scale);
-    }
-
-    auto num_tokens = x_rows;
-    auto hidden = x_cols;
-    auto num_topk = topk_cols;
-
-    uccl::LowLatencyLayout layout(rdma_buffer_ptr,
-                                  num_max_dispatch_tokens_per_rank, hidden,
-                                  num_ranks, num_experts, atomic_buffer_ptr);
-    EP_HOST_ASSERT(layout.total_bytes <=
-                   static_cast<std::size_t>(num_rdma_bytes));
-    int low_latency_buffer_idx_used = low_latency_buffer_idx;
-    auto buffer = layout.buffers[low_latency_buffer_idx];
-    auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
-
-    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
-
-    void* x = reinterpret_cast<void*>(x_ptr);
-    int64_t* topk_idx = reinterpret_cast<int64_t*>(topk_idx_ptr);
-    void* packed_recv_x = reinterpret_cast<void*>(packed_recv_x_ptr);
-    void* packed_recv_x_scales =
-        packed_recv_x_scales_ptr == 0
-            ? nullptr
-            : reinterpret_cast<void*>(packed_recv_x_scales_ptr);
-    int* packed_recv_count = reinterpret_cast<int*>(packed_recv_count_ptr);
-    int* packed_recv_src_info =
-        reinterpret_cast<int*>(packed_recv_src_info_ptr);
-    int64_t* packed_recv_layout_range =
-        reinterpret_cast<int64_t*>(packed_recv_layout_range_ptr);
-    int* cumulative_local_expert_recv_stats =
-        cumulative_local_expert_recv_stats_ptr == 0
-            ? nullptr
-            : reinterpret_cast<int*>(cumulative_local_expert_recv_stats_ptr);
-    int64_t* dispatch_wait_recv_cost_stats =
-        dispatch_wait_recv_cost_stats_ptr == 0
-            ? nullptr
-            : reinterpret_cast<int64_t*>(dispatch_wait_recv_cost_stats_ptr);
-
-    auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
-    auto launcher = [=](int phases) {
-      uccl::internode_ll::dispatch(
-          packed_recv_x, packed_recv_x_scales, packed_recv_src_info,
-          packed_recv_layout_range, packed_recv_count,
-          cumulative_local_expert_recv_stats, dispatch_wait_recv_cost_stats,
-          buffer.dispatch_rdma_recv_data_buffer,
-          buffer.dispatch_rdma_recv_count_buffer,
-          buffer.dispatch_rdma_send_buffer, x, topk_idx, ptr0, ptr_internode0,
-          count0, num_tokens, hidden, num_max_dispatch_tokens_per_rank,
-          num_topk, num_experts, rank, num_ranks, use_fp8, round_scale,
-          use_ue8m0, workspace, num_device_sms, launch_stream, phases,
-          d_handles, num_d2h_channel_addrs, max_nvl_peers,
-          low_latency_buffer_idx_used, d_ipc_rdma_base_ptrs, rdma_buffer_ptr,
-          atomic_buffer_ptr, buffer.dispatch_rdma_recv_count_buffer_internode);
-    };
-    launcher(return_recv_hook
-                 ? LOW_LATENCY_SEND_PHASE
-                 : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
-
-    std::optional<EventHandle> event;
-    if (async) {
-      event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
-      stream_wait(compute_stream, launch_stream);
-    }
-
-    std::optional<std::function<void()>> recv_hook = std::nullopt;
-    if (return_recv_hook)
-      recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
-    return {event, recv_hook};
-  }
-
-  // `low_latency_combine` accepts seven DeepEP-compatible overlap kwargs at
-  // the end of the argument list. They are parsed for API compatibility with
-  // SGLang SBO callers (deepep.py:680-693, which dispatches to different
-  // kwargs dicts on Hopper vs Blackwell paths). Only `overlap=false` is
-  // wired to a kernel path today; `overlap=true` is rejected below until the
-  // comp_signal / src_signals kernel variants land in a follow-up PR.
-  std::tuple<std::optional<EventHandle>, std::optional<std::function<void()>>>
-  low_latency_combine(
-      std::uintptr_t x_ptr, int x_dim0, int x_dim1, int x_dim2,
-      std::uintptr_t topk_idx_ptr, int topk_rows, int topk_cols,
-      std::uintptr_t topk_weights_ptr, std::uintptr_t src_info_ptr,
-      int src_info_dim0, int src_info_dim1, std::uintptr_t layout_range_ptr,
-      int layout_range_dim0, int layout_range_dim1,
-      std::uintptr_t combine_wait_recv_cost_stats_ptr,
-      std::uintptr_t compute_stream_ptr, int num_max_dispatch_tokens_per_rank,
-      int num_experts, bool use_logfmt, bool zero_copy, bool async,
-      bool return_recv_hook, std::uintptr_t out_ptr, bool overlap = false,
-      std::uintptr_t packed_recv_count_ptr = 0,
-      std::uintptr_t comp_signal_ptr = 0, int block_m = 64, int threshold = 0,
-      int num_sms = 0, std::uintptr_t src_signals_ptr = 0,
-      int src_signal_expect_value = 0) {
-    EP_HOST_ASSERT(low_latency_mode);
-    // Handle empty token case: when topk_rows == 0, this rank dispatched
-    // no tokens so there is nothing to combine. Return early.
-    if (topk_rows == 0) {
-      auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-      std::optional<EventHandle> event;
-      if (async) {
-        event = EventHandle(comm_stream);
-      } else if (not return_recv_hook) {
-        stream_wait(compute_stream, comm_stream);
-      }
-      std::optional<std::function<void()>> hook;
-      return {event, hook};
-    }
-    EP_HOST_ASSERT(x_ptr != 0 && topk_idx_ptr != 0 && topk_weights_ptr != 0);
-    EP_HOST_ASSERT(src_info_ptr != 0 && layout_range_ptr != 0);
-    EP_HOST_ASSERT(out_ptr != 0);
-    if (overlap) {
-      throw std::runtime_error(
-          "low_latency_combine(overlap=true) is not implemented yet. "
-          "Overlap kernel support (comp_signal / src_signals) will land in a "
-          "follow-up PR; this release only accepts the parameters for API "
-          "compatibility with DeepEP and SGLang SBO callers.");
-    }
-    // Silence unused-variable warnings for stub parameters.
-    (void)packed_recv_count_ptr;
-    (void)comp_signal_ptr;
-    (void)block_m;
-    (void)threshold;
-    (void)num_sms;
-    (void)src_signals_ptr;
-    (void)src_signal_expect_value;
-
-    auto num_local_experts = num_experts / num_ranks;
-    EP_HOST_ASSERT(x_dim0 == num_local_experts);
-    EP_HOST_ASSERT(x_dim1 == num_ranks * num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(x_dim2 % static_cast<int>(sizeof(int4)) == 0 &&
-                   x_dim2 % 128 == 0);
-    EP_HOST_ASSERT(src_info_dim0 == num_local_experts &&
-                   src_info_dim1 ==
-                       num_ranks * num_max_dispatch_tokens_per_rank);
-    EP_HOST_ASSERT(layout_range_dim0 == num_local_experts &&
-                   layout_range_dim1 == num_ranks);
-    EP_HOST_ASSERT(topk_rows <= num_max_dispatch_tokens_per_rank);
-
-    auto hidden = x_dim2;
-    auto num_topk = topk_cols;
-    auto num_combined_tokens = topk_rows;
-
-    uccl::LowLatencyLayout layout(rdma_buffer_ptr,
-                                  num_max_dispatch_tokens_per_rank, hidden,
-                                  num_ranks, num_experts, atomic_buffer_ptr);
-    EP_HOST_ASSERT(layout.total_bytes <=
-                   static_cast<std::size_t>(num_rdma_bytes));
-    int low_latency_buffer_idx_used = low_latency_buffer_idx;
-    auto buffer = layout.buffers[low_latency_buffer_idx];
-    auto next_buffer = layout.buffers[low_latency_buffer_idx ^= 1];
-
-    auto compute_stream = reinterpret_cast<cudaStream_t>(compute_stream_ptr);
-    auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not(async and return_recv_hook));
-    if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
-
-    void* x = reinterpret_cast<void*>(x_ptr);
-    int64_t* topk_idx = reinterpret_cast<int64_t*>(topk_idx_ptr);
-    float* topk_weights = reinterpret_cast<float*>(topk_weights_ptr);
-    int* src_info = reinterpret_cast<int*>(src_info_ptr);
-    int64_t* layout_range = reinterpret_cast<int64_t*>(layout_range_ptr);
-    int64_t* combine_wait_recv_cost_stats =
-        combine_wait_recv_cost_stats_ptr == 0
-            ? nullptr
-            : reinterpret_cast<int64_t*>(combine_wait_recv_cost_stats_ptr);
-    void* out = reinterpret_cast<void*>(out_ptr);
-
-    auto [ptr0, ptr_internode0, count0] = next_buffer.clean_meta();
-    auto launcher = [=](int phases) {
-      uccl::internode_ll::combine(
-          out, buffer.combine_rdma_recv_data_buffer,
-          buffer.combine_rdma_recv_flag_buffer, buffer.combine_rdma_send_buffer,
-          x, topk_idx, topk_weights, src_info, layout_range,
-          combine_wait_recv_cost_stats, ptr0, ptr_internode0, count0,
-          num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
-          num_topk, num_experts, rank, num_ranks, use_logfmt, workspace,
-          num_device_sms, launch_stream, phases, zero_copy, d_handles,
-          num_d2h_channel_addrs, max_nvl_peers, low_latency_buffer_idx_used,
-          d_ipc_rdma_base_ptrs, rdma_buffer_ptr, atomic_buffer_ptr,
-          buffer.combine_rdma_recv_flag_buffer_internode);
-    };
-    launcher(return_recv_hook
-                 ? LOW_LATENCY_SEND_PHASE
-                 : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
-
-    std::optional<EventHandle> event;
-    if (async) {
-      event = EventHandle(launch_stream);
-    } else if (not return_recv_hook) {
-      stream_wait(compute_stream, launch_stream);
-    }
-
-    std::optional<std::function<void()>> recv_hook = std::nullopt;
-    if (return_recv_hook)
-      recv_hook = [=]() { launcher(LOW_LATENCY_RECV_PHASE); };
-    return {event, recv_hook};
   }
 
   int get_local_device_id() { return device_index; }
@@ -1782,8 +1671,7 @@ class Buffer {
       CUDA_CHECK(cudaDeviceSynchronize());
     }
 
-    // Sync NVSHMEM handles and allocate memory
-    // NOTE(MaoZiming): drop nvshmem. we directly allocate rdma_buffer_ptr.
+    // Sync proxy endpoint metadata and attach the registered RDMA buffer.
     if (num_rdma_bytes > 0) {
       // TODO(MaoZiming): this needs to be allocated by proxy.
       if (!rdma_buffer_ptr) {
@@ -1887,14 +1775,14 @@ class Buffer {
   int num_ranks{1};
   long num_nvl_bytes{0};
   long num_rdma_bytes{0};
-  bool low_latency_mode{false};
+  bool proxy_mode{false};
   bool explicitly_destroy{false};
   int device_index{0};
   std::vector<nb::object> proxies_;
   bool available{false};
   void* rdma_buffer_ptr = nullptr;
   void* atomic_buffer_ptr = nullptr;
-  int low_latency_buffer_idx = 0;
+  int proxy_buffer_idx = 0;
   void* workspace = nullptr;
 
   // device / ranks
@@ -1932,7 +1820,7 @@ class Buffer {
   d2hq::D2HHandle* d_handle_objs{nullptr};
   uint64_t* d_handles{nullptr};
 
-  // IPC base pointers for GPU access (for replacing nvshmemi_get_p2p_ptr)
+  // IPC base pointers for GPU access (for replacing proxy IPC p2p pointer)
   void** d_ipc_rdma_base_ptrs{
       nullptr};  // Device pointer to array of IPC base addresses
 };
@@ -1960,11 +1848,11 @@ NB_MODULE(ep, m) {
            &uccl::Config::get_rdma_buffer_size_hint);
 
   // Helper: peek a UcclProxy's mode without unwrapping nb::object.
-  auto proxy_low_latency_mode = [](nb::object const& proxy) -> bool {
+  auto proxy_proxy_mode = [](nb::object const& proxy) -> bool {
     // UcclProxy.use_normal_mode() returns True for high-throughput mode
     // (DeepEP throughput / "normal" kernels); the registry key uses
-    // low_latency_mode = !use_normal_mode so a Buffer ctor can look up by
-    // its own low_latency_mode flag. The legacy attribute name is kept
+    // proxy_mode = !use_normal_mode so a Buffer ctor can look up by
+    // its own proxy_mode flag. The compatibility attribute name is kept
     // for backwards compatibility with code paths still passing
     // use_normal_mode=True/False.
     return !nb::cast<bool>(proxy.attr("use_normal_mode")());
@@ -1972,25 +1860,25 @@ NB_MODULE(ep, m) {
 
   m.def(
       "register_proxy",
-      [proxy_low_latency_mode](int device_index, nb::object proxy) {
+      [proxy_proxy_mode](int device_index, nb::object proxy) {
         std::lock_guard<std::mutex> lk(g_proxies_mu);
-        bool ll = proxy_low_latency_mode(proxy);
+        bool ll = proxy_proxy_mode(proxy);
         auto& vec = uccl::g_proxies_by_dev[{device_index, ll}];
         if (!vec.empty()) {
           fprintf(stderr,
                   "WARNING: overwriting existing proxies for device %d "
                   "(%s mode)\n",
-                  device_index, ll ? "low-latency" : "high-throughput");
+                  device_index, ll ? "proxy" : "high-throughput");
           std::abort();
         }
         vec.push_back(std::move(proxy));
         printf("Registered proxy for device %d (%s mode)\n", device_index,
-               ll ? "low-latency" : "high-throughput");
+               ll ? "proxy" : "high-throughput");
       },
       nb::arg("device_index"), nb::arg("proxy"));
   m.def(
       "register_proxies",
-      [proxy_low_latency_mode](int device_index,
+      [proxy_proxy_mode](int device_index,
                                std::vector<nb::object> proxies) {
         std::lock_guard<std::mutex> lk(g_proxies_mu);
         if (proxies.empty()) {
@@ -1999,10 +1887,10 @@ NB_MODULE(ep, m) {
                   device_index);
           std::abort();
         }
-        bool ll = proxy_low_latency_mode(proxies.front());
+        bool ll = proxy_proxy_mode(proxies.front());
         // All proxies in a single registration must share the same mode.
         for (auto const& p : proxies) {
-          if (proxy_low_latency_mode(p) != ll) {
+          if (proxy_proxy_mode(p) != ll) {
             fprintf(stderr,
                     "register_proxies: mixed-mode proxies for device %d\n",
                     device_index);
@@ -2014,14 +1902,14 @@ NB_MODULE(ep, m) {
           fprintf(stderr,
                   "WARNING: overwriting existing proxies for device %d "
                   "(%s mode)\n",
-                  device_index, ll ? "low-latency" : "high-throughput");
+                  device_index, ll ? "proxy" : "high-throughput");
           std::abort();
         }
         for (auto& proxy : proxies) {
           vec.push_back(std::move(proxy));
         }
         printf("Registered proxies for device %d (%s mode)\n", device_index,
-               ll ? "low-latency" : "high-throughput");
+               ll ? "proxy" : "high-throughput");
       },
       nb::arg("device_index"), nb::arg("proxies"));
   m.def(
@@ -2136,14 +2024,117 @@ NB_MODULE(ep, m) {
       .def("rank", &ElasticProxyBuffer::rank)
       .def("num_ranks", &ElasticProxyBuffer::num_ranks)
       .def("num_bytes", &ElasticProxyBuffer::num_bytes)
+      .def("get_comm_stream", &ElasticProxyBuffer::get_comm_stream)
       .def("num_scaleout_ranks", &ElasticProxyBuffer::num_scaleout_ranks)
       .def("num_scaleup_ranks", &ElasticProxyBuffer::num_scaleup_ranks)
       .def("scaleout_rank", &ElasticProxyBuffer::scaleout_rank)
-      .def("scaleup_rank", &ElasticProxyBuffer::scaleup_rank);
+      .def("scaleup_rank", &ElasticProxyBuffer::scaleup_rank)
+      .def(
+          "build_v2_dispatch_metadata",
+          [](ElasticProxyBuffer& self, std::uintptr_t recv_src_meta_ptr,
+             std::uintptr_t recv_topk_idx_ptr, int num_recv_tokens,
+             int num_topk, int num_scaleup_ranks, int num_local_experts,
+             int num_max_tokens_per_rank, int expert_alignment,
+             std::uintptr_t recv_src_metadata_ptr,
+             std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+             std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+             std::uintptr_t dst_buffer_slot_idx_ptr,
+             std::uintptr_t raw_num_recv_tokens_per_expert_ptr,
+             std::uintptr_t expanded_expert_cursor_ptr,
+             nb::object previous_event, bool async,
+             bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
+            std::optional<EventHandle> prev;
+            if (!previous_event.is_none()) {
+              EventHandle ev = nb::cast<EventHandle>(previous_event);
+              prev = ev;
+            }
+            return self.build_v2_dispatch_metadata(
+                recv_src_meta_ptr, recv_topk_idx_ptr, num_recv_tokens,
+                num_topk, num_scaleup_ranks, num_local_experts,
+                num_max_tokens_per_rank, expert_alignment,
+                recv_src_metadata_ptr,
+                psum_num_recv_tokens_per_scaleup_rank_ptr,
+                psum_num_recv_tokens_per_expert_ptr, dst_buffer_slot_idx_ptr,
+                raw_num_recv_tokens_per_expert_ptr,
+                expanded_expert_cursor_ptr, prev, async,
+                allocate_on_comm_stream, compute_stream_ptr);
+          },
+          nb::arg("recv_src_meta_ptr"), nb::arg("recv_topk_idx_ptr"),
+          nb::arg("num_recv_tokens"), nb::arg("num_topk"),
+          nb::arg("num_scaleup_ranks"), nb::arg("num_local_experts"),
+          nb::arg("num_max_tokens_per_rank"), nb::arg("expert_alignment"),
+          nb::arg("recv_src_metadata_ptr"),
+          nb::arg("psum_num_recv_tokens_per_scaleup_rank_ptr"),
+          nb::arg("psum_num_recv_tokens_per_expert_ptr"),
+          nb::arg("dst_buffer_slot_idx_ptr"),
+          nb::arg("raw_num_recv_tokens_per_expert_ptr"),
+          nb::arg("expanded_expert_cursor_ptr"),
+          nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
+          nb::arg("allocate_on_comm_stream") = false,
+          nb::arg("compute_stream_ptr") = 0)
+      .def(
+          "build_v2_expanded_payload",
+          [](ElasticProxyBuffer& self, std::uintptr_t recv_x_ptr,
+             std::uintptr_t recv_x_scales_ptr,
+             std::uintptr_t recv_topk_weights_ptr,
+             std::uintptr_t recv_src_metadata_ptr, int num_recv_tokens,
+             int num_topk, int hidden_bytes, int num_scales,
+             std::uintptr_t expanded_x_ptr,
+             std::uintptr_t expanded_x_scales_ptr,
+             std::uintptr_t expanded_topk_weights_ptr,
+             nb::object previous_event, bool async,
+             bool allocate_on_comm_stream, std::uintptr_t compute_stream_ptr) {
+            std::optional<EventHandle> prev;
+            if (!previous_event.is_none()) {
+              EventHandle ev = nb::cast<EventHandle>(previous_event);
+              prev = ev;
+            }
+            return self.build_v2_expanded_payload(
+                recv_x_ptr, recv_x_scales_ptr, recv_topk_weights_ptr,
+                recv_src_metadata_ptr, num_recv_tokens, num_topk,
+                hidden_bytes, num_scales, expanded_x_ptr,
+                expanded_x_scales_ptr, expanded_topk_weights_ptr, prev,
+                async, allocate_on_comm_stream, compute_stream_ptr);
+          },
+          nb::arg("recv_x_ptr"), nb::arg("recv_x_scales_ptr"),
+          nb::arg("recv_topk_weights_ptr"),
+          nb::arg("recv_src_metadata_ptr"), nb::arg("num_recv_tokens"),
+          nb::arg("num_topk"), nb::arg("hidden_bytes"),
+          nb::arg("num_scales"), nb::arg("expanded_x_ptr"),
+          nb::arg("expanded_x_scales_ptr"),
+          nb::arg("expanded_topk_weights_ptr"),
+          nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
+          nb::arg("allocate_on_comm_stream") = false,
+          nb::arg("compute_stream_ptr") = 0)
+      .def(
+          "build_v2_reduced_combine_input",
+          [](ElasticProxyBuffer& self, std::uintptr_t expanded_x_ptr,
+             std::uintptr_t recv_src_metadata_ptr, int num_recv_tokens,
+             int num_topk, int hidden, int dtype_code,
+             std::uintptr_t reduced_x_ptr, nb::object previous_event,
+             bool async, bool allocate_on_comm_stream,
+             std::uintptr_t compute_stream_ptr) {
+            std::optional<EventHandle> prev;
+            if (!previous_event.is_none()) {
+              EventHandle ev = nb::cast<EventHandle>(previous_event);
+              prev = ev;
+            }
+            return self.build_v2_reduced_combine_input(
+                expanded_x_ptr, recv_src_metadata_ptr, num_recv_tokens,
+                num_topk, hidden, dtype_code, reduced_x_ptr, prev, async,
+                allocate_on_comm_stream, compute_stream_ptr);
+          },
+          nb::arg("expanded_x_ptr"), nb::arg("recv_src_metadata_ptr"),
+          nb::arg("num_recv_tokens"), nb::arg("num_topk"),
+          nb::arg("hidden"), nb::arg("dtype_code"),
+          nb::arg("reduced_x_ptr"), nb::arg("previous_event") = nb::none(),
+          nb::arg("async") = false,
+          nb::arg("allocate_on_comm_stream") = false,
+          nb::arg("compute_stream_ptr") = 0);
   nb::class_<Buffer>(m, "Buffer")
       .def(nb::init<int, int, long, long, bool, bool, int>(), nb::arg("rank"),
            nb::arg("num_ranks"), nb::arg("num_nvl_bytes") = 0,
-           nb::arg("num_rdma_bytes") = 0, nb::arg("low_latency_mode") = false,
+           nb::arg("num_rdma_bytes") = 0, nb::arg("proxy_mode") = false,
            nb::arg("explicitly_destroy") = false,
            nb::arg("num_local_ranks") = -1)
       .def("destroy", &Buffer::destroy)
@@ -2155,20 +2146,6 @@ NB_MODULE(ep, m) {
           nb::arg("addr"), nb::arg("is_host_ptr") = false,
           R"doc(Set RDMA buffer from a raw address. Caller must keep the memory alive.)doc")
       .def("reset_rdma_buffer", &Buffer::reset_rdma_buffer)
-      .def("low_latency_dispatch", &Buffer::low_latency_dispatch,
-           nb::arg("x_ptr"), nb::arg("x_rows"), nb::arg("x_cols"),
-           nb::arg("topk_idx_ptr"), nb::arg("topk_rows"), nb::arg("topk_cols"),
-           nb::arg("packed_recv_x_ptr"), nb::arg("packed_recv_x_scales_ptr"),
-           nb::arg("packed_recv_count_ptr"),
-           nb::arg("packed_recv_src_info_ptr"),
-           nb::arg("packed_recv_layout_range_ptr"),
-           nb::arg("cumulative_local_expert_recv_stats_ptr") = 0,
-           nb::arg("dispatch_wait_recv_cost_stats_ptr") = 0,
-           nb::arg("compute_stream_ptr"),
-           nb::arg("num_max_dispatch_tokens_per_rank") = 0,
-           nb::arg("num_experts") = 1, nb::arg("use_fp8") = true,
-           nb::arg("round_scale") = false, nb::arg("use_ue8m0") = false,
-           nb::arg("is_async") = false, nb::arg("return_recv_hook") = false)
       .def("get_local_device_id", &Buffer::get_local_device_id)
       .def("get_local_ipc_handle", &Buffer::get_local_ipc_handle)
       .def("get_local_rdma_ipc_handle", &Buffer::get_local_rdma_ipc_handle)
@@ -2589,29 +2566,7 @@ NB_MODULE(ep, m) {
           nb::arg("combined_topk_weights_ptr"),
           nb::arg("previous_event") = nb::none(), nb::arg("async") = false,
           nb::arg("allocate_on_comm_stream") = false,
-          nb::arg("compute_stream_ptr") = 0)
-      .def("clean_low_latency_buffer", &Buffer::clean_low_latency_buffer,
-           nb::arg("num_max_dispatch_tokens_per_rank"), nb::arg("hidden"),
-           nb::arg("num_experts"), nb::arg("stream_ptr"))
-      .def("low_latency_combine", &Buffer::low_latency_combine,
-           nb::arg("x_ptr"), nb::arg("x_dim0"), nb::arg("x_dim1"),
-           nb::arg("x_dim2"), nb::arg("topk_idx_ptr"), nb::arg("topk_rows"),
-           nb::arg("topk_cols"), nb::arg("topk_weights_ptr"),
-           nb::arg("src_info_ptr"), nb::arg("src_info_dim0"),
-           nb::arg("src_info_dim1"), nb::arg("layout_range_ptr"),
-           nb::arg("layout_range_dim0"), nb::arg("layout_range_dim1"),
-           nb::arg("combine_wait_recv_cost_stats_ptr") = 0,
-           nb::arg("compute_stream_ptr"),
-           nb::arg("num_max_dispatch_tokens_per_rank") = 0,
-           nb::arg("num_experts") = 1, nb::arg("use_logfmt") = false,
-           nb::arg("zero_copy") = false, nb::arg("is_async") = false,
-           nb::arg("return_recv_hook") = false, nb::arg("out_ptr"),
-           // DeepEP-compatible overlap kwargs (stub).
-           nb::arg("overlap") = false, nb::arg("packed_recv_count_ptr") = 0,
-           nb::arg("comp_signal_ptr") = 0, nb::arg("block_m") = 64,
-           nb::arg("threshold") = 0, nb::arg("num_sms") = 0,
-           nb::arg("src_signals_ptr") = 0,
-           nb::arg("src_signal_expect_value") = 0);
+          nb::arg("compute_stream_ptr") = 0);
   m.def("alloc_cmd_ring", &alloc_cmd_ring);
   m.def("free_cmd_ring", &free_cmd_ring);
   m.def("launch_gpu_issue_kernel", [](int blocks, int threads_per_block,
@@ -2626,8 +2581,6 @@ NB_MODULE(ep, m) {
                                std::string(cudaGetErrorString(st)));
     }
   });
-  m.def("get_low_latency_rdma_size_hint",
-        &uccl::get_low_latency_rdma_size_hint);
   m.def("sync_stream", []() {
     auto st = cudaDeviceSynchronize();
     if (st != cudaSuccess)

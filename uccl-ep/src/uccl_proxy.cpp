@@ -19,8 +19,6 @@ UcclProxy::UcclProxy(int thread_idx, uintptr_t gpu_buffer_addr,
       mode_{Mode::None},
       running_{false},
       is_intranode_{is_intranode} {
-  // EP 8 of internode_ll also need atomic_buffer_ptr
-
   Proxy::Config cfg{};
   thread_idx_ = thread_idx;
   gpu_buffer_addr_ = reinterpret_cast<void*>(gpu_buffer_addr);

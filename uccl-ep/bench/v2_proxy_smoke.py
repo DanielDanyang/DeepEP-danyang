@@ -6,24 +6,51 @@ resolves to the AWS wrapper, not the upstream DeepEP package.
 
 The goal is to keep the benchmark shaped like `tests/elastic/test_ep.py`:
 normal dispatch, expanded dispatch, cached dispatch, combine, and reduced
-combine.  Timing is wall time because the UCCL backend does not use the
-official DeepEP kernel names consumed by `bench_kineto`.
-
-    deep_ep.ElasticBuffer API -> UCCL legacy HT Buffer -> CPU proxy -> EFA verbs
+combine.  Timing is wall time because the AWS backend does not use the official
+DeepEP kernel names consumed by `bench_kineto`.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
+import sys
 import time
+import types
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
 import deep_ep
-from deep_ep.utils.math import count_bytes, per_token_cast_to_fp8, safe_div
-from deep_ep.utils.refs import generate_pre_combine_data, ordered_accumulate
+
+
+def _load_deepep_util(module: str):
+    repo_root = Path(__file__).resolve().parents[2]
+    utils_dir = repo_root / "deep_ep" / "utils"
+    package = "_deepep_root_utils"
+    if package not in sys.modules:
+        pkg = types.ModuleType(package)
+        pkg.__path__ = [str(utils_dir)]
+        sys.modules[package] = pkg
+    path = utils_dir / f"{module}.py"
+    spec = importlib.util.spec_from_file_location(f"{package}.{module}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load DeepEP utility module from {path}")
+    loaded = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = loaded
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+_math = _load_deepep_util("math")
+_refs = _load_deepep_util("refs")
+count_bytes = _math.count_bytes
+per_token_cast_to_fp8 = _math.per_token_cast_to_fp8
+safe_div = _math.safe_div
+generate_pre_combine_data = _refs.generate_pre_combine_data
+ordered_accumulate = _refs.ordered_accumulate
 
 
 def wait_event(event) -> None:

@@ -1,225 +1,56 @@
-# UCCL-EP: GPU-initiated Expert-parallel Communication
+# UCCL EP for DeepEP V2 on AWS EFA
 
-GPU-initiated expert-parallel communication (e.g., DeepEP) is the key to efficient and large-scale EP. However, it cannot run on heterogeneous platforms due to tight coupling between GPU and NIC (e.g., with IBGDA). UCCL-EP has the same interface and functionality as [DeepEP](https://github.com/deepseek-ai/DeepEP), and enables GPU-initiated communication for MoE models across heterogeneous GPUs (e.g., Nvidia, AMD) and NICs (e.g., EFA, Broadcom, CX7), with superior performance to the state-of-the-art. 
+这个目录现在只维护 DeepEP V2 在 AWS EFA 上的 native proxy backend。旧的
+DeepEP V1 wrapper、低延迟 API 示例和 V1 benchmark 入口已经移除，避免后续开发继续
+围绕旧接口语义打补丁。
 
-## Prerequisite
+## 当前边界
 
-We provide a script to install dependencies (tested on p5en, p6-b200, AMD MI300x), assuming under a Python environment: 
+- Python 入口在 `deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`。
+- 内部 transport 在 `deep_ep_v2_wrapper/deep_ep/proxy_transport.py`。
+- Native 扩展在 `src/uccl_ep.cc`，CUDA kernel 在 `src/internode.cu` 和
+  `src/intranode.cu`。
+- V2 metadata、expanded dispatch payload、reduced combine input 已经由
+  `ElasticProxyBuffer` 直接调用 CUDA helper，不再经过旧 `Buffer` wrapper。
+- 剩余大块工作是把 dispatch/combine 的实际跨机 transfer plan 继续下沉到 native
+  V2 kernels，最终删除 `ProxyTransport` 里的兼容 transport 调度层。
+
+## 构建
+
+在 AWS p5en 机器上使用隔离 venv：
+
 ```bash
-./install_deps.sh
-```
-
-## Build on CUDA
-
-You can directly build and install into your Python env:
-```bash
+cd /home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/uccl-ep
+source /home/ubuntu/.venvs/deepep-danyang-cu13/bin/activate
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH=/usr/local/cuda-13.0/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+export USE_DMABUF=1
+export MAX_JOBS=16
 python setup.py install
 ```
 
-You can also use `make` to build and install (might deprecate in the future): 
-```bash
-make -j install
-```
+## DeepEP V2 Smoke
 
-Alternatively, you can build `uccl.ep` wheel using docker then install:
-```bash
-# Under uccl
-bash build.sh cu12 ep --install
-```
-
-Notes:  
-* **"Invalid argument" registartion error**: UCCL-EP by default uses `ibv_reg_mr_iova2` to register GPU memory with RDMA, which requires `nvidia_peermem / efa_nv_peermem / ib_peer_mem` kernel module dependency. Making sure the kernel modules are loaded (i.e., `sudo modprobe xxx`). If these modules are not available on your platform, you can specify `USE_DMABUF=1` during wheel building (any of three ways above) to use kernel DMABUF mechanisms. 
-* **EFA auto-detection**: UCCL-EP `setup.py` and `Makefile` auto-detects the existence of `/opt/amazon/efa` to enable EFA-specific RDMA path with `-DEFA`. If you hit "Invalid argument" error on EFA, it is also possible that your UCCL-EP wheel uses a non-EFA RDMA path. In that case, we suggest making sure `/opt/amazon/efa` exists, and rebuilding and reinstalling the wheel. 
-* Docker-built `uccl.ep` wheel currently does not work on p6-b200, see https://github.com/uccl-project/uccl/issues/554.
-
-## Build on ROCm
-
-You can directly build and install into your Python env:
-```bash
-python setup.py install
-```
-
-Alternatively, you can build `uccl.ep` wheel for ROCm7 using docker then install:
-```bash
-# Under uccl
-bash build.sh roc7 ep --install
-```
-
-## Test import `uccl.ep`
-```bash
-python -c "import torch; import uccl.ep"
-```
-
-Note: 
-* If you hit some `CUDA error: invalid device function`, it is likely that the GPU arch auto-detection fails. You can forcely specify the arch by setting `TORCH_CUDA_ARCH_LIST=gfx950` (eg, default gfx942 for MI300X/MI325X, gfx950 for MI355X) during compilation. 
-* If you hit any weird compilation errors, try `python setup.py clean`.
-
-## Example APIs
-
-Dispatch and combine: 
-```python
-packed_recv_x, packed_recv_count, handle, event, hook = buffer.low_latency_dispatch(
-    current_x,
-    topk_idx,
-    num_tokens,
-    num_experts,
-    use_fp8=dispatch_use_fp8,
-    round_scale=round_scale,
-    use_ue8m0=use_ue8m0,
-    cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-    async_finish=not return_recv_hook,
-    return_recv_hook=return_recv_hook,
-)
-
-combined_x, event, hook = buffer.low_latency_combine(
-    simulated_gemm_x,
-    topk_idx,
-    topk_weights,
-    handle,
-    use_logfmt=use_logfmt,
-    async_finish=not return_recv_hook,
-    zero_copy=zero_copy,
-    return_recv_hook=return_recv_hook,
-    out=out,
-)
-```
-
-Initialization and tear down:
-```python
-proxies, workers = initialize_uccl(scratch, num_rdma_bytes, rank, num_ranks, group, args.num_experts)
-destroy_uccl(proxies, workers)
-```
-
-## Benchmark
-In `ep` folder, the benchmark can be run with `torchrun`. 
-
-### Intranode Test
+先确认没有其他人占用 GPU，再运行最小 V2 smoke：
 
 ```bash
-torchrun --standalone --nproc_per_node=8 \
-  bench/test_intranode.py --num-tokens 4096 \
-  --hidden 7168 --num-topk 8 --num-experts 256
+cd /home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang
+source /home/ubuntu/.venvs/deepep-danyang-cu13/bin/activate
+export PYTHONPATH=$PWD/uccl-ep/deep_ep_v2_wrapper:$PYTHONPATH
+python -c "import deep_ep; print(deep_ep.ElasticBuffer)"
 ```
 
-### Internode Low Latency Test
+双机 benchmark 继续使用仓库里的 DeepEP V2 test/bench 脚本，并显式设置 AWS OFI
+master、EFA provider 和 rails：
 
 ```bash
-torchrun --nnodes=4 --nproc_per_node=8 --node_rank=<rank> \
-  --master_addr=<ip> --master_port=12355 \
-  bench/test_low_latency.py --num-tokens=128 \
-  --hidden=7168 --num-topk=8 --num-experts=288
+export LD_LIBRARY_PATH=/home/ubuntu/efs/yzhou/playground/daniel/aws-ofi-nccl-master/lib:/opt/amazon/efa/lib:$LD_LIBRARY_PATH
+unset EP_DISABLE_GIN
+unset OFI_NCCL_GIN_GDAKI
+export NCCL_NET_PLUGIN=ofi
+export FI_PROVIDER=efa
+export FI_EFA_USE_DEVICE_RDMA=1
+export OFI_NCCL_FORCE_NUM_RAILS=4
+export NCCL_SOCKET_IFNAME=enp71s0
 ```
-
-### Internode Normal Mode (Throughput) Test
-
-```bash
-torchrun --nnodes=4 --nproc_per_node=8 --node_rank=<rank> \
-  --master_addr=<ip> --master_port=12355 \
-  bench/test_internode.py  --num-tokens=4096 \
-  --hidden=7168 --num-topk=8 --num-experts=288 --test-ll-compatibility
-```
-
-Notes:
-* To avoid possible hangs, we suggest setting env variables explicitly including `NCCL_IB_GID_INDEX`, `UCCL_IB_GID_INDEX`, `NCCL_SOCKET_IFNAME`, and `UCCL_SOCKET_IFNAME`:
-  * `UCCL_IB_GID_INDEX` should be the same as `NCCL_IB_GID_INDEX` like if you were using NCCL. 
-  * `UCCL_SOCKET_IFNAME` should be the interface that you would use for the `--master_addr` in `torchrun`. 
-* For Broadcom Thor-2, we suggest setting `UCCL_IB_MAX_INFLIGHT_BYTES=1572864 UCCL_IB_MAX_INFLIGHT_NORMAL=1` to enforce strict flow control, avoiding CQE error 12 (Transport Retry Counter Exceeded).
-* For AMD Pollara AI NIC, we suggest setting `UCCL_IB_MAX_INFLIGHT_BYTES=2097152 UCCL_IB_MAX_INFLIGHT_NORMAL=1`. 
-* Please refer to [bench/baseline](bench/baseline) for running more baselines including Torch, NVSHMEM, and pplx-kernels on EFA. 
-
-| Environment Variable | Description | Default Value |
-|---------------------|-------------|---------------|
-| UCCL_SOCKET_IFNAME | Boostrapping interface | null |
-| UCCL_IB_GID_INDEX | GID index in RDMA network | -1 |
-| UCCL_IB_MAX_INFLIGHT_BYTES | Max inflight bytes per GPU/NIC | SIZE_MAX (no limit) |
-| UCCL_IB_MAX_INFLIGHT_NORMAL | Max inflight writes per GPU/NIC in HT | 8 |
-| UCCL_IB_MAX_INFLIGHT_LOW_LATENCY | Max inflight writes per GPU/NIC in LL | 32 |
-| UCCL_IB_SL | Service level in RDMA network | 3/8 (IB/EFA) |
-| UCCL_IB_TC | Traffic class in RDMA network | 104/0 (IB/EFA) |
-| UCCL_EP_ENABLE_AGGRESSIVE_ATOMIC | Use relaxed atomics with manual `s_waitcnt vmcnt(0)` fences instead of acquire/release semantics. Required on AMD CDNA so the combine receiver actually sees the producer's tail-pointer updates over XGMI; without it the kernel deadlocks at scale. | 1 on AMD, 0 on CUDA |
-| UCCL_RDMA_ADAPTIVE_SLEEP | Enable adaptive sleeping on proxy threads, by putting the proxy threads into a sleeping state if there have been no new work requests / RDMA completion events after 120s. | null |
-
-## Results
-
-### Normal kernels with NVLink and RDMA forwarding
-
-#### On p5en
-
-We test normal kernels on **8x H200 + 16x 200Gb/s EFA** with each GPU connected to two **200 Gb/s EFA RDMA** network cards.
-We follow the **DeepSeek-V3 pretraining** configuration (4096 tokens per batch, 7168 hidden, top-4 groups, top-8 experts, FP8 dispatch and BF16 combine).
-
-|   Type    | Dispatch #EP | Bottleneck bandwidth & latency | Combine #EP | Bottleneck bandwidth & latency |
-|:---------:|:-------------:|:--------------------:|:------------:|:--------------------:|
-| Intranode | 8  | 320 GB/s (NVLink), 500 µs | 8  | 319 GB/s (NVLink), 973 µs |
-| Internode | 16 | 50 GB/s (RDMA), 1196 µs | 16 | 18 GB/s (RDMA), 6379 µs    |
-| Internode | 24 | 53 GB/s (RDMA), 1633 µs | 24 | 26 GB/s (RDMA), 6365 µs    |
-| Internode | 32 | 54 GB/s (RDMA), 2022 µs | 32 | 43 GB/s (RDMA), 4899 µs    |
-
-#### On p6-b200
-
-We test normal kernels on **8x B200 + 8x 400Gb/s EFA** with each GPU connected to a **400Gb/s EFA RDMA** network card.
-
-|   Type    | Dispatch #EP | Bottleneck bandwidth & latency | Combine #EP | Bottleneck bandwidth & latency |
-|:---------:|:-------------:|:--------------------:|:------------:|:--------------------:|
-| Intranode | 8  | 280 GB/s (NVLink), 571 µs | 8  | 426 GB/s (NVLink), 727 µs |
-| Internode | 16 | 53 GB/s (RDMA), 1141 µs | 16 | 60 GB/s (RDMA), 1965 µs    |
-| Internode | 24 | 53 GB/s (RDMA), 1637 µs | 24 | 59 GB/s (RDMA), 2887 µs    |
-| Internode | 32 | 53 GB/s (RDMA), 2072 µs | 32 | 57 GB/s (RDMA), 3724 µs    |
-
-#### On AMD MI300X with CX7 InfiniBand
-
-|   Type    | FP8 Dispatch #EP | Bottleneck bandwidth| BF16 Dispatch #EP |Bottleneck bandwidth | Combine #EP | Bottleneck bandwidth |
-|:---------:|:------------:|:--------------------:|:-----------:|:--------------------:|:--------------------:|:--------------------:|
-| Intranode |       8      |    260 GB/s (xGMI)   |     8       |   295 GB/s (xGMI)    |  8       |  304 GB/s (xGMI)     |
-| Internode |      16      |    74 GB/s (RDMA)    |     16      |    82 GB/s (RDMA)    |  16      |   78 GB/s (RDMA)    |
-| Internode |      32      |    60 GB/s (RDMA)    |     32      |    61 GB/s (RDMA)    |  32      |   60 GB/s (RDMA)    |
-| Internode |      64      |    52 GB/s (RDMA)    |     32      |    53 GB/s (RDMA)    |  64      |   51 GB/s (RDMA)    |
-
-
-#### On AMD MI355X with Pollara AI NIC InfiniBand
-
-|   Type    | FP8 Dispatch #EP | Bottleneck bandwidth| BF16 Dispatch #EP |Bottleneck bandwidth | Combine #EP | Bottleneck bandwidth |
-|:---------:|:------------:|:--------------------:|:-----------:|:--------------------:|:--------------------:|:--------------------:|
-| Intranode |       8      |    299 GB/s (xGMI)   |     8       |   336 GB/s (xGMI)    |  8       |  333 GB/s (xGMI)     |
-| Internode |      16      |    82 GB/s (RDMA)    |     16      |    82 GB/s (RDMA)    |  16      |   82 GB/s (RDMA)    |
-| Internode |      32      |    59 GB/s (RDMA)    |     32      |    58 GB/s (RDMA)    |  32      |   59 GB/s (RDMA)    |
-| Internode |      64      |    50 GB/s (RDMA)    |     32      |    49 GB/s (RDMA)    |  64      |   49 GB/s (RDMA)    |
-
-
-#### On AMD MI300X with Broadcom Thor2
-
-|   Type    | FP8 Dispatch #EP | Bottleneck bandwidth| BF16 Dispatch #EP |Bottleneck bandwidth | Combine #EP | Bottleneck bandwidth |
-|:---------:|:------------:|:--------------------:|:-----------:|:--------------------:|:--------------------:|:--------------------:|
-| Internode |      16      |    71 GB/s (RDMA)    |     16      |    81 GB/s (RDMA)    | 16      |    45 GB/s (RDMA)    |
-| Internode |      32      |    49 GB/s (RDMA)    |     32      |    55 GB/s (RDMA)    |  32      |    50 GB/s (RDMA)    |
-
-
-### Low-latency kernels with pure RDMA
-
-#### AMD MI300X with CX7 InfiniBand
-
-| Dispatch #EP | Latency | RDMA bandwidth | Combine #EP | Latency | RDMA bandwidth |
-|:------------:|:-------:|:--------------:|:-----------:|:-------:|:--------------:|
-|      8       |   65 us  |    114 GB/s     |      8      |  92 us  |    157 GB/s    |
-|      16      | 136 us  |    55 GB/s     |     16      | 207 us  |    70 GB/s     |
-|      32      | 224 us  |    30 GB/s     |     32      | 341 us  |    42 GB/s     |
-
-#### On p6-b200
-
-We test low-latency kernels on **8x B200 + 8x 400Gb/s EFA**.
-
-| Dispatch #EP | Latency | RDMA bandwidth | Combine #EP | Latency | RDMA bandwidth |
-|:-------------:|:--------:|:---------------:|:------------:|:--------:|:---------------:|
-| 16 | 228 µs | 33 GB/s | 16 | 318 µs | 46 GB/s |
-| 24 | 448 µs | 17 GB/s | 24 | 566 µs | 26 GB/s |
-| 32 | 406 µs | 19 GB/s | 32 | 617 µs | 24 GB/s |
-
-#### On p5en
-
-We test low-latency kernels on **8x H200 + 16x 200Gb/s EFA**, following a **DeepSeek-V3 inference** setting (128 tokens per batch, 7168 hidden, top-8 experts, FP8 dispatch / BF16 combine).
-
-| Dispatch #EP | Latency | RDMA bandwidth | Combine #EP | Latency | RDMA bandwidth |
-|:-------------:|:--------:|:---------------:|:------------:|:--------:|:---------------:|
-| 16 | 226 µs | 36 GB/s | 16 | 293 µs | 48 GB/s |
-| 24 | 386 µs | 20 GB/s | 24 | 580 µs | 26 GB/s |
-| 32 | 465 µs | 16 GB/s | 32 | 694 µs | 25 GB/s |

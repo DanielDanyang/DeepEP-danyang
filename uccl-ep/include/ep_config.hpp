@@ -74,7 +74,7 @@ struct Config {
         num_channels * num_nvl_ranks * (2 * num_rdma_ranks + 3) * sizeof(int);
     num_bytes += num_channels * num_nvl_ranks *
                  num_max_nvl_chunked_recv_tokens * hidden_bytes;
-#ifndef DISABLE_NVSHMEM
+#ifndef DISABLE_UCCL_PROXY
     num_bytes += num_channels * num_nvl_ranks *
                  num_max_nvl_chunked_recv_tokens *
                  uccl::internode::get_source_meta_bytes();
@@ -92,8 +92,8 @@ struct Config {
   }
 
   size_t get_rdma_buffer_size_hint(int64_t hidden_bytes, int num_ranks) const {
-#ifndef DISABLE_NVSHMEM
-    // Legacy mode
+#ifndef DISABLE_UCCL_PROXY
+    // UCCL proxy compatibility mode.
     if (num_ranks <= NUM_MAX_NVL_PEERS) return 0;
 
     // Below are some assumptions
@@ -127,7 +127,7 @@ struct Config {
     num_bytes = ((num_bytes + 127) / 128) * 128;
     return num_bytes;
 #else
-    EP_HOST_ASSERT(false and "NVSHMEM is disable during compilation");
+    EP_HOST_ASSERT(false and "UCCL proxy is disabled during compilation");
 #endif
   }
 };
@@ -261,7 +261,7 @@ struct LowLatencyLayout {
     size_t dispatch_recv_count_buffer_bytes_internode =
         static_cast<size_t>(num_ranks * num_ranks) * sizeof(int64_t);
 #else
-    // Legacy dispatch tracks one count per expert.
+    // Dispatch tracks one count per expert.
     size_t dispatch_recv_count_buffer_bytes_internode =
         num_experts * sizeof(int64_t);
 #endif
