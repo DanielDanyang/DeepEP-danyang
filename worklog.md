@@ -592,3 +592,46 @@ Benchmark 结果：
 
 - 2 节点 x 2 rank smoke 仍不适合当前 UCCL legacy HT path，因为 `Config.get_rdma_buffer_size_hint(hidden_bytes, num_ranks)` 对 `num_ranks < 8` 返回 0；EP16 是当前有效目标形态。
 - 最后检查两台机器 `nvidia-smi --query-compute-apps` 为空，没有残留 benchmark 进程。
+
+## 2026-05-28 README 风格 EP16 benchmark
+
+本地代码改动：
+
+- commit: `1635d8b Print README-style V2 proxy bandwidth`
+- `uccl-ep/bench/v2_proxy_smoke.py` 增加 README 类似的 logical bandwidth 输出：
+  - dispatch / expanded dispatch / cached dispatch / combine
+  - 同时打印 `GB/s (SO)`、`GB/s (SU)`、平均耗时和 logical bytes。
+- 说明：这里仍是 UCCL wrapper 的端到端 wall-time 计时，不是官方 `tests/elastic/test_ep.py` 里的 `bench_kineto` kernel-name 精确计时；官方 perf 脚本目前匹配的是 `dispatch_impl` / `combine_impl` 等 DeepEP kernel 名，不能直接识别 UCCL backend 的 kernel。
+
+服务器 benchmark：
+
+- 两台机器运行前 `nvidia-smi --query-compute-apps` 均为空。
+- 配置：
+  - EP16: `torchrun --nnodes=2 --nproc_per_node=8`
+  - `--num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 --use-fp8-dispatch`
+  - `OFI_NCCL_FORCE_NUM_RAILS=4`
+  - 未开启 `--ignore-local-traffic`，即按 README 默认口径把 logical local rank traffic 也计入带宽。
+- 稳定数据使用 `--iters 10`：
+  - 日志：
+    - `/tmp/v2_proxy_readme_8192_fp8_iters10_rank0.log`
+    - `/tmp/v2_proxy_readme_8192_fp8_iters10_rank1.log`
+  - `rank=0/16`:
+    - smoke: `recv=(53780, 7168)`, `combined=(8192, 7168)`, `dispatch_avg_ms=4.016`, `expanded_dispatch_avg_ms=4.496`, `cached_dispatch_avg_ms=3.202`, `combine_avg_ms=17.529`
+    - README 风格：
+      - dispatch: `30 GB/s (SO), 100 GB/s (SU), 4016.400 us, 402704640 bytes`
+      - expanded dispatch: `27 GB/s (SO), 90 GB/s (SU), 4495.832 us, 402704640 bytes`
+      - cached dispatch: `38 GB/s (SO), 126 GB/s (SU), 3201.701 us, 402704640 bytes`
+      - combine: `13 GB/s (SO), 44 GB/s (SU), 17529.499 us, 772711040 bytes`
+  - `rank=8/16`:
+    - smoke: `recv=(53412, 7168)`, `combined=(8192, 7168)`, `dispatch_avg_ms=4.197`, `expanded_dispatch_avg_ms=4.477`, `cached_dispatch_avg_ms=3.211`, `combine_avg_ms=17.888`
+    - README 风格：
+      - dispatch: `29 GB/s (SO), 95 GB/s (SU), 4197.211 us, 399949056 bytes`
+      - expanded dispatch: `27 GB/s (SO), 89 GB/s (SU), 4476.500 us, 399949056 bytes`
+      - cached dispatch: `38 GB/s (SO), 125 GB/s (SU), 3211.029 us, 399949056 bytes`
+      - combine: `13 GB/s (SO), 43 GB/s (SU), 17888.255 us, 767423616 bytes`
+
+观察：
+
+- expanded dispatch 已达到 README SM90 EP16 量级的 `~90 GB/s (SU)`；cached dispatch 约 `125-126 GB/s (SU)`。
+- combine 仍明显低，约 `43-44 GB/s (SU)`，是下一步主要瓶颈。
+- 首次 `--iters 3` 中 rank0 uncached dispatch 有明显 outlier，平均到 `16.988 ms`；`--iters 10` 后回到 `4.0-4.2 ms`，因此后续记录优先使用 `iters=10` 或更高迭代数。
