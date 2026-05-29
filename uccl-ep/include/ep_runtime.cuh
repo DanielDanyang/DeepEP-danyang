@@ -6,7 +6,7 @@
 
 namespace internode {
 int init(std::vector<uint8_t> const& root_unique_id_val, int rank,
-         int num_ranks, bool low_latency_mode);
+         int num_ranks);
 void* alloc(std::size_t size, std::size_t alignment);
 void finalize();
 void barrier();

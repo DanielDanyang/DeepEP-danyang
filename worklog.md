@@ -1024,3 +1024,97 @@ chunk sweep 观察：
 - `#SM=20` 对 combine 略好，但 dispatch/cached dispatch 明显低于默认自动 32 SM；
   现在不应该把默认 SM 改回 20。
 - named handle 本身不改变带宽；它是后续把 V2 handle 迁入 native/C++ 的结构准备。
+
+## 2026-05-29 清理 internode V1 mode 开关并对齐 profiler kernel 名
+
+代码清理：
+
+- `uccl::internode` 的 host API 不再接收 `low_latency_mode`：
+  - `notify_dispatch`
+  - `cached_notify`
+  - `dispatch`
+  - `combine`
+- CUDA kernel 模板里的 `kLowLatencyMode` 也删除了。此前该模板参数只传给
+  `translate_dst_rdma_rank`，而实际实现已经始终返回
+  `dst_rdma_rank * NUM_MAX_NVL_PEERS + nvl_rank`，也就是按本地 GPU lane
+  对齐跨节点发往同 lane rank；这个行为保留，并用中文注释解释成 native V2
+  在 AWS/EFA 上的固定 lane/rail 映射。
+- `ep_runtime.{cu,cuh}` 的 dummy `internode::init` 去掉未使用的
+  `low_latency_mode` 参数。
+- `ep_proxy_registry.hpp` 注释从 `(device_index, low_latency_mode)` 改为
+  `(device_index, proxy_mode)`。底层 RDMA command 里的
+  `low_latency_buffer_idx` 暂未删除，因为它现在仍承担 buffer index/立即数编码角色，
+  不能和模式开关一起机械删掉。
+- 为了直接兼容 `tests/elastic/test_ep.py` 的 README 风格 profiler：
+  - internode 主通信 kernel 改名为 `dispatch_impl` / `combine_impl`
+  - V2 expanded/reduced epilogue kernel 改名为
+    `dispatch_copy_epilogue_impl` / `combine_reduce_epilogue_impl`
+  - 普通 non-expanded dispatch/combine 的 payload/reduce 已融合在主 kernel 中，
+    没有独立 epilogue；为了避免原测试脚本 `copy_t == 0` 除零，只在这些非
+    expanded/reduced 路径插入同名 no-op marker kernel。注意这些 marker 只用于
+    profiler 兼容，不能把普通 dispatch/combine 的 `copy/reduce` 列当作真实
+    epilogue 耗时解读；真实通信瓶颈看 SO/SU 和主 kernel 时间。
+
+构建/验证：
+
+- 远端同步并在两台机器安装：
+  - `p5en_0`: `python setup.py install` 通过。
+  - `p5en_1`: `python setup.py install` 通过。
+- 本地：
+  - `python3 -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+  - `git diff --check -- uccl-ep`
+- EP8x2 小配置 correctness smoke：
+  - 命令核心参数：
+    `--num-processes 8 --test-first-only --skip-perf-test --num-tokens 1024 --hidden 1024 --num-topk 2 --num-experts 16`
+  - 日志：
+    `/tmp/v2_native_noll_ep8x2_smoke_rank0.log`,
+    `/tmp/v2_native_noll_ep8x2_smoke_rank1.log`
+  - 结果：通过。
+- 无效 EP2 试跑：
+  - `--num-processes 1` 会让当前 internode 代码出现
+    `num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS = 0`，RDMA buffer hint 变成
+    0 字节并注册失败。
+  - 这个形状不代表 EP8x2；后续不要用它做 smoke。
+
+README 风格 EP8x2 性能：
+
+- 命令核心参数：
+  `--num-processes 8 --test-first-only --skip-check --num-tokens 8192 --hidden 7168 --num-topk 8 --num-experts 256 --ignore-local-traffic`
+- 环境：
+  `OFI_NCCL_FORCE_NUM_RAILS=4`，aws-ofi-nccl master，EFA provider，
+  `PYTHONPATH=$PWD/uccl-ep/deep_ep_v2_wrapper`。
+- 日志：
+  - `/tmp/v2_native_markers_ep8x2_perf_skipcheck_rank0.log`
+  - `/tmp/v2_native_markers_ep8x2_perf_skipcheck_rank1.log`
+- 结果摘要，默认 auto `#SM=32`：
+  - rank0 侧：
+    - dispatch: `26-27 GB/s (SO)`, `151-154 GB/s (SU)`,
+      `2269-2327 us`
+    - expanded dispatch: `27 GB/s (SO)`, `154-156 GB/s (SU)`,
+      `2232-2282 us`
+    - cached dispatch: `28 GB/s (SO)`, `159-161 GB/s (SU)`,
+      `2181-2192 us`
+    - combine: `7-8 GB/s (SO)`, `40-45 GB/s (SU)`,
+      `14954-16730 us`
+    - reduced combine: `7-8 GB/s (SO)`, `39-44 GB/s (SU)`,
+      `15259-17109 us`
+  - rank1 侧：
+    - dispatch: `27-28 GB/s (SO)`, `153-161 GB/s (SU)`,
+      `2171-2290 us`
+    - expanded dispatch: `27 GB/s (SO)`, `152-156 GB/s (SU)`,
+      `2253-2299 us`
+    - cached dispatch: `27-28 GB/s (SO)`, `157-159 GB/s (SU)`,
+      `2205-2223 us`
+    - combine: `7-8 GB/s (SO)`, `40-45 GB/s (SU)`,
+      `14955-16794 us`
+    - reduced combine: `7-8 GB/s (SO)`, `39-44 GB/s (SU)`,
+      `15258-17133 us`
+
+补充观察：
+
+- 不加 `--skip-check` 的同配置已经完整打印性能数据，但 perf 后的严格
+  `torch.equal` correctness check 报 `AssertionError: Diff: 0.0`。此前小配置
+  correctness smoke 已通过；这里更像大配置 perf loop 后的 bitwise/状态检查问题，
+  不是本次带宽统计本身的 blocker。
+- 本轮后两台机器 `nvidia-smi --query-compute-apps` 均为空；中途失败残留在
+  `p5en_1` 的 8 个本次 benchmark Python rank 已清理。

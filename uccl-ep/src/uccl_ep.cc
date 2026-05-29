@@ -965,8 +965,7 @@ class Buffer {
         config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank,
         comm_stream,
         config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-        num_nvl_bytes, proxy_mode, d_handles, num_d2h_channel_addrs,
-        atomic_buffer_ptr);
+        num_nvl_bytes, d_handles, num_d2h_channel_addrs, atomic_buffer_ptr);
 
     int num_recv_tokens = -1;
     int num_rdma_recv_tokens = -1;
@@ -1058,8 +1057,8 @@ class Buffer {
           barrier_signal_ptrs_gpu, rank, comm_stream,
           config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4),
                                            num_ranks),
-          num_nvl_bytes, true, proxy_mode, d_handles,
-          num_d2h_channel_addrs, atomic_buffer_ptr);
+          num_nvl_bytes, true, d_handles, num_d2h_channel_addrs,
+          atomic_buffer_ptr);
     } else {
       EP_HOST_ASSERT(recv_src_meta_ptr != 0);
       EP_HOST_ASSERT(send_rdma_head_ptr != 0);
@@ -1107,8 +1106,8 @@ class Buffer {
         config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
         config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, cached_mode,
-        comm_stream, num_channels, proxy_mode, d_handles,
-        num_d2h_channel_addrs, atomic_buffer_ptr);
+        comm_stream, num_channels, d_handles, num_d2h_channel_addrs,
+        atomic_buffer_ptr);
 
     std::optional<EventHandle> event;
     if (async) {
@@ -1315,6 +1314,14 @@ class Buffer {
     return event;
   }
 
+  void mark_v2_dispatch_copy_epilogue() {
+    uccl::internode::mark_v2_dispatch_copy_epilogue(comm_stream);
+  }
+
+  void mark_v2_combine_reduce_epilogue() {
+    uccl::internode::mark_v2_combine_reduce_epilogue(comm_stream);
+  }
+
   std::optional<EventHandle> internode_combine(
       std::uintptr_t x_ptr, int num_tokens, int hidden, int x_dtype_code,
       int x_element_size, std::uintptr_t topk_weights_ptr, int num_topk,
@@ -1364,8 +1371,8 @@ class Buffer {
         config.num_max_nvl_chunked_recv_tokens, barrier_signal_ptrs_gpu, rank,
         comm_stream,
         config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
-        num_nvl_bytes, false, proxy_mode, d_handles,
-        num_d2h_channel_addrs, atomic_buffer_ptr);
+        num_nvl_bytes, false, d_handles, num_d2h_channel_addrs,
+        atomic_buffer_ptr);
 
     void* bias_ptrs[2] = {
         bias_0_ptr == 0 ? nullptr : reinterpret_cast<void*>(bias_0_ptr),
@@ -1397,8 +1404,7 @@ class Buffer {
         config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
         config.num_max_nvl_chunked_send_tokens,
         config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, comm_stream,
-        num_channels, proxy_mode, d_handles, num_d2h_channel_addrs,
-        atomic_buffer_ptr);
+        num_channels, d_handles, num_d2h_channel_addrs, atomic_buffer_ptr);
 
     std::optional<EventHandle> event;
     if (async) {
@@ -2327,6 +2333,10 @@ NB_MODULE(ep, m) {
           nb::arg("async") = false,
           nb::arg("allocate_on_comm_stream") = false,
           nb::arg("compute_stream_ptr") = 0)
+      .def("mark_v2_dispatch_copy_epilogue",
+           &Buffer::mark_v2_dispatch_copy_epilogue)
+      .def("mark_v2_combine_reduce_epilogue",
+           &Buffer::mark_v2_combine_reduce_epilogue)
       .def(
           "internode_combine",
           [](Buffer& self, std::uintptr_t x_ptr, int num_tokens, int hidden,

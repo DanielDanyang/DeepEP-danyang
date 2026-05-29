@@ -6,7 +6,7 @@
 namespace internode {
 
 int init(std::vector<uint8_t> const& root_unique_id_val, int rank,
-         int num_ranks, bool low_latency_mode) {
+         int num_ranks) {
   std::cout << "[internode::init] dummy init invoked" << std::endl;
   return 0;
 }

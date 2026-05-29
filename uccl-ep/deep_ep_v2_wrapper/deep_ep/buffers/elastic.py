@@ -560,6 +560,8 @@ class ElasticBuffer:
                 recv_topk_idx = handle._cached_recv_topk_idx
             if recv_topk_weights is None and hasattr(handle, "_cached_recv_topk_weights"):
                 recv_topk_weights = handle._cached_recv_topk_weights
+            if not handle.do_expand:
+                self.runtime.mark_v2_dispatch_copy_epilogue()
             return recv_x, recv_topk_idx, recv_topk_weights, handle, event
 
         if topk_idx is None or num_experts is None:
@@ -638,6 +640,7 @@ class ElasticBuffer:
         if not do_expand:
             new_handle._cached_recv_topk_idx = recv_topk_idx
             new_handle._cached_recv_topk_weights = recv_topk_weights
+            self.runtime.mark_v2_dispatch_copy_epilogue()
         return recv_x, recv_topk_idx, recv_topk_weights, new_handle, event
 
     def combine(
@@ -669,7 +672,7 @@ class ElasticBuffer:
             )
             previous_event = reduce_event
             topk_weights = None
-        return transport.combine(
+        result = transport.combine(
             x,
             handle.transport_handle,
             topk_weights=topk_weights,
@@ -679,6 +682,9 @@ class ElasticBuffer:
             async_finish=bool(async_with_compute_stream),
             allocate_on_comm_stream=bool(allocate_on_comm_stream),
         )
+        if not handle.do_expand:
+            self.runtime.mark_v2_combine_reduce_epilogue()
+        return result
 
 
 def _align_2mb(value: int) -> int:

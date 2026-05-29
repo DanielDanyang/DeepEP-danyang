@@ -45,6 +45,10 @@ void build_v2_reduced_combine_input(
     int num_topk, int hidden, cudaDataType_t type, void* reduced_x,
     cudaStream_t stream);
 
+void mark_v2_dispatch_copy_epilogue(cudaStream_t stream);
+
+void mark_v2_combine_reduce_epilogue(cudaStream_t stream);
+
 __host__ __device__ __forceinline__ int get_num_bytes_per_token(
     int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights);
 
@@ -69,8 +73,8 @@ void notify_dispatch(
     int num_max_rdma_chunked_recv_tokens, void** buffer_ptrs,
     int num_max_nvl_chunked_recv_tokens, int** barrier_signal_ptrs, int rank,
     cudaStream_t stream, int64_t num_rdma_bytes, int64_t num_nvl_bytes,
-    bool low_latency_mode, uint64_t const* d2h_channel_addrs,
-    int num_d2h_channel_addrs, void* atomic_buffer_ptr);
+    uint64_t const* d2h_channel_addrs, int num_d2h_channel_addrs,
+    void* atomic_buffer_ptr);
 
 void cached_notify(int hidden_int4, int num_scales, int num_topk_idx,
                    int num_topk_weights, int num_ranks, int num_channels,
@@ -81,9 +85,8 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx,
                    void** buffer_ptrs, int num_max_nvl_chunked_recv_tokens,
                    int** barrier_signal_ptrs, int rank, cudaStream_t stream,
                    int64_t num_rdma_bytes, int64_t num_nvl_bytes,
-                   bool is_cached_dispatch, bool low_latency_mode,
-                   uint64_t const* d2h_channel_addrs, int num_d2h_channel_addrs,
-                   void* atomic_buffer_ptr);
+                   bool is_cached_dispatch, uint64_t const* d2h_channel_addrs,
+                   int num_d2h_channel_addrs, void* atomic_buffer_ptr);
 
 void dispatch(
     void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx,
@@ -100,8 +103,8 @@ void dispatch(
     void** buffer_ptrs, int num_max_nvl_chunked_send_tokens,
     int num_max_nvl_chunked_recv_tokens, int rank, int num_ranks,
     bool is_cached_dispatch, cudaStream_t stream, int num_channels,
-    bool low_latency_mode, uint64_t const* d2h_channel_addrs,
-    int num_d2h_channel_addrs, void* atomic_buffer_ptr);
+    uint64_t const* d2h_channel_addrs, int num_d2h_channel_addrs,
+    void* atomic_buffer_ptr);
 
 void combine(cudaDataType_t type, void* combined_x,
              float* combined_topk_weights,
@@ -116,7 +119,7 @@ void combine(cudaDataType_t type, void* combined_x,
              int num_max_rdma_chunked_recv_tokens, void** buffer_ptrs,
              int num_max_nvl_chunked_send_tokens,
              int num_max_nvl_chunked_recv_tokens, int rank, int num_ranks,
-             cudaStream_t stream, int num_channels, bool low_latency_mode,
+             cudaStream_t stream, int num_channels,
              uint64_t const* d2h_channel_addrs, int num_d2h_channel_addrs,
              void* atomic_buffer_ptr);
 

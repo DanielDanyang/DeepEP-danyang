@@ -7,12 +7,9 @@
 namespace uccl {
 namespace nb = nanobind;
 
-// Keyed by (device_index, low_latency_mode). Allows a single process to
-// register two independent sets of UcclProxy instances on the same device --
-// one for high-throughput mode (DeepEP "normal" / use_normal_mode=True) and
-// one for low-latency mode -- so that two coexisting Buffer instances don't
-// collide on shared resources (per-device thread pool, /dev/shm barriers,
-// etc.).
+// Keyed by (device_index, proxy_mode). The bool is still part of the RDMA
+// proxy resource key so old and native experiments do not collide on shared
+// per-device thread pools or /dev/shm barriers during development.
 using ProxyRegistryKey = std::pair<int, bool>;
 extern std::map<ProxyRegistryKey, std::vector<nb::object>> g_proxies_by_dev;
 
