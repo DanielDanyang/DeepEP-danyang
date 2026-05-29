@@ -13,7 +13,12 @@
   `intranode_prepare/dispatch/combine` binding 已从 native 扩展中移除。
 - `src/internode.cu`、`src/intranode.cu`、`src/layout.cu` 以及对应 header 已删除。
 - `ProxyTransport` 现在只保留 fail-fast placeholder，避免旧 transport 被误用。
-- 下一步是实现 `V2EfaRuntime` 和 V2 JIT descriptor/proxy backend。
+- 保留 UCCL EP 的 CPU proxy / FIFO / RDMA substrate 作为 AWS EFA transport 基础。
+  清理目标是 V1 EP semantic encoding，不是删掉 proxy 方法本身。
+- native V2 command 路径采用 64B `V2TransferCmd` + 16B FIFO doorbell/index：
+  GPU 写 command array，FIFO 只通知 command index，CPU proxy drain 后按 index 发 EFA
+  write/signal。
+- 下一步是把 `V2EfaRuntime` 的 V2 JIT descriptor enqueue 接到真实 retained host proxy。
 
 ## 构建
 

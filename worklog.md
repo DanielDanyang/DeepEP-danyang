@@ -97,6 +97,13 @@
   - Python/nanobind runtime 增加 `build_reference_transfer_roundtrip_plan` 调试入口，
     一次返回 dispatch/combine descriptor、contiguous transfer layout 和
     `V2TransferCmd` 列表，后续可直接和官方 V2 handle metadata 对拍。
+  - 明确清理边界：保留 UCCL EP 的 CPU proxy / FIFO / RDMA substrate，删除或绕开的是
+    V1 EP semantic encoding。native V2 不把 command 编回旧 16B `TransferCmd` bitfield。
+  - 新增 `include/v2_efa/transfer_fifo.hpp`：GPU/host 流程设计为 command array + FIFO
+    doorbell。64B `V2TransferCmd` 存 V2 语义，16B `V2FifoDoorbell` 只存 queue id 和
+    command index，CPU proxy drain FIFO 后按 index 读取 command。
+  - 本地测试覆盖 descriptor -> `V2TransferCmd` -> FIFO doorbell pack/unpack ->
+    host drain -> loopback，确认这一条 proxy-style roundtrip 没破坏 command helper。
   - 本地没有 nanobind header，`uccl_ep.cc` 只能等服务器/构建环境做 extension 编译；
     当前已完成 Python `py_compile` 和 C++ header/runtime 单测。
 - 服务器当前未执行任何 build/test/profiling/benchmark。

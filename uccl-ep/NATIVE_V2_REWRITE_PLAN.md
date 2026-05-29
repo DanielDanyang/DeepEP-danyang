@@ -135,6 +135,10 @@ API 不能再命中。
 - `include/d2h_queue_*`、`include/ring_buffer*.cuh`
   - device-to-host queue 思路可以复用。
   - 字段命名和 encoding 要从 `low_latency/is_combine/expert` 改成 V2 descriptor/packet。
+  - native V2 的长期路径是保留 FIFO/doorbell 方法：GPU 写 64B `V2TransferCmd`
+    到 command array，再向 FIFO 推一个 16B doorbell/index；CPU proxy drain FIFO 后
+    按 index 读取 native V2 command。这样流程和 UCCL EP V1 一样是
+    GPU-to-CPU proxy，但不把 V2 语义重新压回旧 `TransferCmd` bitfield。
 - `include/common.hpp`、`include/exception.cuh`、`include/ep_launch.cuh`
   - 通用 assert、launch helper 可以复用。
 - Python 里的 topology/bootstrap 工具
@@ -150,6 +154,7 @@ uccl-ep/
     runtime.hpp
     transfer_cmd.hpp
     transfer_cmd_plan.hpp
+    transfer_fifo.hpp
     transfer_layout.hpp
     transfer_queue_host.hpp
     dispatch_jit.cuh
@@ -376,6 +381,10 @@ device enqueue EFA proxy descriptors
 - nanobind/Python runtime 已新增 `build_reference_transfer_roundtrip_plan`，可导出
   descriptor、contiguous layout 和 `V2TransferCmd` 列表，作为接入真实 V2 JIT/handle
   metadata 前的对拍入口。
+- 已新增 `transfer_fifo.hpp`，定义 16B `V2FifoDoorbell` 和 host/device FIFO view。
+  它只承载 queue id 与 command index，真正的 dispatch/combine payload/signal 语义
+  保留在 64B `V2TransferCmd` 中。host reference FIFO 已能通过 doorbell drain
+  command 并执行 loopback。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 

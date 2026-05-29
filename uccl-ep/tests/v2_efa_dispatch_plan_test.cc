@@ -3,6 +3,7 @@
 #include "v2_efa/runtime.hpp"
 #include "v2_efa/transfer_cmd.hpp"
 #include "v2_efa/transfer_cmd_plan.hpp"
+#include "v2_efa/transfer_fifo.hpp"
 #include "v2_efa/transfer_layout.hpp"
 #include "v2_efa/transfer_loopback.hpp"
 #include "v2_efa/transfer_queue_host.hpp"
@@ -199,6 +200,39 @@ int main() {
                          queued_dispatch_remote.size()});
   assert(queued_dispatch_stats.payload_commands == 4);
   assert(std::memcmp(queued_dispatch_remote.data() + 2000,
+                     dispatch_local.data() + 1000, 64) == 0);
+
+  HostV2TransferFifo dispatch_fifo(
+      static_cast<uint32_t>(dispatch_commands.commands.size()),
+      /*queue_id=*/7);
+  const auto fifo_stats = submit_v2_transfer_fifo_commands(
+      dispatch_fifo, dispatch_commands.commands);
+  assert(fifo_stats.submitted == dispatch_commands.commands.size());
+  assert(fifo_stats.overflow == 0);
+  const auto doorbells = dispatch_fifo.doorbells();
+  assert(doorbells.size() == dispatch_commands.commands.size());
+  assert(doorbells[0].queue_id == 7);
+  assert(doorbells[0].command_index == 0);
+  uint64_t packed_first = 0;
+  uint64_t packed_second = 0;
+  pack_v2_fifo_doorbell(doorbells[0], &packed_first, &packed_second);
+  const auto unpacked_doorbell =
+      unpack_v2_fifo_doorbell(packed_first, packed_second);
+  assert(is_v2_fifo_doorbell(unpacked_doorbell));
+  assert(unpacked_doorbell.queue_id == 7);
+  assert(dispatch_fifo.command_for(unpacked_doorbell).kind ==
+         static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload));
+  const auto fifo_commands = dispatch_fifo.drain_commands();
+  assert(fifo_commands.size() == dispatch_commands.commands.size());
+  assert(fifo_commands[1].kind ==
+         static_cast<uint8_t>(V2TransferCmdKind::kDispatchSignal));
+  std::vector<uint8_t> fifo_dispatch_remote(4096, 0);
+  const auto fifo_dispatch_stats = dispatch_fifo.drain_loopback(
+      LoopbackMemoryView{dispatch_local.data(), dispatch_local.size(),
+                         fifo_dispatch_remote.data(),
+                         fifo_dispatch_remote.size()});
+  assert(fifo_dispatch_stats.payload_commands == 4);
+  assert(std::memcmp(fifo_dispatch_remote.data() + 2000,
                      dispatch_local.data() + 1000, 64) == 0);
 
   assert(v2_sink.ops[0].target_rank == dispatch_commands.commands[0].target_rank);
