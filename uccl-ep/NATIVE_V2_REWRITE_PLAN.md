@@ -374,6 +374,8 @@ device enqueue EFA proxy descriptors
 - 已新增 `V2TransferCmd` 的 two-`uint64_t` pack/unpack codec，host adapter 可直接把
   FIFO/trigger words decode 成 `EfaPostOp`。真实 CPU proxy poll loop 后续应在这里
   分流 V2 command，而不是进入旧 `TransferCmd` decode 逻辑。
+- command helper 已改为 CUDA/HIP host-device inline；device enqueue kernel 和 host
+  reference planner 共用同一套 builder/codec。
 - JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。旧
   `ProxyCommand` enqueue/reference 路径已删除，host transfer queue 和 EFA adapter
   都直接消费 `V2TransferCmd`。

@@ -7,6 +7,18 @@
 
 namespace uccl::v2_efa {
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define V2_EFA_HOST_DEVICE __host__ __device__
+#else
+#define V2_EFA_HOST_DEVICE
+#endif
+
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#define V2_EFA_DEVICE_CODE 1
+#else
+#define V2_EFA_DEVICE_CODE 0
+#endif
+
 constexpr int kV2TransferOffsetShift = 2;
 
 enum class V2TransferCmdKind : uint8_t {
@@ -24,8 +36,8 @@ enum class V2TransferCmdFlags : uint8_t {
   kCombine = 1u << 3,
 };
 
-inline constexpr V2TransferCmdFlags operator|(V2TransferCmdFlags a,
-                                              V2TransferCmdFlags b) {
+V2_EFA_HOST_DEVICE inline constexpr V2TransferCmdFlags operator|(
+    V2TransferCmdFlags a, V2TransferCmdFlags b) {
   return static_cast<V2TransferCmdFlags>(static_cast<uint8_t>(a) |
                                          static_cast<uint8_t>(b));
 }
@@ -68,12 +80,12 @@ struct CombineTransferLayout {
   uint32_t signal_stride = sizeof(uint32_t);
 };
 
-inline bool is_v2_transfer_cmd(const V2TransferCmd& cmd) {
+V2_EFA_HOST_DEVICE inline bool is_v2_transfer_cmd(const V2TransferCmd& cmd) {
   return cmd.kind >= static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload) &&
          cmd.kind <= static_cast<uint8_t>(V2TransferCmdKind::kCombineSignal);
 }
 
-inline uint8_t v2_transfer_flags(V2TransferCmdKind kind) {
+V2_EFA_HOST_DEVICE inline uint8_t v2_transfer_flags(V2TransferCmdKind kind) {
   switch (kind) {
     case V2TransferCmdKind::kDispatchPayload:
       return static_cast<uint8_t>(V2TransferCmdFlags::kDispatch) |
@@ -88,48 +100,58 @@ inline uint8_t v2_transfer_flags(V2TransferCmdKind kind) {
       return static_cast<uint8_t>(V2TransferCmdFlags::kCombine) |
              static_cast<uint8_t>(V2TransferCmdFlags::kSignal);
   }
-  throw std::invalid_argument("unknown V2 transfer command kind");
+  return 0;
 }
 
-inline uint32_t encode_v2_transfer_offset(uint64_t offset) {
+V2_EFA_HOST_DEVICE inline uint32_t encode_v2_transfer_offset(uint64_t offset) {
   const auto align = uint64_t{1} << kV2TransferOffsetShift;
+#if !V2_EFA_DEVICE_CODE
   if ((offset & (align - 1)) != 0) {
     throw std::invalid_argument("V2 transfer offset is not aligned");
   }
+#endif
   const auto shifted = offset >> kV2TransferOffsetShift;
+#if !V2_EFA_DEVICE_CODE
   if (shifted > UINT32_MAX) {
     throw std::out_of_range("V2 transfer offset exceeds command range");
   }
+#endif
   return static_cast<uint32_t>(shifted);
 }
 
-inline uint64_t decode_v2_transfer_offset(uint32_t shifted) {
+V2_EFA_HOST_DEVICE inline uint64_t decode_v2_transfer_offset(uint32_t shifted) {
   return static_cast<uint64_t>(shifted) << kV2TransferOffsetShift;
 }
 
-inline bool is_v2_transfer_payload(const V2TransferCmd& command) {
+V2_EFA_HOST_DEVICE inline bool is_v2_transfer_payload(
+    const V2TransferCmd& command) {
   return (command.flags & static_cast<uint8_t>(V2TransferCmdFlags::kPayload)) !=
          0;
 }
 
-inline bool is_v2_transfer_signal(const V2TransferCmd& command) {
+V2_EFA_HOST_DEVICE inline bool is_v2_transfer_signal(
+    const V2TransferCmd& command) {
   return (command.flags & static_cast<uint8_t>(V2TransferCmdFlags::kSignal)) !=
          0;
 }
 
-inline uint64_t v2_transfer_remote_offset(const V2TransferCmd& command) {
+V2_EFA_HOST_DEVICE inline uint64_t v2_transfer_remote_offset(
+    const V2TransferCmd& command) {
   return decode_v2_transfer_offset(command.remote_offset_shifted);
 }
 
-inline uint64_t v2_transfer_local_offset(const V2TransferCmd& command) {
+V2_EFA_HOST_DEVICE inline uint64_t v2_transfer_local_offset(
+    const V2TransferCmd& command) {
   return decode_v2_transfer_offset(command.local_offset_shifted);
 }
 
-inline void pack_v2_transfer_cmd(const V2TransferCmd& command, uint64_t* first,
-                                 uint64_t* second) {
+V2_EFA_HOST_DEVICE inline void pack_v2_transfer_cmd(
+    const V2TransferCmd& command, uint64_t* first, uint64_t* second) {
+#if !V2_EFA_DEVICE_CODE
   if (first == nullptr || second == nullptr) {
     throw std::invalid_argument("V2 transfer command pack output is null");
   }
+#endif
   uint64_t a = 0;
   uint64_t b = 0;
   a |= static_cast<uint64_t>(command.kind);
@@ -143,7 +165,8 @@ inline void pack_v2_transfer_cmd(const V2TransferCmd& command, uint64_t* first,
   *second = b;
 }
 
-inline V2TransferCmd unpack_v2_transfer_cmd(uint64_t first, uint64_t second) {
+V2_EFA_HOST_DEVICE inline V2TransferCmd unpack_v2_transfer_cmd(
+    uint64_t first, uint64_t second) {
   V2TransferCmd command;
   command.kind = static_cast<uint8_t>(first & 0xFFu);
   command.target_rank = static_cast<uint8_t>((first >> 8) & 0xFFu);
@@ -156,18 +179,15 @@ inline V2TransferCmd unpack_v2_transfer_cmd(uint64_t first, uint64_t second) {
   return command;
 }
 
-inline V2TransferCmd make_v2_transfer_cmd(V2TransferCmdKind kind,
-                                          uint32_t target_rank,
-                                          uint32_t target_lane,
-                                          uint32_t descriptor_index,
-                                          uint32_t batch_index,
-                                          uint32_t bytes,
-                                          uint32_t signal_value,
-                                          uint64_t local_offset,
-                                          uint64_t remote_offset) {
+V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_transfer_cmd(
+    V2TransferCmdKind kind, uint32_t target_rank, uint32_t target_lane,
+    uint32_t descriptor_index, uint32_t batch_index, uint32_t bytes,
+    uint32_t signal_value, uint64_t local_offset, uint64_t remote_offset) {
+#if !V2_EFA_DEVICE_CODE
   if (target_rank > UINT8_MAX || target_lane > UINT8_MAX) {
     throw std::out_of_range("V2 transfer target exceeds command range");
   }
+#endif
   V2TransferCmd out;
   out.kind = static_cast<uint8_t>(kind);
   out.target_rank = static_cast<uint8_t>(target_rank);
@@ -185,7 +205,7 @@ inline V2TransferCmd make_v2_transfer_cmd(V2TransferCmdKind kind,
   return out;
 }
 
-inline V2TransferCmd make_v2_dispatch_payload_cmd(
+V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_payload_cmd(
     const DispatchSegmentDescriptor& segment, uint32_t segment_idx,
     uint32_t batch_idx, const DispatchTransferLayout& layout) {
   return make_v2_transfer_cmd(
@@ -203,7 +223,7 @@ inline V2TransferCmd make_v2_dispatch_payload_cmd(
               layout.expanded_slot_stride);
 }
 
-inline V2TransferCmd make_v2_dispatch_signal_cmd(
+V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_signal_cmd(
     const DispatchExpertBatch& batch, uint32_t batch_idx,
     const DispatchTransferLayout& layout) {
   return make_v2_transfer_cmd(
@@ -218,7 +238,7 @@ inline V2TransferCmd make_v2_dispatch_signal_cmd(
           static_cast<uint64_t>(batch_idx) * layout.signal_stride);
 }
 
-inline V2TransferCmd make_v2_combine_payload_cmd(
+V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_combine_payload_cmd(
     const CombineSegmentDescriptor& segment, uint32_t segment_idx,
     uint32_t batch_idx, const CombineTransferLayout& layout) {
   return make_v2_transfer_cmd(
@@ -237,7 +257,7 @@ inline V2TransferCmd make_v2_combine_payload_cmd(
               layout.reduced_token_stride);
 }
 
-inline V2TransferCmd make_v2_combine_signal_cmd(
+V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_combine_signal_cmd(
     const CombineExpertBatch& batch, uint32_t batch_idx,
     const CombineTransferLayout& layout) {
   return make_v2_transfer_cmd(
@@ -274,3 +294,6 @@ __device__ __forceinline__ void enqueue_v2_transfer_cmd(
 #endif
 
 }  // namespace uccl::v2_efa
+
+#undef V2_EFA_HOST_DEVICE
+#undef V2_EFA_DEVICE_CODE

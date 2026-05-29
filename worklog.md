@@ -105,6 +105,9 @@
     现有 128-bit FIFO/trigger 宽度。
   - `efa_adapter.hpp` 现在可以直接把 packed V2 FIFO words decode 成 `EfaPostOp`，
     对应后续真实 CPU proxy poll loop 的接入点。
+  - `V2TransferCmd` helper 已改为 CUDA/HIP host-device inline；device path 不抛异常，
+    使 `dispatch_jit.cuh` / `combine_jit.cuh` 的 enqueue kernel 可以直接调用同一套
+    command builder。
   - 本地没有 nanobind header，`uccl_ep.cc` 只能等服务器/构建环境做 extension 编译；
     当前已完成 Python `py_compile` 和 C++ header/runtime 单测。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
