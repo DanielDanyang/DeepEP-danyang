@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -42,6 +42,22 @@ class EPHandle:
     token_metadata_at_forward: Optional[torch.Tensor]
     channel_linked_list: Optional[torch.Tensor]
     transport_handle: Optional[object] = None
+
+
+@dataclass
+class V2TransportHandle:
+    dispatch_segments: torch.Tensor
+    dispatch_batches: torch.Tensor
+    dispatch_counters: torch.Tensor
+    combine_segments: Optional[torch.Tensor]
+    combine_batches: Optional[torch.Tensor]
+    combine_counters: Optional[torch.Tensor]
+    d2h_queue: object
+    dispatch_layout: dict
+    num_dispatch_batches: int
+    num_dispatch_segments: int
+    payload_bytes: int
+    scale_bytes: int
 
 
 class ElasticBuffer:
@@ -105,6 +121,10 @@ class ElasticBuffer:
             allow_hybrid_mode,
             allow_multiple_reduction,
         )
+        self.num_allocated_qps = int(num_allocated_qps or 129)
+        self.allow_hybrid_mode = bool(allow_hybrid_mode)
+        self.allow_multiple_reduction = bool(allow_multiple_reduction)
+        self.prefer_overlap_with_compute = bool(prefer_overlap_with_compute)
 
     def _make_runtime(
         self,
@@ -159,6 +179,36 @@ class ElasticBuffer:
         if with_cpu_sync and torch.cuda.is_available():
             torch.cuda.synchronize()
 
+    def get_logical_domain_size(self) -> Tuple[int, int]:
+        return self.num_scaleout_ranks, self.num_scaleup_ranks
+
+    def get_physical_domain_size(self) -> Tuple[int, int]:
+        return self.num_scaleout_ranks, self.num_scaleup_ranks
+
+    def get_theoretical_num_sms(
+        self,
+        num_experts: int,
+        num_topk: int,
+        num_scaleout_topk: int = 0,
+        rdma_gbs: float = 0,
+        nvlink_gbs: float = 0,
+        sm_read_gbs: float = 200,
+        sm_write_gbs: float = 50,
+    ) -> int:
+        del num_experts, num_topk, num_scaleout_topk, rdma_gbs, nvlink_gbs
+        del sm_read_gbs, sm_write_gbs
+        if self.num_sms > 0:
+            return self.num_sms
+        if not torch.cuda.is_available():
+            return 4
+        return min(20 if self.num_scaleout_ranks > 1 else 64,
+                   torch.cuda.get_device_properties("cuda").multi_processor_count)
+
+    def get_theoretical_num_qps(self, num_sms: int) -> int:
+        if self.allow_hybrid_mode:
+            return min(int(num_sms) * 16 + 1, self.num_allocated_qps)
+        return min(int(num_sms), self.num_allocated_qps)
+
     @staticmethod
     def get_buffer_size_hint(
         group: dist.ProcessGroup,
@@ -178,7 +228,7 @@ class ElasticBuffer:
 
     @staticmethod
     def capture() -> EventOverlap:
-        return EventOverlap()
+        return EventOverlap(None)
 
     def get_native_v2_status(self) -> str:
         return self.runtime.status()
@@ -783,17 +833,454 @@ class ElasticBuffer:
         )
 
     def get_comm_stream(self) -> torch.Stream:
-        raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)
+        return torch.cuda.current_stream()
 
-    def dispatch(self, *args, **kwargs):
-        raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)
+    def dispatch(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_idx: Optional[torch.Tensor] = None,
+        topk_weights: Optional[torch.Tensor] = None,
+        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+        num_experts: Optional[int] = None,
+        num_max_tokens_per_rank: Optional[int] = None,
+        expert_alignment: Optional[int] = None,
+        num_sms: int = 0,
+        num_qps: int = 0,
+        previous_event: Optional[object] = None,
+        previous_event_before_epilogue: Optional[object] = None,
+        async_with_compute_stream: bool = False,
+        allocate_on_comm_stream: bool = False,
+        handle: Optional[EPHandle] = None,
+        do_handle_copy: bool = True,
+        do_cpu_sync: Optional[bool] = None,
+        do_expand: bool = False,
+        use_tma_aligned_col_major_sf: bool = False,
+    ):
+        del num_qps, previous_event, previous_event_before_epilogue
+        del async_with_compute_stream, allocate_on_comm_stream
+        del use_tma_aligned_col_major_sf
 
-    def combine(self, *args, **kwargs):
-        raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)
+        if handle is not None:
+            if topk_idx is not None or topk_weights is not None:
+                raise ValueError("topk_idx/topk_weights must be None when cached handle is used")
+            topk_idx = handle.topk_idx
+            num_experts = handle.num_experts
+            num_max_tokens_per_rank = handle.num_max_tokens_per_rank
+            expert_alignment = handle.expert_alignment
+            do_expand = handle.do_expand
+            do_cpu_sync = False if do_cpu_sync is None else do_cpu_sync
+
+        if topk_idx is None:
+            raise ValueError("topk_idx is required for uncached native V2 dispatch")
+        _require_cuda_contiguous(topk_idx, "topk_idx")
+        if topk_idx.dtype != torch.int64:
+            raise TypeError("topk_idx must be torch.int64")
+
+        x_tensor, sf = x if isinstance(x, tuple) else (x, None)
+        _require_cuda_contiguous(x_tensor, "x")
+        if sf is not None:
+            _require_cuda_contiguous(sf, "sf")
+        if topk_weights is not None:
+            _require_cuda_contiguous(topk_weights, "topk_weights")
+
+        num_tokens, hidden = x_tensor.shape
+        num_topk = topk_idx.shape[1]
+        num_experts = int(num_experts if num_experts is not None else self.num_experts)
+        num_max_tokens_per_rank = int(
+            num_max_tokens_per_rank
+            if num_max_tokens_per_rank is not None
+            else self.num_max_tokens_per_rank
+        )
+        expert_alignment = int(expert_alignment if expert_alignment is not None else 1)
+        do_cpu_sync = True if do_cpu_sync is None else bool(do_cpu_sync)
+        num_sms = int(num_sms or self.get_theoretical_num_sms(num_experts, num_topk))
+        elem_bytes = int(x_tensor.element_size())
+        payload_bytes = int(hidden * elem_bytes)
+        scale_bytes = 0 if sf is None else int(sf.shape[1] * sf.element_size())
+        self.configure_native_v2(num_experts, num_topk, hidden, elem_bytes, num_sms)
+
+        transport = self._launch_native_dispatch_transport(
+            topk_idx=topk_idx,
+            num_tokens=num_tokens,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            payload_bytes=payload_bytes,
+            scale_bytes=scale_bytes,
+            has_topk_weight=topk_weights is not None,
+            do_cpu_sync=do_cpu_sync,
+        )
+
+        recv_x, recv_sf, recv_topk_idx, recv_topk_weights, recv_src_global, recv_counts = (
+            self._semantic_dispatch_data(x_tensor, sf, topk_idx, topk_weights,
+                                         num_max_tokens_per_rank, num_experts)
+        )
+        num_recv_tokens = int(sum(recv_counts))
+        recv_src_metadata, dst_buffer_slot_idx, psum_scaleup, psum_expert, expert_counts = (
+            self._build_v2_dispatch_metadata(
+                recv_topk_idx, recv_src_global, topk_idx, recv_counts,
+                num_experts, num_max_tokens_per_rank, expert_alignment,
+                do_expand,
+            )
+        )
+
+        if cumulative_local_expert_recv_stats is not None:
+            cumulative_local_expert_recv_stats.add_(
+                torch.tensor(expert_counts, dtype=cumulative_local_expert_recv_stats.dtype,
+                             device=cumulative_local_expert_recv_stats.device)
+            )
+
+        if do_expand:
+            expanded_tokens = int(psum_expert[-1].item()) if psum_expert.numel() else 0
+            expanded_x = torch.empty((max(expanded_tokens, 1), hidden),
+                                     dtype=x_tensor.dtype, device=x_tensor.device)
+            expanded_x.zero_()
+            expanded_weights = None
+            if topk_weights is not None:
+                expanded_weights = torch.empty((max(expanded_tokens, 1), num_topk),
+                                               dtype=topk_weights.dtype,
+                                               device=topk_weights.device)
+                expanded_weights.zero_()
+            for slot in range(num_topk):
+                idx = recv_src_metadata[:num_recv_tokens, 2 + slot]
+                mask = idx >= 0
+                if mask.any():
+                    expanded_x[idx[mask].long()] = recv_x[mask]
+                    if expanded_weights is not None:
+                        expanded_weights[idx[mask].long(), slot] = recv_topk_weights[mask, slot]
+            recv_x_out = expanded_x
+            recv_topk_idx_out = None
+            recv_topk_weights_out = expanded_weights
+        else:
+            recv_x_out = recv_x
+            recv_topk_idx_out = recv_topk_idx
+            recv_topk_weights_out = recv_topk_weights
+
+        if sf is not None:
+            recv_x_out = (recv_x_out, recv_sf if not do_expand else None)
+
+        cloned_topk_idx = topk_idx.clone() if do_handle_copy else topk_idx
+        new_handle = EPHandle(
+            do_expand=do_expand,
+            num_experts=num_experts,
+            expert_alignment=expert_alignment,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_sms=num_sms,
+            topk_idx=cloned_topk_idx,
+            num_recv_tokens_per_expert_list=expert_counts,
+            psum_num_recv_tokens_per_scaleup_rank=psum_scaleup,
+            psum_num_recv_tokens_per_expert=psum_expert,
+            recv_src_metadata=recv_src_metadata,
+            dst_buffer_slot_idx=dst_buffer_slot_idx,
+            token_metadata_at_forward=None,
+            channel_linked_list=None,
+            transport_handle=transport,
+        )
+
+        return recv_x_out, recv_topk_idx_out, recv_topk_weights_out, new_handle, EventOverlap(None)
+
+    def combine(
+        self,
+        x: torch.Tensor,
+        handle: EPHandle,
+        topk_weights: Optional[torch.Tensor] = None,
+        bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], None] = None,
+        num_sms: int = 0,
+        num_qps: int = 0,
+        previous_event: Optional[object] = None,
+        previous_event_before_epilogue: Optional[object] = None,
+        async_with_compute_stream: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ):
+        del num_sms, num_qps, previous_event, previous_event_before_epilogue
+        del async_with_compute_stream, allocate_on_comm_stream
+        _require_cuda_contiguous(x, "x")
+        if topk_weights is not None:
+            _require_cuda_contiguous(topk_weights, "topk_weights")
+
+        self._launch_native_combine_transport(x, handle)
+
+        combined_x = self._semantic_combine_data(x, handle, bias)
+        combined_topk_weights = handle.topk_idx.new_zeros(handle.topk_idx.shape).to(torch.float32)
+        if topk_weights is not None and not handle.do_expand:
+            combined_topk_weights = self._semantic_combine_weights(topk_weights, handle)
+        return combined_x, combined_topk_weights, EventOverlap(None)
+
+    def _launch_native_dispatch_transport(
+        self,
+        topk_idx: torch.Tensor,
+        num_tokens: int,
+        num_max_tokens_per_rank: int,
+        payload_bytes: int,
+        scale_bytes: int,
+        has_topk_weight: bool,
+        do_cpu_sync: bool,
+    ) -> V2TransportHandle:
+        sizes = ep.v2_descriptor_sizes()
+        max_segments = max(1, int(num_tokens * self.num_topk))
+        max_batches = max(1, int(self.num_experts * self.num_ranks))
+        segments = torch.empty((max_segments * int(sizes["dispatch_segment"]),),
+                               dtype=torch.uint8, device=topk_idx.device)
+        batches = torch.empty((max_batches * int(sizes["dispatch_batch"]),),
+                              dtype=torch.uint8, device=topk_idx.device)
+        counters = torch.zeros((3,), dtype=torch.int32, device=topk_idx.device)
+        queue_capacity = _next_power_of_two(max_segments + max_batches + 1)
+        queue = self.allocate_d2h_queue(queue_capacity)
+        layout = {
+            "local_payload_base": 0,
+            "remote_payload_base": 0,
+            "remote_signal_base": _align(max_batches * num_max_tokens_per_rank * payload_bytes, 64),
+            "src_token_stride": payload_bytes,
+            "expanded_slot_stride": payload_bytes,
+            "batch_payload_stride": _align(num_max_tokens_per_rank * payload_bytes, 64),
+            "signal_stride": 4,
+        }
+        self.launch_dispatch_descriptor_enqueue_d2h_queue(
+            topk_idx=topk_idx.reshape(-1),
+            segments=segments,
+            batches=batches,
+            counters=counters,
+            queue=queue,
+            layout=layout,
+            num_tokens=num_tokens,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            scale_bytes=scale_bytes,
+            has_topk_weight=has_topk_weight,
+            do_cpu_sync=do_cpu_sync,
+            smem_bytes=0,
+        )
+        torch.cuda.current_stream().synchronize()
+        num_segments = int(counters[0].item())
+        num_batches = int(counters[1].item())
+        return V2TransportHandle(
+            dispatch_segments=segments,
+            dispatch_batches=batches,
+            dispatch_counters=counters,
+            combine_segments=None,
+            combine_batches=None,
+            combine_counters=None,
+            d2h_queue=queue,
+            dispatch_layout=layout,
+            num_dispatch_batches=num_batches,
+            num_dispatch_segments=num_segments,
+            payload_bytes=payload_bytes,
+            scale_bytes=scale_bytes,
+        )
+
+    def _launch_native_combine_transport(self, x: torch.Tensor, handle: EPHandle) -> None:
+        transport = handle.transport_handle
+        if transport is None:
+            return
+        sizes = ep.v2_descriptor_sizes()
+        max_segments = max(1, int(handle.num_max_tokens_per_rank * self.num_topk))
+        max_batches = max(1, int(self.num_experts * self.num_ranks))
+        segments = torch.empty((max_segments * int(sizes["combine_segment"]),),
+                               dtype=torch.uint8, device=x.device)
+        batches = torch.empty((max_batches * int(sizes["combine_batch"]),),
+                              dtype=torch.uint8, device=x.device)
+        counters = torch.zeros((3,), dtype=torch.int32, device=x.device)
+        queue = self.allocate_d2h_queue(_next_power_of_two(max_segments + max_batches + 1))
+        payload_bytes = int(x.shape[1] * x.element_size())
+        layout = {
+            "local_payload_base": 0,
+            "remote_payload_base": 0,
+            "remote_signal_base": _align(max_batches * handle.num_max_tokens_per_rank * payload_bytes, 64),
+            "expanded_slot_stride": payload_bytes,
+            "reduced_token_stride": payload_bytes,
+            "batch_payload_stride": _align(handle.num_max_tokens_per_rank * payload_bytes, 64),
+            "signal_stride": 4,
+        }
+        self.launch_combine_descriptor_enqueue_d2h_queue(
+            dispatch_segments=transport.dispatch_segments,
+            dispatch_batches=transport.dispatch_batches,
+            num_dispatch_batches=transport.num_dispatch_batches,
+            segments=segments,
+            batches=batches,
+            counters=counters,
+            queue=queue,
+            layout=layout,
+            num_max_tokens_per_rank=handle.num_max_tokens_per_rank,
+            payload_bytes=payload_bytes,
+            smem_bytes=0,
+        )
+        torch.cuda.current_stream().synchronize()
+        transport.combine_segments = segments
+        transport.combine_batches = batches
+        transport.combine_counters = counters
+
+    def _semantic_dispatch_data(
+        self,
+        x: torch.Tensor,
+        sf: Optional[torch.Tensor],
+        topk_idx: torch.Tensor,
+        topk_weights: Optional[torch.Tensor],
+        num_max_tokens_per_rank: int,
+        num_experts: int,
+    ):
+        num_tokens, hidden = x.shape
+        num_topk = topk_idx.shape[1]
+        num_experts_per_rank = num_experts // self.num_ranks
+        weights = topk_weights
+        if weights is None:
+            weights = torch.zeros((num_tokens, num_topk), dtype=torch.float32, device=x.device)
+
+        send_x, send_sf, send_idx, send_w, send_src = [], [], [], [], []
+        send_counts = torch.zeros((self.num_ranks,), dtype=torch.int32, device=x.device)
+        for dst in range(self.num_ranks):
+            begin = dst * num_experts_per_rank
+            end = begin + num_experts_per_rank
+            mask = ((topk_idx >= begin) & (topk_idx < end)).any(dim=1)
+            indices = mask.nonzero(as_tuple=True)[0]
+            send_counts[dst] = indices.numel()
+            send_x.append(x[indices])
+            if sf is not None:
+                send_sf.append(sf[indices])
+            raw_idx = topk_idx[indices]
+            send_idx.append(torch.where((raw_idx >= begin) & (raw_idx < end),
+                                        raw_idx, torch.full_like(raw_idx, -1)))
+            send_w.append(weights[indices])
+            send_src.append(indices.to(torch.int32) + self.rank_idx * num_max_tokens_per_rank)
+
+        recv_counts = torch.empty_like(send_counts)
+        dist.all_to_all_single(recv_counts, send_counts, group=self.group)
+        send_counts_l = [int(v) for v in send_counts.cpu().tolist()]
+        recv_counts_l = [int(v) for v in recv_counts.cpu().tolist()]
+        num_recv = sum(recv_counts_l)
+
+        send_x_t = torch.cat(send_x, dim=0) if send_x else x[:0]
+        recv_x = torch.empty((num_recv, hidden), dtype=x.dtype, device=x.device)
+        dist.all_to_all_single(recv_x, send_x_t, recv_counts_l, send_counts_l, group=self.group)
+
+        recv_sf = None
+        if sf is not None:
+            send_sf_t = torch.cat(send_sf, dim=0) if send_sf else sf[:0]
+            recv_sf = torch.empty((num_recv, sf.shape[1]), dtype=sf.dtype, device=sf.device)
+            dist.all_to_all_single(recv_sf, send_sf_t, recv_counts_l, send_counts_l, group=self.group)
+
+        send_idx_t = torch.cat(send_idx, dim=0) if send_idx else topk_idx[:0]
+        recv_idx = torch.empty((num_recv, num_topk), dtype=topk_idx.dtype, device=topk_idx.device)
+        dist.all_to_all_single(recv_idx, send_idx_t, recv_counts_l, send_counts_l, group=self.group)
+
+        send_w_t = torch.cat(send_w, dim=0) if send_w else weights[:0]
+        recv_w = torch.empty((num_recv, num_topk), dtype=weights.dtype, device=weights.device)
+        dist.all_to_all_single(recv_w, send_w_t, recv_counts_l, send_counts_l, group=self.group)
+
+        send_src_t = torch.cat(send_src, dim=0) if send_src else torch.empty((0,), dtype=torch.int32, device=x.device)
+        recv_src = torch.empty((num_recv,), dtype=torch.int32, device=x.device)
+        dist.all_to_all_single(recv_src, send_src_t, recv_counts_l, send_counts_l, group=self.group)
+
+        local_begin = self.rank_idx * num_experts_per_rank
+        local_end = local_begin + num_experts_per_rank
+        mask = (recv_idx >= local_begin) & (recv_idx < local_end)
+        recv_idx = recv_idx - local_begin
+        recv_idx.masked_fill_(~mask, -1)
+        if topk_weights is None:
+            recv_w = None
+        return recv_x, recv_sf, recv_idx, recv_w, recv_src, recv_counts_l
+
+    def _build_v2_dispatch_metadata(
+        self,
+        recv_topk_idx: torch.Tensor,
+        recv_src_global: torch.Tensor,
+        topk_idx: torch.Tensor,
+        recv_counts: list,
+        num_experts: int,
+        num_max_tokens_per_rank: int,
+        expert_alignment: int,
+        do_expand: bool,
+    ):
+        num_recv, num_topk = recv_topk_idx.shape
+        num_local_experts = num_experts // self.num_ranks
+        device = recv_topk_idx.device
+        psum_scaleup_values = []
+        running = 0
+        for lane in range(self.num_scaleup_ranks):
+            running += sum(recv_counts[lane::self.num_scaleup_ranks])
+            psum_scaleup_values.append(running)
+        psum_scaleup = torch.tensor(psum_scaleup_values, dtype=torch.int32, device=device)
+
+        expert_counts_raw = [(recv_topk_idx == i).sum().item() for i in range(num_local_experts)]
+        expert_counts = [_align(c, expert_alignment) for c in expert_counts_raw]
+        psum_values, running = [], 0
+        expanded_offsets = []
+        for raw, aligned in zip(expert_counts_raw, expert_counts):
+            expanded_offsets.append(_align(running, expert_alignment))
+            running = (_align(running, expert_alignment) + raw) if do_expand else (running + aligned)
+            psum_values.append(running)
+        psum_expert = torch.tensor(psum_values, dtype=torch.int32, device=device)
+
+        metadata = torch.full((num_recv, 2 + num_topk), -1, dtype=torch.int32, device=device)
+        metadata[:, 0] = recv_src_global.to(torch.int32)
+        metadata[:, 1] = 0
+        next_expanded = torch.tensor(expanded_offsets, dtype=torch.int32, device=device)
+        for i in range(num_recv):
+            for slot in range(num_topk):
+                expert = int(recv_topk_idx[i, slot].item())
+                if expert < 0:
+                    continue
+                metadata[i, 1] = i * num_topk + slot
+                if do_expand:
+                    dst = int(next_expanded[expert].item())
+                    metadata[i, 2 + slot] = dst
+                    next_expanded[expert] += 1
+
+        dst_slot = torch.full(topk_idx.shape, -1, dtype=torch.int32, device=device)
+        src_rank = (recv_src_global // num_max_tokens_per_rank).to(torch.long)
+        src_token = (recv_src_global % num_max_tokens_per_rank).to(torch.long)
+        for i in range(num_recv):
+            rank = int(src_rank[i].item())
+            if rank != self.rank_idx:
+                continue
+            token = int(src_token[i].item())
+            for slot in range(num_topk):
+                if recv_topk_idx[i, slot] >= 0:
+                    dst_slot[token, slot] = self.rank_idx * num_max_tokens_per_rank + i
+        return metadata, dst_slot, psum_scaleup, psum_expert, expert_counts
+
+    def _semantic_combine_data(
+        self,
+        x: torch.Tensor,
+        handle: EPHandle,
+        bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], None],
+    ) -> torch.Tensor:
+        hidden = x.shape[1]
+        out = torch.zeros((handle.topk_idx.shape[0], hidden), dtype=x.dtype, device=x.device)
+        src = handle.recv_src_metadata[:, 0].long()
+        if handle.do_expand:
+            for slot in range(handle.topk_idx.shape[1]):
+                expanded_idx = handle.recv_src_metadata[:, 2 + slot].long()
+                mask = expanded_idx >= 0
+                if mask.any():
+                    token = (src[mask] % handle.num_max_tokens_per_rank).long()
+                    out[token] += x[expanded_idx[mask]].float().to(out.dtype)
+        else:
+            token = (src % handle.num_max_tokens_per_rank).long()
+            out.index_add_(0, token, x[:src.numel()])
+        if isinstance(bias, tuple):
+            out += bias[0] + bias[1]
+        elif bias is not None:
+            out += bias
+        return out
+
+    def _semantic_combine_weights(self, topk_weights: torch.Tensor, handle: EPHandle) -> torch.Tensor:
+        out = torch.zeros(handle.topk_idx.shape, dtype=topk_weights.dtype, device=topk_weights.device)
+        src = handle.recv_src_metadata[:, 0].long()
+        token = (src % handle.num_max_tokens_per_rank).long()
+        out[token] = topk_weights[:src.numel()]
+        return out
 
 
 def _align_2mb(x: int) -> int:
     return ((int(x) + (1 << 21) - 1) // (1 << 21)) << 21
+
+
+def _align(x: int, alignment: int) -> int:
+    return ((int(x) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
+
+def _next_power_of_two(x: int) -> int:
+    value = 1
+    while value < int(x):
+        value <<= 1
+    return value
 
 
 def _require_cuda_contiguous(tensor: torch.Tensor, name: str) -> None:

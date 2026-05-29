@@ -8,6 +8,7 @@
 #include <nanobind/stl/string.h>
 
 #include "ep_util.hpp"
+#include "v2_efa/efa_adapter.hpp"
 #include "v2_efa/runtime.hpp"
 #include "v2_efa/transfer_cmd.hpp"
 #include "v2_efa/transfer_cmd_plan.hpp"
@@ -216,6 +217,20 @@ nb::dict transfer_cmd_to_dict(const v2::V2TransferCmd& cmd) {
   return out;
 }
 
+nb::dict efa_post_op_to_dict(const v2::EfaPostOp& op) {
+  nb::dict out;
+  out["kind"] = static_cast<uint32_t>(op.kind);
+  out["target_rank"] = op.target_rank;
+  out["target_lane"] = op.target_lane;
+  out["bytes"] = op.bytes;
+  out["signal_value"] = op.signal_value;
+  out["local_offset"] = op.local_offset;
+  out["remote_offset"] = op.remote_offset;
+  out["descriptor_index"] = op.descriptor_index;
+  out["batch_index"] = op.batch_index;
+  return out;
+}
+
 nb::dict jit_launch_plan_to_dict(const v2::V2EfaJitLaunchPlan& plan) {
   nb::dict out;
   out["name"] = plan.name;
@@ -335,6 +350,23 @@ class MappedD2HQueueHandle {
     return out;
   }
 
+  std::vector<v2::EfaPostOp> drain_ready_to_efa_posts(bool coalesce,
+                                                      bool ack_after_drain) {
+    v2::RecordingEfaPostSink recorder;
+    const auto commands = poll_ready();
+    if (coalesce) {
+      v2::CoalescingEfaPostSink sink(&recorder);
+      v2::drain_v2_transfer_cmds_to_efa_posts(commands, sink);
+      sink.flush();
+    } else {
+      v2::drain_v2_transfer_cmds_to_efa_posts(commands, recorder);
+    }
+    if (ack_after_drain) {
+      ack_ready();
+    }
+    return recorder.ops;
+  }
+
   void ack_ready() {
     const auto h = head();
     auto t = tail();
@@ -406,6 +438,27 @@ NB_MODULE(ep, m) {
           out.append(transfer_cmd_to_dict(cmd));
         }
         return out;
+      })
+      .def("drain_ready_to_efa_posts",
+           [](MappedD2HQueueHandle& queue, bool coalesce,
+              bool ack_after_drain) {
+             nb::list out;
+             for (const auto& op :
+                  queue.drain_ready_to_efa_posts(coalesce, ack_after_drain)) {
+               out.append(efa_post_op_to_dict(op));
+             }
+             return out;
+           },
+           nb::arg("coalesce") = true,
+           nb::arg("ack_after_drain") = true)
+      .def("drain_ready",
+           [](MappedD2HQueueHandle& queue) {
+             nb::list out;
+             for (const auto& op :
+                  queue.drain_ready_to_efa_posts(true, true)) {
+               out.append(efa_post_op_to_dict(op));
+             }
+             return out;
       });
 
   nb::class_<v2::RuntimeConfig>(m, "V2EfaRuntimeConfig")

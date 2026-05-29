@@ -1386,3 +1386,45 @@ README 风格 EP8x2 性能：
   - combine counters: `[4, 4, 0]`
   - mapped D2H queue: `head=8, tail=0`
   - CPU 读到 8 条 combine command。
+
+## 2026-05-29 Python ElasticBuffer native V2 接入推进
+
+- 在 `uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py` 里开始接入真实
+  `ElasticBuffer.dispatch/combine` surface：
+  - 新增 `V2TransportHandle`，把 dispatch descriptor、batch、counter、mapped
+    D2H queue、transfer layout 和 payload/scale 字节数挂到 V2 handle 上。
+  - `dispatch()` 现在会按真实 V2 参数重新配置 runtime，分配 V2 descriptor
+    workspace，发射 fused `dispatch_descriptor_enqueue_d2h` JIT kernel，并生成
+    `EPHandle` 需要的 V2 metadata：
+    `psum_num_recv_tokens_per_scaleup_rank`、`psum_num_recv_tokens_per_expert`、
+    `recv_src_metadata`、`dst_buffer_slot_idx`。
+  - `combine()` 现在会读取 dispatch handle 里的 transport metadata，发射 fused
+    `combine_descriptor_enqueue_d2h` JIT kernel，把 reduced-combine 方向的
+    `V2TransferCmd` 写入 mapped D2H queue。
+  - Python surface 暂时仍用语义正确的数据交换/归约路径产出 tensors，目的是让
+    handle/metadata/API shape 能先贴近 DeepEP V2 测试脚本；真正的 payload 数据面
+    还需要下一步把 D2H drain 接到 retained EFA verbs proxy。
+- 在 `src/uccl_ep.cc` 给 `V2MappedD2HQueue` 增加 host drain API：
+  - `drain_ready_to_efa_posts(coalesce=True, ack_after_drain=True)` 会把 mapped queue
+    中 ready 的 16B `V2TransferCmd` 转成 transport-neutral `EfaPostOp`。
+  - `drain_ready()` 是默认 coalesce + ack 的简化入口。
+  - 这一步让 Python/CPU proxy 可以看到和真实 verbs sink 同形的 post stream：
+    payload write 与 signal write 已经由 `V2TransferCmd.kind` 区分，不再走旧
+    V1 `TransferCmd`。
+- 本地验证：
+  - `python -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+    通过。
+  - `python -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py
+    uccl-ep/deep_ep_v2_wrapper/deep_ep/utils/event.py
+    uccl-ep/deep_ep_v2_wrapper/deep_ep/__init__.py` 通过。
+  - `python uccl-ep/tests/v2_efa_source_hygiene_test.py` 通过。
+  - `c++ -std=c++17 -Iuccl-ep/include
+    uccl-ep/tests/v2_efa_dispatch_plan_test.cc
+    uccl-ep/src/v2_efa_runtime.cc -o /tmp/v2_efa_dispatch_plan_test &&
+    /tmp/v2_efa_dispatch_plan_test` 通过。
+  - `git diff --check -- uccl-ep` 通过。
+- 服务器验证状态：
+  - 尝试按纪律先查 `p5en_0` / `p5en_1` GPU 占用，但 SSH 被本机
+    `known_hosts` host key mismatch 拦截。
+  - 未绕过 strict host key checking，未在服务器执行构建、测试、profiling 或
+    benchmark。
