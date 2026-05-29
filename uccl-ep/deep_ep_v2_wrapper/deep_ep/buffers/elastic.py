@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+from uccl import ep
 
 from ..utils.event import EventOverlap
 
@@ -43,7 +44,12 @@ class EPHandle:
 
 
 class ElasticBuffer:
-    """Fail-fast surface for the upcoming native V2 AWS EFA backend."""
+    """Native V2 AWS EFA buffer surface.
+
+    Construction is intentionally lightweight so tests can inspect topology,
+    descriptor sizes, and workspace plans while dispatch/combine are being
+    ported to JIT kernels.
+    """
 
     def __init__(
         self,
@@ -64,7 +70,53 @@ class ElasticBuffer:
         num_gpu_timeout_secs: int = 100,
         explicitly_destroy: bool = False,
     ) -> None:
-        raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)
+        self.group = group
+        self.rank_idx = group.rank()
+        self.num_ranks = group.size()
+        self.num_max_tokens_per_rank = int(num_max_tokens_per_rank)
+        self.hidden = int(hidden)
+        self.num_topk = int(num_topk)
+        self.explicitly_destroy = explicitly_destroy
+        self._destroyed = False
+
+        local_world = int(torch.cuda.device_count() or 1)
+        self.num_scaleup_ranks = min(max(1, local_world), self.num_ranks)
+        self.num_scaleout_ranks = max(1, self.num_ranks // self.num_scaleup_ranks)
+        self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
+        self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
+
+        config = ep.V2EfaRuntimeConfig()
+        config.rank = self.rank_idx
+        config.world_size = self.num_ranks
+        config.scaleout_rank = self.scaleout_rank_idx
+        config.scaleup_rank = self.scaleup_rank_idx
+        config.num_scaleout_ranks = self.num_scaleout_ranks
+        config.num_scaleup_ranks = self.num_scaleup_ranks
+        config.num_experts = 1
+        config.num_topk = max(1, self.num_topk)
+        config.hidden = self.hidden
+        config.elem_bytes = 1 if use_fp8_dispatch else 2
+        config.num_sms = 0
+        self.runtime = ep.V2EfaRuntime(config)
+        self.num_bytes = num_bytes or self.get_buffer_size_hint(
+            group,
+            num_max_tokens_per_rank,
+            hidden,
+            num_topk,
+            use_fp8_dispatch,
+            allow_hybrid_mode,
+            allow_multiple_reduction,
+        )
+
+    def destroy(self) -> None:
+        self._destroyed = True
+
+    def barrier(self, use_comm_stream: bool = True, with_cpu_sync: bool = False) -> None:
+        if with_cpu_sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dist.barrier(self.group)
+        if with_cpu_sync and torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     @staticmethod
     def get_buffer_size_hint(
@@ -86,6 +138,22 @@ class ElasticBuffer:
     @staticmethod
     def capture() -> EventOverlap:
         return EventOverlap()
+
+    def get_native_v2_status(self) -> str:
+        return self.runtime.status()
+
+    def get_native_v2_workspace_plan(self, num_max_tokens_per_rank: Optional[int] = None):
+        tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        return self.runtime.workspace_plan(tokens)
+
+    def get_comm_stream(self) -> torch.Stream:
+        raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)
+
+    def dispatch(self, *args, **kwargs):
+        raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)
+
+    def combine(self, *args, **kwargs):
+        raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)
 
 
 def _align_2mb(x: int) -> int:

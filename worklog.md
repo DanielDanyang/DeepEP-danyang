@@ -20,6 +20,17 @@
     fail-fast `V2EfaRuntime`。
   - `setup.py` 改成显式编译 `src/uccl_ep.cc`，不再 glob 编译旧 `.cu`。
   - `ProxyTransport` 替换成 fail-fast placeholder，避免继续误跑 V1 transport。
+- Phase 1 已开始：
+  - 新增 `include/v2_efa/descriptor.hpp`，定义 dispatch/combine segment 与
+    per-expert batch descriptor。
+  - 新增 `include/v2_efa/workspace.hpp`，按 descriptor buffer/counter 计算 native V2
+    workspace layout。
+  - 新增 `include/v2_efa/runtime.hpp` 与 `src/v2_efa_runtime.cc`，提供
+    `V2EfaRuntime` 配置、worst-case descriptor stats 和 workspace plan。
+  - 新增 `include/v2_efa/proxy_queue.cuh`、`dispatch_jit.cuh`、`combine_jit.cuh`
+    作为后续 JIT kernel 接入点；目前只放 scaffold，不再引入 V1 static kernel。
+  - Python `ElasticBuffer` 现在可以构造 runtime 并查询 status/workspace plan，但
+    dispatch/combine 仍明确 fail-fast。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

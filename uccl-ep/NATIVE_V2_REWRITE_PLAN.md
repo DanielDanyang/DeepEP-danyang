@@ -314,6 +314,12 @@ device enqueue EFA proxy descriptors
 - 暴露 `init`, `alloc_workspace`, `launch_dispatch`, `launch_combine`。
 - 先只支持 AWS EFA，多机 EP8x2，不做 IB/NVSHMEM 兼容。
 
+当前进度：
+
+- 已新增 `V2EfaRuntime` skeleton。
+- 已暴露 runtime config、descriptor stats、workspace plan。
+- dispatch/combine 仍明确返回未实现错误。
+
 交付标准：Python 可以 import，runtime 可以初始化 EFA proxy 资源，但 dispatch/combine
 明确返回未实现错误。
 

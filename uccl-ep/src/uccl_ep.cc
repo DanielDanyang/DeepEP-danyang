@@ -2,8 +2,13 @@
 #include <string>
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/string.h>
+
+#include "v2_efa/proxy_queue.cuh"
+#include "v2_efa/runtime.hpp"
 
 namespace nb = nanobind;
+namespace v2 = uccl::v2_efa;
 
 namespace {
 
@@ -35,19 +40,35 @@ struct EventHandle {
   void current_stream_wait() const {}
 };
 
-class V2EfaRuntime {
- public:
-  V2EfaRuntime() = default;
+nb::dict region_to_dict(const v2::WorkspaceRegion& region) {
+  nb::dict out;
+  out["offset"] = region.offset;
+  out["bytes"] = region.bytes;
+  return out;
+}
 
-  bool is_ready() const { return false; }
+nb::dict workspace_to_dict(const v2::WorkspacePlan& plan) {
+  nb::dict out;
+  out["dispatch_segments"] = region_to_dict(plan.dispatch_segments);
+  out["dispatch_batches"] = region_to_dict(plan.dispatch_batches);
+  out["combine_segments"] = region_to_dict(plan.combine_segments);
+  out["combine_batches"] = region_to_dict(plan.combine_batches);
+  out["dispatch_counters"] = region_to_dict(plan.dispatch_counters);
+  out["combine_counters"] = region_to_dict(plan.combine_counters);
+  out["total_bytes"] = plan.total_bytes;
+  return out;
+}
 
-  void init() const { fail(); }
-  void launch_dispatch() const { fail(); }
-  void launch_combine() const { fail(); }
-
- private:
-  static void fail() { throw std::runtime_error(kRewriteMessage); }
-};
+nb::dict stats_to_dict(const v2::DescriptorPlanStats& stats) {
+  nb::dict out;
+  out["num_dispatch_segments"] = stats.num_dispatch_segments;
+  out["num_dispatch_batches"] = stats.num_dispatch_batches;
+  out["num_combine_segments"] = stats.num_combine_segments;
+  out["num_combine_batches"] = stats.num_combine_batches;
+  out["max_tokens_per_segment"] = stats.max_tokens_per_segment;
+  out["max_payload_bytes_per_segment"] = stats.max_payload_bytes_per_segment;
+  return out;
+}
 
 }  // namespace
 
@@ -76,12 +97,47 @@ NB_MODULE(ep, m) {
       .def(nb::init<>())
       .def("current_stream_wait", &EventHandle::current_stream_wait);
 
-  nb::class_<V2EfaRuntime>(m, "V2EfaRuntime")
+  nb::class_<v2::RuntimeConfig>(m, "V2EfaRuntimeConfig")
       .def(nb::init<>())
-      .def("is_ready", &V2EfaRuntime::is_ready)
-      .def("init", &V2EfaRuntime::init)
-      .def("launch_dispatch", &V2EfaRuntime::launch_dispatch)
-      .def("launch_combine", &V2EfaRuntime::launch_combine);
+      .def_rw("rank", &v2::RuntimeConfig::rank)
+      .def_rw("world_size", &v2::RuntimeConfig::world_size)
+      .def_rw("scaleout_rank", &v2::RuntimeConfig::scaleout_rank)
+      .def_rw("scaleup_rank", &v2::RuntimeConfig::scaleup_rank)
+      .def_rw("num_scaleout_ranks", &v2::RuntimeConfig::num_scaleout_ranks)
+      .def_rw("num_scaleup_ranks", &v2::RuntimeConfig::num_scaleup_ranks)
+      .def_rw("num_experts", &v2::RuntimeConfig::num_experts)
+      .def_rw("num_topk", &v2::RuntimeConfig::num_topk)
+      .def_rw("hidden", &v2::RuntimeConfig::hidden)
+      .def_rw("elem_bytes", &v2::RuntimeConfig::elem_bytes)
+      .def_rw("num_sms", &v2::RuntimeConfig::num_sms);
+
+  nb::class_<v2::V2EfaRuntime>(m, "V2EfaRuntime")
+      .def(nb::init<v2::RuntimeConfig>())
+      .def("is_ready", &v2::V2EfaRuntime::is_ready)
+      .def("status", &v2::V2EfaRuntime::status)
+      .def("workspace_plan",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank) {
+             return workspace_to_dict(
+                 self.workspace_plan(num_max_tokens_per_rank));
+           })
+      .def("worst_case_stats",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank) {
+             return stats_to_dict(
+                 self.worst_case_stats(num_max_tokens_per_rank));
+           })
+      .def("launch_dispatch", &v2::V2EfaRuntime::launch_dispatch)
+      .def("launch_combine", &v2::V2EfaRuntime::launch_combine);
+
+  m.def("v2_descriptor_sizes", []() {
+    nb::dict out;
+    out["version"] = v2::kDescriptorVersion;
+    out["dispatch_segment"] = sizeof(v2::DispatchSegmentDescriptor);
+    out["dispatch_batch"] = sizeof(v2::DispatchExpertBatch);
+    out["combine_segment"] = sizeof(v2::CombineSegmentDescriptor);
+    out["combine_batch"] = sizeof(v2::CombineExpertBatch);
+    out["proxy_command"] = sizeof(v2::ProxyCommand);
+    return out;
+  });
 
   m.def("is_native_v2_ready", []() { return false; });
   m.def("native_v2_rewrite_message", []() { return std::string(kRewriteMessage); });
