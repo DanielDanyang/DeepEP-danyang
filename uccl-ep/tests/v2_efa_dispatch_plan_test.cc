@@ -170,6 +170,20 @@ int main() {
   assert(dispatch_enqueue_jit_plan.source.find(
              "v2_efa_dispatch_enqueue_d2h_kernel<0>") !=
          std::string::npos);
+  const auto dispatch_fused_jit_plan =
+      runtime.build_dispatch_descriptor_enqueue_d2h_jit_plan(
+          /*num_max_tokens_per_rank=*/4, /*num_channels_per_sm=*/2,
+          /*scale_bytes=*/0, /*has_topk_weight=*/true,
+          /*cached_mode=*/false, /*deterministic=*/false,
+          /*do_cpu_sync=*/false, /*smem_bytes=*/228 * 1024,
+          /*uccl_include_path=*/"/tmp/uccl-ep/include");
+  assert(dispatch_fused_jit_plan.name ==
+         "v2_efa_dispatch_descriptor_enqueue_d2h");
+  assert(dispatch_fused_jit_plan.grid_dim_x == 1);
+  assert(dispatch_fused_jit_plan.num_threads == 32);
+  assert(dispatch_fused_jit_plan.source.find(
+             "v2_efa_dispatch_descriptor_enqueue_d2h_kernel<2, 2, 8, 2, 32>") !=
+         std::string::npos);
 
   const auto combine_enqueue_jit_plan =
       runtime.build_combine_enqueue_d2h_jit_plan("/tmp/uccl-ep/include");
@@ -182,6 +196,19 @@ int main() {
          std::string::npos);
   assert(combine_enqueue_jit_plan.source.find(
              "v2_efa_combine_enqueue_d2h_kernel<0>") !=
+         std::string::npos);
+  const auto combine_fused_jit_plan =
+      runtime.build_combine_descriptor_enqueue_d2h_jit_plan(
+          /*num_max_tokens_per_rank=*/4, /*num_channels=*/2,
+          /*payload_bytes=*/32, /*use_expanded_layout=*/true,
+          /*allow_multiple_reduction=*/true, /*smem_bytes=*/228 * 1024,
+          /*uccl_include_path=*/"/tmp/uccl-ep/include");
+  assert(combine_fused_jit_plan.name ==
+         "v2_efa_combine_descriptor_enqueue_d2h");
+  assert(combine_fused_jit_plan.grid_dim_x == 1);
+  assert(combine_fused_jit_plan.num_threads == 32);
+  assert(combine_fused_jit_plan.source.find(
+             "v2_efa_combine_descriptor_enqueue_d2h_kernel<2, 2, 8, 2, 16>") !=
          std::string::npos);
 
   const auto dispatch_layout = make_contiguous_dispatch_transfer_layout(

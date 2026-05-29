@@ -193,6 +193,69 @@ void launch_v2_efa_combine_enqueue_d2h_plan(
       num_batches, queue, layout));
 }
 
+void launch_v2_efa_dispatch_descriptor_enqueue_d2h_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t topk_idx_ptr,
+    std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+    std::uintptr_t counters_ptr, int num_tokens, int scaleout_rank,
+    int scaleup_rank, int scale_bytes, bool has_topk_weight, int max_segments,
+    int max_batches, std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+    std::uintptr_t tail_ptr, int queue_capacity, DispatchTransferLayout layout,
+    std::uintptr_t cuda_stream_ptr) {
+  if (num_tokens < 0 || max_segments <= 0 || max_batches <= 0) {
+    throw std::invalid_argument(
+        "invalid V2 EFA fused dispatch descriptor/enqueue launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  V2TransferD2HQueueView queue{
+      checked_ptr<V2TransferCmd>(commands_ptr, "commands"),
+      checked_ptr<uint64_t>(head_ptr, "head"),
+      checked_ptr<uint64_t>(tail_ptr, "tail"),
+      static_cast<uint32_t>(checked_queue_capacity(queue_capacity))};
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config, checked_ptr<const int64_t>(topk_idx_ptr, "topk_idx"),
+      checked_ptr<DispatchSegmentDescriptor>(segments_ptr, "segments"),
+      checked_ptr<DispatchExpertBatch>(batches_ptr, "batches"),
+      checked_ptr<uint32_t>(counters_ptr, "counters"), num_tokens,
+      scaleout_rank, scaleup_rank, scale_bytes, has_topk_weight, max_segments,
+      max_batches, queue, layout));
+}
+
+void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t dispatch_segments_ptr,
+    std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
+    std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+    std::uintptr_t counters_ptr, int dst_original_rank, int payload_bytes,
+    int max_segments, int max_batches, std::uintptr_t commands_ptr,
+    std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
+    CombineTransferLayout layout, std::uintptr_t cuda_stream_ptr) {
+  if (num_dispatch_batches < 0 || payload_bytes <= 0 || max_segments <= 0 ||
+      max_batches <= 0) {
+    throw std::invalid_argument(
+        "invalid V2 EFA fused combine descriptor/enqueue launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  V2TransferD2HQueueView queue{
+      checked_ptr<V2TransferCmd>(commands_ptr, "commands"),
+      checked_ptr<uint64_t>(head_ptr, "head"),
+      checked_ptr<uint64_t>(tail_ptr, "tail"),
+      static_cast<uint32_t>(checked_queue_capacity(queue_capacity))};
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config,
+      checked_ptr<const DispatchSegmentDescriptor>(dispatch_segments_ptr,
+                                                  "dispatch_segments"),
+      checked_ptr<const DispatchExpertBatch>(dispatch_batches_ptr,
+                                             "dispatch_batches"),
+      num_dispatch_batches,
+      checked_ptr<CombineSegmentDescriptor>(segments_ptr, "segments"),
+      checked_ptr<CombineExpertBatch>(batches_ptr, "batches"),
+      checked_ptr<uint32_t>(counters_ptr, "counters"), dst_original_rank,
+      payload_bytes, max_segments, max_batches, queue, layout));
+}
+
 void V2EfaRuntime::launch_dispatch_descriptors(
     std::uintptr_t topk_idx_ptr, std::uintptr_t segments_ptr,
     std::uintptr_t batches_ptr, std::uintptr_t counters_ptr, int num_tokens,
@@ -262,6 +325,60 @@ void V2EfaRuntime::launch_combine_enqueue_d2h(
   launch_v2_efa_combine_enqueue_d2h_plan(
       plan, segments_ptr, batches_ptr, num_batches, commands_ptr, head_ptr,
       tail_ptr, queue_capacity, layout, cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_dispatch_descriptor_enqueue_d2h(
+    std::uintptr_t topk_idx_ptr, std::uintptr_t segments_ptr,
+    std::uintptr_t batches_ptr, std::uintptr_t counters_ptr, int num_tokens,
+    int num_max_tokens_per_rank, int num_channels_per_sm, int scale_bytes,
+    bool has_topk_weight, bool cached_mode, bool deterministic,
+    bool do_cpu_sync, int smem_bytes, std::uintptr_t commands_ptr,
+    std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
+    DispatchTransferLayout layout, const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto& cfg = config();
+  const auto plan = build_dispatch_descriptor_enqueue_d2h_jit_plan(
+      num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
+      has_topk_weight, cached_mode, deterministic, do_cpu_sync, smem_bytes,
+      uccl_include_path);
+  launch_v2_efa_dispatch_descriptor_enqueue_d2h_plan(
+      plan, topk_idx_ptr, segments_ptr, batches_ptr, counters_ptr, num_tokens,
+      cfg.scaleout_rank, cfg.scaleup_rank, scale_bytes, has_topk_weight,
+      static_cast<int>(max_dispatch_segments(num_max_tokens_per_rank,
+                                             cfg.num_topk)),
+      static_cast<int>(max_expert_batches(cfg.num_experts,
+                                          cfg.num_scaleout_ranks,
+                                          cfg.num_scaleup_ranks)),
+      commands_ptr, head_ptr, tail_ptr, queue_capacity, layout,
+      cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_combine_descriptor_enqueue_d2h(
+    std::uintptr_t dispatch_segments_ptr,
+    std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
+    std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+    std::uintptr_t counters_ptr, int num_max_tokens_per_rank, int num_channels,
+    int payload_bytes, bool use_expanded_layout,
+    bool allow_multiple_reduction, int smem_bytes,
+    std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+    std::uintptr_t tail_ptr, int queue_capacity, CombineTransferLayout layout,
+    const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto& cfg = config();
+  const auto plan = build_combine_descriptor_enqueue_d2h_jit_plan(
+      num_max_tokens_per_rank, num_channels, payload_bytes,
+      use_expanded_layout, allow_multiple_reduction, smem_bytes,
+      uccl_include_path);
+  launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
+      plan, dispatch_segments_ptr, dispatch_batches_ptr, num_dispatch_batches,
+      segments_ptr, batches_ptr, counters_ptr, cfg.rank, payload_bytes,
+      static_cast<int>(max_dispatch_segments(num_max_tokens_per_rank,
+                                             cfg.num_topk)),
+      static_cast<int>(max_expert_batches(cfg.num_experts,
+                                          cfg.num_scaleout_ranks,
+                                          cfg.num_scaleup_ranks)),
+      commands_ptr, head_ptr, tail_ptr, queue_capacity, layout,
+      cuda_stream_ptr);
 }
 
 }  // namespace uccl::v2_efa

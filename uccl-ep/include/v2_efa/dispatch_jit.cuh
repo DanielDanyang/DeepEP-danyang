@@ -21,33 +21,20 @@ __device__ __forceinline__ uint32_t make_dispatch_flags(int scale_bytes,
   return flags;
 }
 
-#endif
-
-}  // namespace detail
-
 template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
           int kNumTopk, int kHiddenBytes>
-__global__ void v2_efa_dispatch_descriptor_kernel(
+__device__ __forceinline__ void build_dispatch_descriptors(
     const int64_t* topk_idx, DispatchSegmentDescriptor* segments,
     DispatchExpertBatch* batches, uint32_t* counters, int num_tokens,
-    int scaleout_rank, int scaleup_rank, int scale_bytes,
-    bool has_topk_weight, int max_segments, int max_batches) {
-  // Device-side reference generator. It intentionally mirrors the CPU
-  // reference planner before we parallelize descriptor construction inside the
-  // real DeepEP V2 JIT dispatch path.
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-  (void)scaleout_rank;
-  (void)scaleup_rank;
-
+    int scale_bytes, bool has_topk_weight, int max_segments,
+    int max_batches) {
   constexpr int kWorldSize = kNumScaleoutRanks * kNumScaleupRanks;
   static_assert(kWorldSize > 0, "invalid V2 EFA topology");
   static_assert(kNumExperts % kWorldSize == 0,
                 "num experts must be divisible by world size");
   constexpr int kExpertsPerRank = kNumExperts / kWorldSize;
 
-  const auto flags = detail::make_dispatch_flags(scale_bytes, has_topk_weight);
+  const auto flags = make_dispatch_flags(scale_bytes, has_topk_weight);
   int num_segments = 0;
   int num_batches = 0;
 
@@ -131,6 +118,65 @@ __global__ void v2_efa_dispatch_descriptor_kernel(
   counters[kDescriptorCounterSegments] = num_segments;
   counters[kDescriptorCounterBatches] = num_batches;
   counters[kDescriptorCounterOverflow] = 0;
+}
+
+__device__ __forceinline__ void enqueue_dispatch_d2h(
+    const DispatchSegmentDescriptor* segments,
+    const DispatchExpertBatch* batches, int num_batches,
+    V2TransferD2HQueueView queue, DispatchTransferLayout layout) {
+  detail::enqueue_dispatch_d2h(segments, batches, num_batches, queue, layout);
+}
+
+#endif
+
+}  // namespace detail
+
+template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
+          int kNumTopk, int kHiddenBytes>
+__global__ void v2_efa_dispatch_descriptor_kernel(
+    const int64_t* topk_idx, DispatchSegmentDescriptor* segments,
+    DispatchExpertBatch* batches, uint32_t* counters, int num_tokens,
+    int scaleout_rank, int scaleup_rank, int scale_bytes,
+    bool has_topk_weight, int max_segments, int max_batches) {
+  // Device-side reference generator. It intentionally mirrors the CPU
+  // reference planner before we parallelize descriptor construction inside the
+  // real DeepEP V2 JIT dispatch path.
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  (void)scaleout_rank;
+  (void)scaleup_rank;
+
+  detail::build_dispatch_descriptors<kNumScaleoutRanks, kNumScaleupRanks,
+                                     kNumExperts, kNumTopk, kHiddenBytes>(
+      topk_idx, segments, batches, counters, num_tokens, scale_bytes,
+      has_topk_weight, max_segments, max_batches);
+}
+
+template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
+          int kNumTopk, int kHiddenBytes>
+__global__ void v2_efa_dispatch_descriptor_enqueue_d2h_kernel(
+    const int64_t* topk_idx, DispatchSegmentDescriptor* segments,
+    DispatchExpertBatch* batches, uint32_t* counters, int num_tokens,
+    int scaleout_rank, int scaleup_rank, int scale_bytes,
+    bool has_topk_weight, int max_segments, int max_batches,
+    V2TransferD2HQueueView queue, DispatchTransferLayout layout) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  (void)scaleout_rank;
+  (void)scaleup_rank;
+
+  detail::build_dispatch_descriptors<kNumScaleoutRanks, kNumScaleupRanks,
+                                     kNumExperts, kNumTopk, kHiddenBytes>(
+      topk_idx, segments, batches, counters, num_tokens, scale_bytes,
+      has_topk_weight, max_segments, max_batches);
+  if (counters[kDescriptorCounterOverflow] != 0) {
+    return;
+  }
+  detail::enqueue_dispatch_d2h(
+      segments, batches, static_cast<int>(counters[kDescriptorCounterBatches]),
+      queue, layout);
 }
 
 template <int kInstance>

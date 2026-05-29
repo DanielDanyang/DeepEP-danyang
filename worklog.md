@@ -1343,3 +1343,12 @@ README 风格 EP8x2 性能：
     `poll_ready/ack_ready/reset/head/tail` 给 CPU proxy 或 smoke test 使用。
   - Python wrapper 新增 `allocate_d2h_queue`、`launch_dispatch_enqueue_d2h_queue`、
     `launch_combine_enqueue_d2h_queue`，避免最终路径依赖临时 CUDA tensor queue。
+- 继续补齐 device-side 流水：
+  - dispatch/combine descriptor 构建逻辑下沉成 device helper。
+  - 新增 fused JIT kernel：
+    `v2_efa_dispatch_descriptor_enqueue_d2h_kernel` 和
+    `v2_efa_combine_descriptor_enqueue_d2h_kernel`。
+  - fused kernel 在同一个 launch 内生成 native V2 descriptor，并在无 overflow 时直接
+    enqueue 16B `V2TransferCmd` 到 mapped D2H queue，避免 CPU 先读 counters 再启动
+    enqueue kernel。
+  - C++ / nanobind / Python wrapper 新增对应 compile 和 launch queue API。

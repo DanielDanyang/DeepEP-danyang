@@ -6,22 +6,18 @@
 
 namespace uccl::v2_efa {
 
+namespace detail {
+
+#if defined(__CUDA_ARCH__)
 template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
           int kNumTopk, int kHidden>
-__global__ void v2_efa_combine_descriptor_kernel(
+__device__ __forceinline__ void build_combine_descriptors(
     const DispatchSegmentDescriptor* dispatch_segments,
     const DispatchExpertBatch* dispatch_batches, int num_dispatch_batches,
     CombineSegmentDescriptor* segments, CombineExpertBatch* batches,
     uint32_t* counters, int dst_original_rank, int payload_bytes,
     int max_segments, int max_batches) {
-  // Device-side reference generator. The production V2 kernel will derive
-  // equivalent descriptors from token_metadata_at_forward/channel_linked_list;
-  // this form is useful for roundtrip validation against dispatch descriptors.
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
   (void)kNumScaleoutRanks;
-  (void)kNumScaleupRanks;
   (void)kNumExperts;
   (void)kNumTopk;
   (void)kHidden;
@@ -87,6 +83,70 @@ __global__ void v2_efa_combine_descriptor_kernel(
   counters[kDescriptorCounterSegments] = num_segments;
   counters[kDescriptorCounterBatches] = num_batches;
   counters[kDescriptorCounterOverflow] = 0;
+}
+
+__device__ __forceinline__ void enqueue_combine_d2h(
+    const CombineSegmentDescriptor* segments, const CombineExpertBatch* batches,
+    int num_batches, V2TransferD2HQueueView queue,
+    CombineTransferLayout layout) {
+  detail::enqueue_combine_d2h(segments, batches, num_batches, queue, layout);
+}
+
+#endif
+
+}  // namespace detail
+
+template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
+          int kNumTopk, int kHidden>
+__global__ void v2_efa_combine_descriptor_kernel(
+    const DispatchSegmentDescriptor* dispatch_segments,
+    const DispatchExpertBatch* dispatch_batches, int num_dispatch_batches,
+    CombineSegmentDescriptor* segments, CombineExpertBatch* batches,
+    uint32_t* counters, int dst_original_rank, int payload_bytes,
+    int max_segments, int max_batches) {
+  // Device-side reference generator. The production V2 kernel will derive
+  // equivalent descriptors from token_metadata_at_forward/channel_linked_list;
+  // this form is useful for roundtrip validation against dispatch descriptors.
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  (void)kNumScaleoutRanks;
+  (void)kNumScaleupRanks;
+  (void)kNumExperts;
+  (void)kNumTopk;
+  (void)kHidden;
+
+  detail::build_combine_descriptors<kNumScaleoutRanks, kNumScaleupRanks,
+                                    kNumExperts, kNumTopk, kHidden>(
+      dispatch_segments, dispatch_batches, num_dispatch_batches, segments,
+      batches, counters, dst_original_rank, payload_bytes, max_segments,
+      max_batches);
+}
+
+template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
+          int kNumTopk, int kHidden>
+__global__ void v2_efa_combine_descriptor_enqueue_d2h_kernel(
+    const DispatchSegmentDescriptor* dispatch_segments,
+    const DispatchExpertBatch* dispatch_batches, int num_dispatch_batches,
+    CombineSegmentDescriptor* segments, CombineExpertBatch* batches,
+    uint32_t* counters, int dst_original_rank, int payload_bytes,
+    int max_segments, int max_batches, V2TransferD2HQueueView queue,
+    CombineTransferLayout layout) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+
+  detail::build_combine_descriptors<kNumScaleoutRanks, kNumScaleupRanks,
+                                    kNumExperts, kNumTopk, kHidden>(
+      dispatch_segments, dispatch_batches, num_dispatch_batches, segments,
+      batches, counters, dst_original_rank, payload_bytes, max_segments,
+      max_batches);
+  if (counters[kDescriptorCounterOverflow] != 0) {
+    return;
+  }
+  detail::enqueue_combine_d2h(
+      segments, batches, static_cast<int>(counters[kDescriptorCounterBatches]),
+      queue, layout);
 }
 
 template <int kInstance>

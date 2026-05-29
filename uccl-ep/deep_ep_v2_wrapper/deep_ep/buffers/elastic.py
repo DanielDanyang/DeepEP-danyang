@@ -409,6 +409,33 @@ class ElasticBuffer:
             uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
         return self.runtime.compile_dispatch_enqueue_d2h_jit(str(uccl_include_path))
 
+    def compile_dispatch_descriptor_enqueue_d2h_jit(
+        self,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels_per_sm: int = 1,
+        scale_bytes: int = 0,
+        has_topk_weight: bool = True,
+        cached_mode: bool = False,
+        deterministic: bool = False,
+        do_cpu_sync: bool = False,
+        smem_bytes: int = 228 * 1024,
+        uccl_include_path: str = "",
+    ):
+        tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        return self.runtime.compile_dispatch_descriptor_enqueue_d2h_jit(
+            tokens,
+            int(num_channels_per_sm),
+            int(scale_bytes),
+            bool(has_topk_weight),
+            bool(cached_mode),
+            bool(deterministic),
+            bool(do_cpu_sync),
+            int(smem_bytes),
+            str(uccl_include_path),
+        )
+
     def build_combine_enqueue_d2h_jit_plan(self, uccl_include_path: str = ""):
         return self.runtime.build_combine_enqueue_d2h_jit_plan(str(uccl_include_path))
 
@@ -416,6 +443,29 @@ class ElasticBuffer:
         if not uccl_include_path:
             uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
         return self.runtime.compile_combine_enqueue_d2h_jit(str(uccl_include_path))
+
+    def compile_combine_descriptor_enqueue_d2h_jit(
+        self,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels: int = 1,
+        payload_bytes: int = 0,
+        use_expanded_layout: bool = True,
+        allow_multiple_reduction: bool = True,
+        smem_bytes: int = 228 * 1024,
+        uccl_include_path: str = "",
+    ):
+        tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        return self.runtime.compile_combine_descriptor_enqueue_d2h_jit(
+            tokens,
+            int(num_channels),
+            int(payload_bytes),
+            bool(use_expanded_layout),
+            bool(allow_multiple_reduction),
+            int(smem_bytes),
+            str(uccl_include_path),
+        )
 
     @staticmethod
     def allocate_d2h_queue(capacity: int = 2048):
@@ -544,6 +594,63 @@ class ElasticBuffer:
             _cuda_stream_ptr(stream),
         )
 
+    def launch_dispatch_descriptor_enqueue_d2h_queue(
+        self,
+        topk_idx: torch.Tensor,
+        segments: torch.Tensor,
+        batches: torch.Tensor,
+        counters: torch.Tensor,
+        queue,
+        layout: dict,
+        num_tokens: Optional[int] = None,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels_per_sm: int = 1,
+        scale_bytes: int = 0,
+        has_topk_weight: bool = True,
+        cached_mode: bool = False,
+        deterministic: bool = False,
+        do_cpu_sync: bool = False,
+        smem_bytes: int = 228 * 1024,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        _require_cuda_contiguous(topk_idx, "topk_idx")
+        _require_cuda_contiguous(segments, "segments")
+        _require_cuda_contiguous(batches, "batches")
+        _require_cuda_contiguous(counters, "counters")
+        tokens = int(topk_idx.shape[0] if num_tokens is None else num_tokens)
+        max_tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_dispatch_descriptor_enqueue_d2h(
+            int(topk_idx.data_ptr()),
+            int(segments.data_ptr()),
+            int(batches.data_ptr()),
+            int(counters.data_ptr()),
+            tokens,
+            max_tokens,
+            int(num_channels_per_sm),
+            int(scale_bytes),
+            bool(has_topk_weight),
+            bool(cached_mode),
+            bool(deterministic),
+            bool(do_cpu_sync),
+            int(smem_bytes),
+            int(queue.commands_ptr()),
+            int(queue.head_ptr()),
+            int(queue.tail_ptr()),
+            int(queue.capacity()),
+            int(layout.get("local_payload_base", 0)),
+            int(layout.get("remote_payload_base", 0)),
+            int(layout.get("remote_signal_base", 0)),
+            int(layout["src_token_stride"]),
+            int(layout["expanded_slot_stride"]),
+            int(layout["batch_payload_stride"]),
+            int(layout.get("signal_stride", 4)),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
     def launch_combine_enqueue_d2h(
         self,
         segments: torch.Tensor,
@@ -603,6 +710,63 @@ class ElasticBuffer:
             int(segments.data_ptr()),
             int(batches.data_ptr()),
             int(num_batches),
+            int(queue.commands_ptr()),
+            int(queue.head_ptr()),
+            int(queue.tail_ptr()),
+            int(queue.capacity()),
+            int(layout.get("local_payload_base", 0)),
+            int(layout.get("remote_payload_base", 0)),
+            int(layout.get("remote_signal_base", 0)),
+            int(layout["expanded_slot_stride"]),
+            int(layout["reduced_token_stride"]),
+            int(layout["batch_payload_stride"]),
+            int(layout.get("signal_stride", 4)),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
+    def launch_combine_descriptor_enqueue_d2h_queue(
+        self,
+        dispatch_segments: torch.Tensor,
+        dispatch_batches: torch.Tensor,
+        num_dispatch_batches: int,
+        segments: torch.Tensor,
+        batches: torch.Tensor,
+        counters: torch.Tensor,
+        queue,
+        layout: dict,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels: int = 1,
+        payload_bytes: int = 0,
+        use_expanded_layout: bool = True,
+        allow_multiple_reduction: bool = True,
+        smem_bytes: int = 228 * 1024,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        _require_cuda_contiguous(dispatch_segments, "dispatch_segments")
+        _require_cuda_contiguous(dispatch_batches, "dispatch_batches")
+        _require_cuda_contiguous(segments, "segments")
+        _require_cuda_contiguous(batches, "batches")
+        _require_cuda_contiguous(counters, "counters")
+        max_tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if payload_bytes == 0:
+            payload_bytes = self.hidden * 2
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_combine_descriptor_enqueue_d2h(
+            int(dispatch_segments.data_ptr()),
+            int(dispatch_batches.data_ptr()),
+            int(num_dispatch_batches),
+            int(segments.data_ptr()),
+            int(batches.data_ptr()),
+            int(counters.data_ptr()),
+            max_tokens,
+            int(num_channels),
+            int(payload_bytes),
+            bool(use_expanded_layout),
+            bool(allow_multiple_reduction),
+            int(smem_bytes),
             int(queue.commands_ptr()),
             int(queue.head_ptr()),
             int(queue.tail_ptr()),
