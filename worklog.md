@@ -89,6 +89,11 @@
     `python -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py uccl-ep/deep_ep_v2_wrapper/deep_ep/proxy_transport.py uccl-ep/deep_ep_v2_wrapper/deep_ep/__init__.py`。
   - 本地 command/helper/host queue 测试通过：
     `c++ -std=c++17 -Iuccl-ep/include uccl-ep/tests/v2_efa_dispatch_plan_test.cc uccl-ep/src/v2_efa_runtime.cc -o /tmp/v2_efa_dispatch_plan_test && /tmp/v2_efa_dispatch_plan_test`。
+  - 新增 `include/v2_efa/transfer_layout.hpp`，根据 V2 descriptor 的
+    expanded/reduced slot span 自动生成 contiguous dispatch/combine transfer layout。
+  - 修正 combine layout 语义：`reduced_token_slot` 是原始 token/reduced layout slot，
+    不能按 batch-local `total_tokens` 推导 stride；现在使用
+    `max(reduced_token_slot + count)` 防止 batch payload 覆盖 signal 区域。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

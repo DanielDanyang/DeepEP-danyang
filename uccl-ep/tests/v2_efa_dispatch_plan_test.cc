@@ -3,6 +3,7 @@
 #include "v2_efa/runtime.hpp"
 #include "v2_efa/transfer_cmd.hpp"
 #include "v2_efa/transfer_cmd_plan.hpp"
+#include "v2_efa/transfer_layout.hpp"
 #include "v2_efa/transfer_loopback.hpp"
 #include "v2_efa/transfer_queue_host.hpp"
 
@@ -89,13 +90,11 @@ int main() {
   assert(workspace.combine_counters.bytes ==
          sizeof(uint32_t) * kDescriptorCounterWords);
 
-  DispatchTransferLayout dispatch_layout;
-  dispatch_layout.local_payload_base = 1000;
-  dispatch_layout.remote_payload_base = 2000;
-  dispatch_layout.remote_signal_base = 3000;
-  dispatch_layout.src_token_stride = 32;
-  dispatch_layout.expanded_slot_stride = 32;
-  dispatch_layout.batch_payload_stride = 256;
+  const auto dispatch_layout = make_contiguous_dispatch_transfer_layout(
+      plan, /*src_token_stride=*/32, /*expanded_slot_stride=*/32,
+      /*local_payload_base=*/1000, /*remote_payload_base=*/2000);
+  assert(dispatch_layout.batch_payload_stride == 64);
+  assert(dispatch_layout.remote_signal_base == 2256);
   const auto dispatch_commands =
       build_dispatch_transfer_cmd_plan(plan, dispatch_layout);
   assert(dispatch_commands.commands.size() == plan.segments.size() +
@@ -108,7 +107,7 @@ int main() {
   assert(dispatch_commands.commands[0].target_rank == 0);
   assert(dispatch_commands.commands[1].kind ==
          static_cast<uint8_t>(V2TransferCmdKind::kDispatchSignal));
-  assert(dispatch_commands.commands[1].remote_offset == 3000);
+  assert(dispatch_commands.commands[1].remote_offset == 2256);
   assert(dispatch_commands.commands[1].signal_value == 2);
   const auto v2_dispatch_cmd =
       make_v2_dispatch_payload_cmd(plan.segments[0], 0, 0, dispatch_layout);
@@ -128,13 +127,11 @@ int main() {
   assert(v2_dispatch_cmd.remote_offset ==
          dispatch_commands.commands[0].remote_offset);
 
-  CombineTransferLayout combine_layout;
-  combine_layout.local_payload_base = 4000;
-  combine_layout.remote_payload_base = 5000;
-  combine_layout.remote_signal_base = 6000;
-  combine_layout.expanded_slot_stride = 32;
-  combine_layout.reduced_token_stride = 32;
-  combine_layout.batch_payload_stride = 256;
+  const auto combine_layout = make_contiguous_combine_transfer_layout(
+      combine_plan, /*expanded_slot_stride=*/32, /*reduced_token_stride=*/32,
+      /*local_payload_base=*/4000, /*remote_payload_base=*/5000);
+  assert(combine_layout.batch_payload_stride == 128);
+  assert(combine_layout.remote_signal_base == 5512);
   const auto combine_commands =
       build_combine_transfer_cmd_plan(combine_plan, combine_layout);
   assert(combine_commands.commands.size() == combine_plan.segments.size() +
@@ -172,7 +169,7 @@ int main() {
   assert(std::memcmp(dispatch_remote.data() + 2000,
                      dispatch_local.data() + 1000, 64) == 0);
   uint32_t dispatch_signal = 0;
-  std::memcpy(&dispatch_signal, dispatch_remote.data() + 3000,
+  std::memcpy(&dispatch_signal, dispatch_remote.data() + 2256,
               sizeof(uint32_t));
   assert(dispatch_signal == 2);
 
@@ -235,7 +232,7 @@ int main() {
   assert(std::memcmp(combine_remote.data() + 5000,
                      combine_local.data() + 4000, 64) == 0);
   uint32_t combine_signal = 0;
-  std::memcpy(&combine_signal, combine_remote.data() + 6000,
+  std::memcpy(&combine_signal, combine_remote.data() + 5512,
               sizeof(uint32_t));
   assert(combine_signal == 2);
 

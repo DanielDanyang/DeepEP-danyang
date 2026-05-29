@@ -150,6 +150,7 @@ uccl-ep/
     runtime.hpp
     transfer_cmd.hpp
     transfer_cmd_plan.hpp
+    transfer_layout.hpp
     transfer_queue_host.hpp
     dispatch_jit.cuh
     combine_jit.cuh
@@ -368,6 +369,10 @@ device enqueue EFA proxy descriptors
 - JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。旧
   `ProxyCommand` enqueue/reference 路径已删除，host transfer queue 和 EFA adapter
   都直接消费 `V2TransferCmd`。
+- 已新增 contiguous transfer layout helper，用 descriptor 中的 expanded/reduced slot
+  span 自动计算 per-batch payload stride 和 signal base。combine 路径按
+  `reduced_token_slot + count` 计算跨度，避免把 V2 reduced layout 误当作 batch-local
+  packed layout。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 
