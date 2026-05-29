@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 using namespace uccl::v2_efa;
@@ -122,6 +123,17 @@ int main() {
          v2_transfer_local_offset(dispatch_commands.commands[0]));
   assert(v2_transfer_remote_offset(v2_dispatch_cmd) ==
          v2_transfer_remote_offset(dispatch_commands.commands[0]));
+  uint64_t packed_first = 0;
+  uint64_t packed_second = 0;
+  pack_v2_transfer_cmd(v2_dispatch_cmd, &packed_first, &packed_second);
+  const auto unpacked_v2_dispatch_cmd =
+      unpack_v2_transfer_cmd(packed_first, packed_second);
+  assert(unpacked_v2_dispatch_cmd.kind == v2_dispatch_cmd.kind);
+  assert(unpacked_v2_dispatch_cmd.target_rank == v2_dispatch_cmd.target_rank);
+  assert(unpacked_v2_dispatch_cmd.target_lane == v2_dispatch_cmd.target_lane);
+  assert(unpacked_v2_dispatch_cmd.bytes == v2_dispatch_cmd.bytes);
+  assert(v2_transfer_local_offset(unpacked_v2_dispatch_cmd) == 1000);
+  assert(v2_transfer_remote_offset(unpacked_v2_dispatch_cmd) == 2000);
 
   const auto combine_layout = make_contiguous_combine_transfer_layout(
       combine_plan, /*expanded_slot_stride=*/32, /*reduced_token_stride=*/32,
@@ -189,6 +201,21 @@ int main() {
   assert(v2_sink.ops.size() == transfer_cmds.size());
   assert(v2_sink.ops[0].kind == EfaPostOpKind::kWrite);
   assert(v2_sink.ops[1].kind == EfaPostOpKind::kSignalWrite);
+  std::vector<std::pair<uint64_t, uint64_t>> packed_transfer_cmds;
+  for (const auto& command : transfer_cmds) {
+    uint64_t first = 0;
+    uint64_t second = 0;
+    pack_v2_transfer_cmd(command, &first, &second);
+    packed_transfer_cmds.emplace_back(first, second);
+  }
+  RecordingEfaPostSink packed_v2_sink;
+  drain_packed_v2_transfer_cmds_to_efa_posts(packed_transfer_cmds,
+                                             packed_v2_sink);
+  assert(packed_v2_sink.ops.size() == v2_sink.ops.size());
+  assert(packed_v2_sink.ops[0].kind == EfaPostOpKind::kWrite);
+  assert(packed_v2_sink.ops[0].local_offset == v2_sink.ops[0].local_offset);
+  assert(packed_v2_sink.ops[1].kind == EfaPostOpKind::kSignalWrite);
+  assert(packed_v2_sink.ops[1].signal_value == 2);
   const auto queued_dispatch_stats = dispatch_queue.drain_loopback(
       LoopbackMemoryView{dispatch_local.data(), dispatch_local.size(),
                          queued_dispatch_remote.data(),

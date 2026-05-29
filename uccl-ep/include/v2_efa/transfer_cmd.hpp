@@ -125,6 +125,37 @@ inline uint64_t v2_transfer_local_offset(const V2TransferCmd& command) {
   return decode_v2_transfer_offset(command.local_offset_shifted);
 }
 
+inline void pack_v2_transfer_cmd(const V2TransferCmd& command, uint64_t* first,
+                                 uint64_t* second) {
+  if (first == nullptr || second == nullptr) {
+    throw std::invalid_argument("V2 transfer command pack output is null");
+  }
+  uint64_t a = 0;
+  uint64_t b = 0;
+  a |= static_cast<uint64_t>(command.kind);
+  a |= static_cast<uint64_t>(command.target_rank) << 8;
+  a |= static_cast<uint64_t>(command.target_lane) << 16;
+  a |= static_cast<uint64_t>(command.flags) << 24;
+  a |= static_cast<uint64_t>(command.bytes) << 32;
+  b |= static_cast<uint64_t>(command.remote_offset_shifted);
+  b |= static_cast<uint64_t>(command.local_offset_shifted) << 32;
+  *first = a;
+  *second = b;
+}
+
+inline V2TransferCmd unpack_v2_transfer_cmd(uint64_t first, uint64_t second) {
+  V2TransferCmd command;
+  command.kind = static_cast<uint8_t>(first & 0xFFu);
+  command.target_rank = static_cast<uint8_t>((first >> 8) & 0xFFu);
+  command.target_lane = static_cast<uint8_t>((first >> 16) & 0xFFu);
+  command.flags = static_cast<uint8_t>((first >> 24) & 0xFFu);
+  command.bytes = static_cast<uint32_t>((first >> 32) & 0xFFFFFFFFu);
+  command.remote_offset_shifted = static_cast<uint32_t>(second & 0xFFFFFFFFu);
+  command.local_offset_shifted =
+      static_cast<uint32_t>((second >> 32) & 0xFFFFFFFFu);
+  return command;
+}
+
 inline V2TransferCmd make_v2_transfer_cmd(V2TransferCmdKind kind,
                                           uint32_t target_rank,
                                           uint32_t target_lane,

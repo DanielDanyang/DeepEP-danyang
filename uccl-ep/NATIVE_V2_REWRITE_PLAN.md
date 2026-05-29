@@ -371,6 +371,9 @@ device enqueue EFA proxy descriptors
 - 已新增 native V2 `V2TransferCmd`，替代旧 `TransferCmd` 作为后续 command ring wire
   format。它保持 16B/128-bit FIFO slot 宽度，字段来自 V2 descriptor/layout 解析后的
   EFA post 需求，而不是 V1 low-latency bitfield。
+- 已新增 `V2TransferCmd` 的 two-`uint64_t` pack/unpack codec，host adapter 可直接把
+  FIFO/trigger words decode 成 `EfaPostOp`。真实 CPU proxy poll loop 后续应在这里
+  分流 V2 command，而不是进入旧 `TransferCmd` decode 逻辑。
 - JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。旧
   `ProxyCommand` enqueue/reference 路径已删除，host transfer queue 和 EFA adapter
   都直接消费 `V2TransferCmd`。

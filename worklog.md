@@ -100,7 +100,11 @@
     但保持同样的 16B/128-bit FIFO slot 宽度。
   - 将 `V2TransferCmd` 从调试用 64B 自描述结构收敛为 16B hot-path command：
     kind、target rank/lane、bytes、shifted local/remote offset 或 signal value、
-    descriptor/batch index。expert/count 等语义仍留在 V2 descriptor/layout 中。
+    expert/count/descriptor index 等语义仍留在 V2 descriptor/layout 中。
+  - 新增 `V2TransferCmd` <-> two `uint64_t` 的显式 pack/unpack codec，匹配 UCCL EP
+    现有 128-bit FIFO/trigger 宽度。
+  - `efa_adapter.hpp` 现在可以直接把 packed V2 FIFO words decode 成 `EfaPostOp`，
+    对应后续真实 CPU proxy poll loop 的接入点。
   - 本地没有 nanobind header，`uccl_ep.cc` 只能等服务器/构建环境做 extension 编译；
     当前已完成 Python `py_compile` 和 C++ header/runtime 单测。
 - 服务器当前未执行任何 build/test/profiling/benchmark。

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "v2_efa/transfer_cmd.hpp"
@@ -103,10 +104,24 @@ inline EfaPostOp make_efa_post_op(const V2TransferCmd& command) {
   throw std::invalid_argument("unknown V2 transfer command kind");
 }
 
+inline EfaPostOp make_efa_post_op_from_packed_v2_transfer(uint64_t first,
+                                                          uint64_t second) {
+  return make_efa_post_op(unpack_v2_transfer_cmd(first, second));
+}
+
 inline void drain_v2_transfer_cmds_to_efa_posts(
     const std::vector<V2TransferCmd>& commands, EfaPostSink& sink) {
   for (const auto& command : commands) {
     sink.post(make_efa_post_op(command));
+  }
+}
+
+inline void drain_packed_v2_transfer_cmds_to_efa_posts(
+    const std::vector<std::pair<uint64_t, uint64_t>>& packed_commands,
+    EfaPostSink& sink) {
+  for (const auto& command : packed_commands) {
+    sink.post(make_efa_post_op_from_packed_v2_transfer(command.first,
+                                                       command.second));
   }
 }
 
