@@ -1500,3 +1500,46 @@ README 风格 EP8x2 性能：
   - 把 Python smoke 中的 recording drain 替换成 CPU proxy drain 到
     `V2EfaVerbsPostSink`，并验证 receiver buffer 中的 V2 expanded/reduced layout
     被真实 RDMA write 填充。
+
+## 2026-05-29 V2-only EFA connection binding
+
+- 新增 `uccl.ep.V2EfaConnection`：
+  - 构造时打开 EFA verbs device，注册 caller-owned V2 RDMA window，注册 host
+    signal scratch，创建 per-lane SRD QP。
+  - `local_info()` 导出 `addr/bytes/rkey/lkey/qpns/gid/device_name`，Python 侧用
+    `torch.distributed.all_gather_object` 交换。
+  - `connect(all_infos)` 用交换得到的 GID/QPN/rkey/remote window 直接建立
+    `V2VerbsEndpointTable` 和 `V2EfaVerbsPostSink`。
+  - `drain_queue(queue)` 将 `V2MappedD2HQueue` 里的 native `V2TransferCmd` 直接
+    drain 到 verbs sink；可选 coalescing，仍不经过旧 V1 `TransferCmd`。
+  - `post_op(dict)` 暴露最小 raw write/signal 调试入口，便于先做纯 RDMA window
+    smoke，再接完整 dispatch/combine。
+  - `poll_completions()` poll CQ，并在有 completion 后释放 signal scratch ring 的
+    简单线性 allocator。
+- Python `ElasticBuffer` 新增：
+  - `init_native_v2_efa_transport(...)`
+  - `has_native_v2_efa_transport()`
+  - `drain_native_v2_dispatch_transport(handle, ...)`
+  - `drain_native_v2_combine_transport(handle, ...)`
+- 这一步仍然是 V2-only connection/runtime shim：
+  - 没有链接旧 `proxy.cpp` / `rdma.cpp`；
+  - 没有恢复 V1 staged token buffer；
+  - RDMA window layout 仍需下一步和 V2 expanded/reduced buffer allocator 对齐，才能
+    默认替换 semantic fallback 的真实 payload 数据面。
+- 服务器验证：
+  - `p5en_0` 编译和安装通过，`uccl.ep.v2_has_verbs_sink() == True`，
+    `hasattr(uccl.ep, "V2EfaConnection") == True`。
+  - `p5en_1` 安装通过，同样确认 `V2EfaConnection` 存在。
+  - `p5en_0` 单进程 self-window RDMA smoke 通过：
+    - 注册 4 KiB CUDA window；
+    - 创建 1 lane SRD QP，当前 EFA 返回 `qpns=[0]`，因此放宽了 sink 对
+      `dst_qpn != 0` 的校验；
+    - rank0 对自身 window 执行 16B RDMA write，poll 到 1 个 completion；
+    - 目标 offset `[128:144]` 内容为 `0..15`。
+  - 新增 `uccl-ep/tests/v2_efa_connection_smoke.py`。
+  - 双机 EP1x2 endpoint + remote write smoke 通过：
+    - rank0/rank1 分别注册 4 KiB CUDA window 并交换 endpoint info；
+    - rank0 通过 `V2EfaConnection.post_op` 向 rank1 的 remote window offset 128
+      写 16B；
+    - rank0 poll 到 send completion；
+    - rank1 读回自身 CUDA window `[128:144] == 0..15`。

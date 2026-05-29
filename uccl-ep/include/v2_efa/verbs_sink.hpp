@@ -147,11 +147,13 @@ class V2EfaVerbsPostSink final : public EfaPostSink {
 
   const V2VerbsPostStats& stats() const { return stats_; }
 
+  void reset_signal_scratch() { next_signal_scratch_ = 0; }
+
  private:
   void validate_endpoint(const V2VerbsEndpoint& endpoint) const {
     if (endpoint.qp == nullptr || endpoint.ah == nullptr ||
         endpoint.remote_base == 0 || endpoint.remote_bytes == 0 ||
-        endpoint.remote_rkey == 0 || endpoint.dst_qpn == 0) {
+        endpoint.remote_rkey == 0) {
       throw std::invalid_argument("incomplete V2 EFA verbs endpoint");
     }
   }
@@ -260,7 +262,7 @@ inline V2VerbsEndpoint make_v2_verbs_endpoint_from_proxy_ctx(
     endpoint.dst_qpn = ctx.dst_qpn;
   }
 
-  if (endpoint.qp == nullptr || endpoint.dst_qpn == 0) {
+  if (endpoint.qp == nullptr) {
     throw std::invalid_argument("ProxyCtx has no usable data QP");
   }
   return endpoint;

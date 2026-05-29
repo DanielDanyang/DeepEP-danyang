@@ -129,6 +129,8 @@ class ElasticBuffer:
         self.allow_hybrid_mode = bool(allow_hybrid_mode)
         self.allow_multiple_reduction = bool(allow_multiple_reduction)
         self.prefer_overlap_with_compute = bool(prefer_overlap_with_compute)
+        self._v2_efa_window: Optional[torch.Tensor] = None
+        self._v2_efa_connection = None
 
     def _make_runtime(
         self,
@@ -524,6 +526,81 @@ class ElasticBuffer:
     @staticmethod
     def allocate_d2h_queue(capacity: int = 2048):
         return ep.V2MappedD2HQueue(int(capacity))
+
+    def init_native_v2_efa_transport(
+        self,
+        window: Optional[torch.Tensor] = None,
+        num_bytes: Optional[int] = None,
+        num_lanes: int = 1,
+        device_index: int = -1,
+        signal_capacity: int = 65536,
+    ):
+        """Create the V2-only EFA verbs connection for the native backend.
+
+        The connection registers one caller-owned V2 RDMA window and exchanges
+        endpoint metadata through the existing torch distributed group. It does
+        not instantiate the removed V1 proxy or old TransferCmd path.
+        """
+
+        if not hasattr(ep, "V2EfaConnection"):
+            raise RuntimeError("uccl.ep was built without V2 EFA verbs connection support")
+        if window is None:
+            bytes_to_alloc = int(self.num_bytes if num_bytes is None else num_bytes)
+            window = torch.empty((bytes_to_alloc,), dtype=torch.uint8, device="cuda")
+        _require_cuda_contiguous(window, "window")
+        bytes_in_window = int(window.numel() * window.element_size())
+        if num_bytes is not None and int(num_bytes) > bytes_in_window:
+            raise ValueError("num_bytes exceeds the provided V2 EFA window")
+
+        connection = ep.V2EfaConnection(
+            int(window.data_ptr()),
+            int(bytes_in_window if num_bytes is None else num_bytes),
+            int(self.num_ranks),
+            int(self.rank_idx),
+            int(max(1, num_lanes)),
+            int(device_index),
+            int(signal_capacity),
+        )
+        local_info = connection.local_info()
+        all_infos = [None for _ in range(self.num_ranks)]
+        dist.all_gather_object(all_infos, local_info, group=self.group)
+        connection.connect(all_infos)
+        self._v2_efa_window = window
+        self._v2_efa_connection = connection
+        return local_info
+
+    def has_native_v2_efa_transport(self) -> bool:
+        return self._v2_efa_connection is not None
+
+    def drain_native_v2_dispatch_transport(
+        self,
+        handle: EPHandle,
+        coalesce: bool = True,
+        ack_after_drain: bool = True,
+    ):
+        if self._v2_efa_connection is None:
+            raise RuntimeError("native V2 EFA transport has not been initialized")
+        transport = handle.transport_handle
+        if transport is None:
+            raise RuntimeError("dispatch handle does not contain V2 transport metadata")
+        return self._v2_efa_connection.drain_queue(
+            transport.d2h_queue, bool(coalesce), bool(ack_after_drain)
+        )
+
+    def drain_native_v2_combine_transport(
+        self,
+        handle: EPHandle,
+        coalesce: bool = True,
+        ack_after_drain: bool = True,
+    ):
+        if self._v2_efa_connection is None:
+            raise RuntimeError("native V2 EFA transport has not been initialized")
+        transport = handle.transport_handle
+        if transport is None or transport.combine_d2h_queue is None:
+            raise RuntimeError("combine handle does not contain V2 transport metadata")
+        return self._v2_efa_connection.drain_queue(
+            transport.combine_d2h_queue, bool(coalesce), bool(ack_after_drain)
+        )
 
     def launch_combine_descriptors(
         self,

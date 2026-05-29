@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -6,6 +8,7 @@
 #include <cuda_runtime_api.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include "ep_util.hpp"
 #include "v2_efa/efa_adapter.hpp"
@@ -15,6 +18,13 @@
 #include "v2_efa/transfer_d2h_queue.cuh"
 #include "v2_efa/transfer_layout.hpp"
 #include "v2_efa/verbs_sink.hpp"
+
+#if UCCL_V2_EFA_HAS_VERBS
+#ifdef EFA
+#include <infiniband/efadv.h>
+#endif
+#include <cstdlib>
+#endif
 
 namespace nb = nanobind;
 namespace v2 = uccl::v2_efa;
@@ -396,6 +406,409 @@ class MappedD2HQueueHandle {
   uint64_t* tail_device_ = nullptr;
 };
 
+#if UCCL_V2_EFA_HAS_VERBS
+
+class V2EfaConnectionHandle {
+ public:
+  V2EfaConnectionHandle(std::uintptr_t local_addr, uint64_t bytes,
+                        uint32_t world_size, uint32_t rank,
+                        uint32_t num_lanes = 1, int device_index = -1,
+                        uint64_t signal_capacity = 65536)
+      : local_addr_(local_addr),
+        bytes_(bytes),
+        world_size_(world_size),
+        rank_(rank),
+        num_lanes_(std::max<uint32_t>(num_lanes, 1)),
+        signal_values_(static_cast<size_t>(std::max<uint64_t>(
+            signal_capacity, uint64_t{1}))) {
+#ifndef EFA
+    throw std::runtime_error(
+        "V2EfaConnection requires an EFA build; rebuild uccl-ep with EFA_HOME");
+#else
+    if (local_addr_ == 0 || bytes_ == 0) {
+      throw std::invalid_argument("V2 EFA local window is empty");
+    }
+    if (world_size_ == 0 || rank_ >= world_size_) {
+      throw std::invalid_argument("invalid V2 EFA rank/world_size");
+    }
+
+    open_device(device_index);
+    pd_ = ibv_alloc_pd(context_);
+    if (pd_ == nullptr) {
+      throw std::runtime_error("ibv_alloc_pd failed for V2 EFA");
+    }
+    cq_ = ibv_create_cq(context_, kMaxOutstandingSends * num_lanes_, nullptr,
+                        nullptr, 0);
+    if (cq_ == nullptr) {
+      throw std::runtime_error("ibv_create_cq failed for V2 EFA");
+    }
+
+    constexpr int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                           IBV_ACCESS_REMOTE_READ;
+    mr_ = ibv_reg_mr(pd_, reinterpret_cast<void*>(local_addr_), bytes_, access);
+    if (mr_ == nullptr) {
+      throw std::runtime_error("ibv_reg_mr failed for V2 EFA local window");
+    }
+    signal_mr_ =
+        ibv_reg_mr(pd_, signal_values_.data(),
+                   signal_values_.size() * sizeof(uint32_t),
+                   IBV_ACCESS_LOCAL_WRITE);
+    if (signal_mr_ == nullptr) {
+      throw std::runtime_error("ibv_reg_mr failed for V2 EFA signal scratch");
+    }
+
+    qps_.reserve(num_lanes_);
+    for (uint32_t i = 0; i < num_lanes_; ++i) {
+      qps_.push_back(create_srd_qp());
+    }
+
+    if (ibv_query_gid(context_, 1, 0, &gid_) != 0) {
+      throw std::runtime_error("ibv_query_gid failed for V2 EFA");
+    }
+#endif
+  }
+
+  V2EfaConnectionHandle(const V2EfaConnectionHandle&) = delete;
+  V2EfaConnectionHandle& operator=(const V2EfaConnectionHandle&) = delete;
+
+  ~V2EfaConnectionHandle() { destroy(); }
+
+  nb::dict local_info() const {
+    nb::dict out;
+    out["rank"] = rank_;
+    out["addr"] = local_addr_;
+    out["bytes"] = bytes_;
+    out["rkey"] = mr_ == nullptr ? uint32_t{0} : mr_->rkey;
+    out["lkey"] = mr_ == nullptr ? uint32_t{0} : mr_->lkey;
+    out["device_name"] = device_name_;
+    std::vector<uint32_t> qpns;
+    qpns.reserve(qps_.size());
+    for (auto* qp : qps_) {
+      qpns.push_back(qp == nullptr ? uint32_t{0} : qp->qp_num);
+    }
+    out["qpns"] = qpns;
+    std::vector<uint8_t> gid(16);
+    std::memcpy(gid.data(), gid_.raw, gid.size());
+    out["gid"] = gid;
+    return out;
+  }
+
+  void connect(const nb::sequence& all_infos) {
+    if (static_cast<uint32_t>(nb::len(all_infos)) != world_size_) {
+      throw std::invalid_argument("V2 EFA endpoint info count != world_size");
+    }
+    endpoint_table_ =
+        std::make_unique<v2::V2VerbsEndpointTable>(world_size_, num_lanes_);
+    ahs_.clear();
+    ahs_.reserve(world_size_);
+
+    for (uint32_t peer = 0; peer < world_size_; ++peer) {
+      nb::dict info = nb::cast<nb::dict>(all_infos[peer]);
+      const auto remote_addr =
+          static_cast<uint64_t>(nb::cast<std::uintptr_t>(info["addr"]));
+      const auto remote_bytes = nb::cast<uint64_t>(info["bytes"]);
+      const auto remote_rkey = nb::cast<uint32_t>(info["rkey"]);
+      const auto qpns = nb::cast<std::vector<uint32_t>>(info["qpns"]);
+      const auto gid = nb::cast<std::vector<uint8_t>>(info["gid"]);
+      if (remote_addr == 0 || remote_bytes == 0 || remote_rkey == 0 ||
+          qpns.empty() || gid.size() != 16) {
+        throw std::invalid_argument("invalid V2 EFA remote endpoint info");
+      }
+      auto* ah = create_ah(gid);
+      ahs_.push_back(ah);
+      for (uint32_t lane = 0; lane < num_lanes_; ++lane) {
+        v2::V2VerbsEndpoint endpoint;
+        endpoint.rank = peer;
+        endpoint.lane = lane;
+        endpoint.qp = qps_.at(lane % qps_.size());
+        endpoint.ah = ah;
+        endpoint.dst_qpn = qpns.at(lane % qpns.size());
+        endpoint.qkey = v2::kDefaultEfaQKey;
+        endpoint.remote_base = remote_addr;
+        endpoint.remote_bytes = remote_bytes;
+        endpoint.remote_rkey = remote_rkey;
+        endpoint_table_->set(endpoint);
+      }
+    }
+
+    v2::V2VerbsLocalWindow local_window;
+    local_window.base = local_addr_;
+    local_window.bytes = bytes_;
+    local_window.lkey = mr_->lkey;
+
+    v2::V2VerbsSignalScratch signal_scratch;
+    signal_scratch.values = signal_values_.data();
+    signal_scratch.capacity = signal_values_.size();
+    signal_scratch.lkey = signal_mr_->lkey;
+
+    sink_ = std::make_unique<v2::V2EfaVerbsPostSink>(
+        local_window, signal_scratch, endpoint_table_.get());
+  }
+
+  bool is_connected() const { return sink_ != nullptr; }
+
+  nb::dict drain_queue(MappedD2HQueueHandle& queue, bool coalesce = true,
+                       bool ack_after_drain = true) {
+    ensure_connected();
+    const auto before = sink_->stats();
+    const auto commands = queue.poll_ready();
+    if (coalesce) {
+      v2::CoalescingEfaPostSink coalesced(sink_.get());
+      v2::drain_v2_transfer_cmds_to_efa_posts(commands, coalesced);
+      coalesced.flush();
+    } else {
+      v2::drain_v2_transfer_cmds_to_efa_posts(commands, *sink_);
+    }
+    if (ack_after_drain) {
+      queue.ack_ready();
+    }
+    const auto after = sink_->stats();
+    nb::dict out;
+    out["drained_commands"] = commands.size();
+    out["posted_writes"] = after.posted_writes - before.posted_writes;
+    out["posted_signals"] = after.posted_signals - before.posted_signals;
+    out["posted_bytes"] = after.posted_bytes - before.posted_bytes;
+    out["head"] = queue.head();
+    out["tail"] = queue.tail();
+    return out;
+  }
+
+  nb::dict post_op(const nb::dict& op_dict) {
+    ensure_connected();
+    v2::EfaPostOp op;
+    op.kind = static_cast<v2::EfaPostOpKind>(
+        nb::cast<uint32_t>(op_dict["kind"]));
+    op.target_rank = nb::cast<uint32_t>(op_dict["target_rank"]);
+    op.target_lane = nb::cast<uint32_t>(op_dict["target_lane"]);
+    op.bytes = nb::cast<uint32_t>(op_dict["bytes"]);
+    if (op_dict.contains("signal_value")) {
+      op.signal_value = nb::cast<uint32_t>(op_dict["signal_value"]);
+    }
+    if (op_dict.contains("local_offset")) {
+      op.local_offset = nb::cast<uint64_t>(op_dict["local_offset"]);
+    }
+    op.remote_offset = nb::cast<uint64_t>(op_dict["remote_offset"]);
+    const auto before = sink_->stats();
+    sink_->post(op);
+    const auto after = sink_->stats();
+    nb::dict out;
+    out["posted_writes"] = after.posted_writes - before.posted_writes;
+    out["posted_signals"] = after.posted_signals - before.posted_signals;
+    out["posted_bytes"] = after.posted_bytes - before.posted_bytes;
+    return out;
+  }
+
+  uint32_t poll_completions(uint32_t max_entries = 64) {
+    if (cq_ == nullptr || max_entries == 0) {
+      return 0;
+    }
+    std::vector<ibv_wc> wc(max_entries);
+    uint32_t total = 0;
+    while (total < max_entries) {
+      const auto room = static_cast<int>(max_entries - total);
+      const int ne = ibv_poll_cq(cq_, room, wc.data() + total);
+      if (ne < 0) {
+        throw std::runtime_error("ibv_poll_cq failed for V2 EFA");
+      }
+      if (ne == 0) {
+        break;
+      }
+      for (int i = 0; i < ne; ++i) {
+        if (wc[total + i].status != IBV_WC_SUCCESS) {
+          throw std::runtime_error("V2 EFA completion status is not success");
+        }
+      }
+      total += static_cast<uint32_t>(ne);
+    }
+    if (sink_ != nullptr && total != 0) {
+      sink_->reset_signal_scratch();
+    }
+    return total;
+  }
+
+  nb::dict stats() const {
+    nb::dict out;
+    if (sink_ == nullptr) {
+      out["posted_writes"] = uint64_t{0};
+      out["posted_signals"] = uint64_t{0};
+      out["posted_bytes"] = uint64_t{0};
+      return out;
+    }
+    const auto& stats = sink_->stats();
+    out["posted_writes"] = stats.posted_writes;
+    out["posted_signals"] = stats.posted_signals;
+    out["posted_bytes"] = stats.posted_bytes;
+    return out;
+  }
+
+ private:
+  void ensure_connected() const {
+    if (sink_ == nullptr) {
+      throw std::runtime_error("V2 EFA connection is not connected");
+    }
+  }
+
+  void open_device(int requested_index) {
+    int num_devices = 0;
+    auto** devices = ibv_get_device_list(&num_devices);
+    if (devices == nullptr || num_devices == 0) {
+      throw std::runtime_error("ibv_get_device_list found no RDMA devices");
+    }
+
+    int selected = requested_index;
+    if (selected < 0) {
+      if (const char* env = std::getenv("UCCL_V2_EFA_DEVICE_INDEX")) {
+        selected = std::atoi(env);
+      }
+    }
+    if (selected < 0) {
+      selected = 0;
+      for (int i = 0; i < num_devices; ++i) {
+        const char* name = ibv_get_device_name(devices[i]);
+        if (name != nullptr && std::string(name).find("efa") != std::string::npos) {
+          selected = i;
+          break;
+        }
+      }
+    }
+    if (selected < 0 || selected >= num_devices) {
+      ibv_free_device_list(devices);
+      throw std::out_of_range("V2 EFA device index out of range");
+    }
+    device_name_ = ibv_get_device_name(devices[selected]);
+    context_ = ibv_open_device(devices[selected]);
+    ibv_free_device_list(devices);
+    if (context_ == nullptr) {
+      throw std::runtime_error("ibv_open_device failed for V2 EFA");
+    }
+  }
+
+  ibv_qp* create_srd_qp() {
+#ifndef EFA
+    throw std::runtime_error("SRD QP requires EFA");
+#else
+    ibv_qp_init_attr_ex qp_attr{};
+    efadv_qp_init_attr efa_attr{};
+    qp_attr.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
+    qp_attr.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE;
+    qp_attr.cap.max_send_wr = kMaxOutstandingSends;
+    qp_attr.cap.max_recv_wr = kMaxOutstandingSends;
+    qp_attr.cap.max_send_sge = 1;
+    qp_attr.cap.max_recv_sge = 1;
+    qp_attr.cap.max_inline_data = 0;
+    qp_attr.pd = pd_;
+    qp_attr.qp_context = context_;
+    qp_attr.sq_sig_all = 1;
+    qp_attr.send_cq = cq_;
+    qp_attr.recv_cq = cq_;
+    qp_attr.qp_type = IBV_QPT_DRIVER;
+
+    efa_attr.driver_qp_type = EFADV_QP_DRIVER_TYPE_SRD;
+    efa_attr.flags = EFADV_QP_FLAGS_UNSOLICITED_WRITE_RECV;
+
+    auto* qp = efadv_create_qp_ex(context_, &qp_attr, &efa_attr,
+                                  sizeof(efadv_qp_init_attr));
+    if (qp == nullptr) {
+      throw std::runtime_error("efadv_create_qp_ex failed for V2 EFA");
+    }
+
+    ibv_qp_attr attr{};
+    attr.qp_state = IBV_QPS_INIT;
+    attr.pkey_index = 0;
+    attr.port_num = 1;
+    attr.qkey = v2::kDefaultEfaQKey;
+    if (ibv_modify_qp(qp, &attr,
+                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+                          IBV_QP_QKEY) != 0) {
+      throw std::runtime_error("ibv_modify_qp INIT failed for V2 EFA");
+    }
+    std::memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTR;
+    if (ibv_modify_qp(qp, &attr, IBV_QP_STATE) != 0) {
+      throw std::runtime_error("ibv_modify_qp RTR failed for V2 EFA");
+    }
+    std::memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTS;
+    attr.sq_psn = 0;
+    if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
+      throw std::runtime_error("ibv_modify_qp RTS failed for V2 EFA");
+    }
+    return qp;
+#endif
+  }
+
+  ibv_ah* create_ah(const std::vector<uint8_t>& remote_gid) {
+    ibv_ah_attr attr{};
+    attr.is_global = 1;
+    attr.port_num = 1;
+    attr.grh.sgid_index = 0;
+    std::memcpy(&attr.grh.dgid, remote_gid.data(), 16);
+    attr.grh.hop_limit = 255;
+    auto* ah = ibv_create_ah(pd_, &attr);
+    if (ah == nullptr) {
+      throw std::runtime_error("ibv_create_ah failed for V2 EFA");
+    }
+    return ah;
+  }
+
+  void destroy() {
+    sink_.reset();
+    endpoint_table_.reset();
+    for (auto* ah : ahs_) {
+      if (ah != nullptr) {
+        ibv_destroy_ah(ah);
+      }
+    }
+    ahs_.clear();
+    for (auto* qp : qps_) {
+      if (qp != nullptr) {
+        ibv_destroy_qp(qp);
+      }
+    }
+    qps_.clear();
+    if (signal_mr_ != nullptr) {
+      ibv_dereg_mr(signal_mr_);
+      signal_mr_ = nullptr;
+    }
+    if (mr_ != nullptr) {
+      ibv_dereg_mr(mr_);
+      mr_ = nullptr;
+    }
+    if (cq_ != nullptr) {
+      ibv_destroy_cq(cq_);
+      cq_ = nullptr;
+    }
+    if (pd_ != nullptr) {
+      ibv_dealloc_pd(pd_);
+      pd_ = nullptr;
+    }
+    if (context_ != nullptr) {
+      ibv_close_device(context_);
+      context_ = nullptr;
+    }
+  }
+
+  std::uintptr_t local_addr_ = 0;
+  uint64_t bytes_ = 0;
+  uint32_t world_size_ = 0;
+  uint32_t rank_ = 0;
+  uint32_t num_lanes_ = 1;
+  std::string device_name_;
+  ibv_context* context_ = nullptr;
+  ibv_pd* pd_ = nullptr;
+  ibv_cq* cq_ = nullptr;
+  ibv_mr* mr_ = nullptr;
+  ibv_mr* signal_mr_ = nullptr;
+  ibv_gid gid_{};
+  std::vector<ibv_qp*> qps_;
+  std::vector<ibv_ah*> ahs_;
+  std::vector<uint32_t> signal_values_;
+  std::unique_ptr<v2::V2VerbsEndpointTable> endpoint_table_;
+  std::unique_ptr<v2::V2EfaVerbsPostSink> sink_;
+};
+
+#endif  // UCCL_V2_EFA_HAS_VERBS
+
 }  // namespace
 
 NB_MODULE(ep, m) {
@@ -461,6 +874,26 @@ NB_MODULE(ep, m) {
              }
              return out;
       });
+
+#if UCCL_V2_EFA_HAS_VERBS
+  nb::class_<V2EfaConnectionHandle>(m, "V2EfaConnection")
+      .def(nb::init<std::uintptr_t, uint64_t, uint32_t, uint32_t, uint32_t,
+                    int, uint64_t>(),
+           nb::arg("local_addr"), nb::arg("bytes"), nb::arg("world_size"),
+           nb::arg("rank"), nb::arg("num_lanes") = 1,
+           nb::arg("device_index") = -1,
+           nb::arg("signal_capacity") = 65536)
+      .def("local_info", &V2EfaConnectionHandle::local_info)
+      .def("connect", &V2EfaConnectionHandle::connect)
+      .def("is_connected", &V2EfaConnectionHandle::is_connected)
+      .def("drain_queue", &V2EfaConnectionHandle::drain_queue,
+           nb::arg("queue"), nb::arg("coalesce") = true,
+           nb::arg("ack_after_drain") = true)
+      .def("post_op", &V2EfaConnectionHandle::post_op)
+      .def("poll_completions", &V2EfaConnectionHandle::poll_completions,
+           nb::arg("max_entries") = 64)
+      .def("stats", &V2EfaConnectionHandle::stats);
+#endif
 
   nb::class_<v2::RuntimeConfig>(m, "V2EfaRuntimeConfig")
       .def(nb::init<>())
