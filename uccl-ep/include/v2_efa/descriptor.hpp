@@ -32,6 +32,7 @@ struct DispatchSegmentDescriptor {
   int32_t count = 0;
   int32_t src_token_begin = 0;
   int32_t src_token_index_offset = -1;
+  int32_t topk_slot = 0;
   int32_t expanded_slot_begin = 0;
   int32_t payload_bytes = 0;
   int32_t scale_bytes = 0;

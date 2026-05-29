@@ -85,19 +85,16 @@ class ElasticBuffer:
         self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
         self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
 
-        config = ep.V2EfaRuntimeConfig()
-        config.rank = self.rank_idx
-        config.world_size = self.num_ranks
-        config.scaleout_rank = self.scaleout_rank_idx
-        config.scaleup_rank = self.scaleup_rank_idx
-        config.num_scaleout_ranks = self.num_scaleout_ranks
-        config.num_scaleup_ranks = self.num_scaleup_ranks
-        config.num_experts = max(1, self.num_ranks)
-        config.num_topk = max(1, self.num_topk)
-        config.hidden = self.hidden
-        config.elem_bytes = 1 if use_fp8_dispatch else 2
-        config.num_sms = 0
-        self.runtime = ep.V2EfaRuntime(config)
+        self.num_experts = self.num_ranks
+        self.elem_bytes = 1 if use_fp8_dispatch else 2
+        self.num_sms = 0
+        self.runtime = self._make_runtime(
+            num_experts=self.num_experts,
+            num_topk=max(1, self.num_topk),
+            hidden=self.hidden,
+            elem_bytes=self.elem_bytes,
+            num_sms=self.num_sms,
+        )
         self.num_bytes = num_bytes or self.get_buffer_size_hint(
             group,
             num_max_tokens_per_rank,
@@ -106,6 +103,49 @@ class ElasticBuffer:
             use_fp8_dispatch,
             allow_hybrid_mode,
             allow_multiple_reduction,
+        )
+
+    def _make_runtime(
+        self,
+        num_experts: int,
+        num_topk: int,
+        hidden: int,
+        elem_bytes: int,
+        num_sms: int,
+    ):
+        config = ep.V2EfaRuntimeConfig()
+        config.rank = self.rank_idx
+        config.world_size = self.num_ranks
+        config.scaleout_rank = self.scaleout_rank_idx
+        config.scaleup_rank = self.scaleup_rank_idx
+        config.num_scaleout_ranks = self.num_scaleout_ranks
+        config.num_scaleup_ranks = self.num_scaleup_ranks
+        config.num_experts = int(num_experts)
+        config.num_topk = int(num_topk)
+        config.hidden = int(hidden)
+        config.elem_bytes = int(elem_bytes)
+        config.num_sms = int(num_sms)
+        return ep.V2EfaRuntime(config)
+
+    def configure_native_v2(
+        self,
+        num_experts: int,
+        num_topk: Optional[int] = None,
+        hidden: Optional[int] = None,
+        elem_bytes: Optional[int] = None,
+        num_sms: int = 0,
+    ) -> None:
+        self.num_experts = int(num_experts)
+        self.num_topk = int(self.num_topk if num_topk is None else num_topk)
+        self.hidden = int(self.hidden if hidden is None else hidden)
+        self.elem_bytes = int(self.elem_bytes if elem_bytes is None else elem_bytes)
+        self.num_sms = int(num_sms)
+        self.runtime = self._make_runtime(
+            self.num_experts,
+            max(1, self.num_topk),
+            self.hidden,
+            self.elem_bytes,
+            self.num_sms,
         )
 
     def destroy(self) -> None:
@@ -148,6 +188,24 @@ class ElasticBuffer:
 
     def route_expert(self, expert_id: int):
         return self.runtime.route_expert(int(expert_id))
+
+    def build_reference_dispatch_plan(
+        self,
+        topk_idx_flat,
+        num_tokens: int,
+        payload_bytes: int,
+        scale_bytes: int = 0,
+        has_topk_weight: bool = True,
+    ):
+        if isinstance(topk_idx_flat, torch.Tensor):
+            topk_idx_flat = topk_idx_flat.detach().cpu().reshape(-1).tolist()
+        return self.runtime.build_reference_dispatch_plan(
+            topk_idx_flat,
+            int(num_tokens),
+            int(payload_bytes),
+            int(scale_bytes),
+            bool(has_topk_weight),
+        )
 
     def get_comm_stream(self) -> torch.Stream:
         raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)

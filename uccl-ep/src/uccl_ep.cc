@@ -1,5 +1,6 @@
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
@@ -80,6 +81,57 @@ nb::dict route_to_dict(const v2::ExpertRoute& route) {
   return out;
 }
 
+nb::dict dispatch_segment_to_dict(const v2::DispatchSegmentDescriptor& segment) {
+  nb::dict out;
+  out["dst_scaleout_rank"] = segment.dst_scaleout_rank;
+  out["dst_scaleup_lane"] = segment.dst_scaleup_lane;
+  out["expert_id"] = segment.expert_id;
+  out["count"] = segment.count;
+  out["src_token_begin"] = segment.src_token_begin;
+  out["src_token_index_offset"] = segment.src_token_index_offset;
+  out["topk_slot"] = segment.topk_slot;
+  out["expanded_slot_begin"] = segment.expanded_slot_begin;
+  out["payload_bytes"] = segment.payload_bytes;
+  out["scale_bytes"] = segment.scale_bytes;
+  out["flags"] = segment.flags;
+  return out;
+}
+
+nb::dict dispatch_batch_to_dict(const v2::DispatchExpertBatch& batch) {
+  nb::dict out;
+  out["dst_scaleout_rank"] = batch.dst_scaleout_rank;
+  out["dst_scaleup_lane"] = batch.dst_scaleup_lane;
+  out["expert_id"] = batch.expert_id;
+  out["first_segment"] = batch.first_segment;
+  out["num_segments"] = batch.num_segments;
+  out["total_tokens"] = batch.total_tokens;
+  return out;
+}
+
+nb::dict dispatch_plan_to_dict(const v2::DispatchPlan& plan) {
+  nb::list segments;
+  for (const auto& segment : plan.segments) {
+    segments.append(dispatch_segment_to_dict(segment));
+  }
+  nb::list batches;
+  for (const auto& batch : plan.batches) {
+    batches.append(dispatch_batch_to_dict(batch));
+  }
+  nb::dict out;
+  out["segments"] = segments;
+  out["batches"] = batches;
+  return out;
+}
+
+std::vector<int64_t> sequence_to_i64_vector(const nb::sequence& values) {
+  std::vector<int64_t> out;
+  out.reserve(static_cast<size_t>(values.size()));
+  for (size_t i = 0; i < values.size(); ++i) {
+    out.push_back(nb::cast<int64_t>(values[i]));
+  }
+  return out;
+}
+
 }  // namespace
 
 NB_MODULE(ep, m) {
@@ -138,6 +190,20 @@ NB_MODULE(ep, m) {
       .def("route_expert",
            [](const v2::V2EfaRuntime& self, int expert_id) {
              return route_to_dict(self.route_expert(expert_id));
+           })
+      .def("build_reference_dispatch_plan",
+           [](const v2::V2EfaRuntime& self, nb::sequence topk_idx_flat,
+              int num_tokens, int payload_bytes, int scale_bytes,
+              bool has_topk_weight) {
+             if (topk_idx_flat.size() !=
+                 static_cast<size_t>(num_tokens * self.config().num_topk)) {
+               throw std::invalid_argument(
+                   "topk_idx_flat length must equal num_tokens * num_topk");
+             }
+             auto topk = sequence_to_i64_vector(topk_idx_flat);
+             return dispatch_plan_to_dict(self.build_reference_dispatch_plan(
+                 topk.data(), num_tokens, payload_bytes, scale_bytes,
+                 has_topk_weight));
            })
       .def("launch_dispatch", &v2::V2EfaRuntime::launch_dispatch)
       .def("launch_combine", &v2::V2EfaRuntime::launch_combine);

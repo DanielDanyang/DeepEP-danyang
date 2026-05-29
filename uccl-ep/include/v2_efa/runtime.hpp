@@ -4,6 +4,7 @@
 #include <string>
 
 #include "v2_efa/descriptor.hpp"
+#include "v2_efa/dispatch_plan.hpp"
 #include "v2_efa/topology.hpp"
 #include "v2_efa/workspace.hpp"
 
@@ -34,6 +35,11 @@ class V2EfaRuntime {
   WorkspacePlan workspace_plan(int num_max_tokens_per_rank) const;
   DescriptorPlanStats worst_case_stats(int num_max_tokens_per_rank) const;
   ExpertRoute route_expert(int expert_id) const;
+  DispatchPlan build_reference_dispatch_plan(const int64_t* topk_idx,
+                                             int num_tokens,
+                                             int payload_bytes,
+                                             int scale_bytes,
+                                             bool has_topk_weight) const;
 
   [[noreturn]] void launch_dispatch() const;
   [[noreturn]] void launch_combine() const;

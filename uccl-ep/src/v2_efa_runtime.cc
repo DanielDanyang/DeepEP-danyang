@@ -82,6 +82,22 @@ ExpertRoute V2EfaRuntime::route_expert(int expert_id) const {
                                     config_.scaleout_rank);
 }
 
+DispatchPlan V2EfaRuntime::build_reference_dispatch_plan(
+    const int64_t* topk_idx, int num_tokens, int payload_bytes, int scale_bytes,
+    bool has_topk_weight) const {
+  DispatchPlanConfig plan_config;
+  plan_config.world_size = config_.world_size;
+  plan_config.num_scaleup_ranks = config_.num_scaleup_ranks;
+  plan_config.local_scaleout_rank = config_.scaleout_rank;
+  plan_config.num_experts = config_.num_experts;
+  plan_config.num_topk = config_.num_topk;
+  plan_config.payload_bytes = payload_bytes;
+  plan_config.scale_bytes = scale_bytes;
+  plan_config.has_topk_weight = has_topk_weight;
+  return uccl::v2_efa::build_reference_dispatch_plan(topk_idx, num_tokens,
+                                                     plan_config);
+}
+
 void V2EfaRuntime::launch_dispatch() const { fail_not_ready(); }
 
 void V2EfaRuntime::launch_combine() const { fail_not_ready(); }

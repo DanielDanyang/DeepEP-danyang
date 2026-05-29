@@ -34,6 +34,16 @@
   - 新增 `include/v2_efa/topology.hpp`，把 global expert 映射到
     `(owner_rank, dst_scaleout_rank, dst_scaleup_lane)`，作为后续 per-expert
     semantic batching 的基础。
+- Phase 2 已开始：
+  - 新增 `include/v2_efa/dispatch_plan.hpp`，提供 CPU reference dispatch planner。
+  - dispatch descriptor 增加 `topk_slot`，用于保留 expanded weights/topk metadata
+    所需的原始 gate 位置。
+  - reference planner 按 `(dst_scaleout_rank, dst_scaleup_lane, expert_id)` 分组，
+    并在 `src_token`、`expanded_slot`、`topk_slot` 连续时合并 segment。
+  - 新增 `uccl-ep/tests/v2_efa_dispatch_plan_test.cc`，覆盖 expert routing、
+    segment coalescing、`-1` topk 跳过和 scale flag。
+  - 本地命令通过：
+    `c++ -std=c++17 -Iuccl-ep/include uccl-ep/tests/v2_efa_dispatch_plan_test.cc uccl-ep/src/v2_efa_runtime.cc -o /tmp/v2_efa_dispatch_plan_test && /tmp/v2_efa_dispatch_plan_test`。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

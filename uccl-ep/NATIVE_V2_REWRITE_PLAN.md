@@ -337,6 +337,13 @@ device enqueue EFA proxy descriptors
 - proxy 支持按 `(dst_rank, expert, lane)` 批量 post。
 - 保留 EFA MR/QP/CQ 管理，删除旧 `low_latency_buffer_idx` 语义。
 
+当前进度：
+
+- 已定义 dispatch/combine descriptor 和 proxy command scaffold。
+- 已实现 CPU reference dispatch planner，用来固定 CUDA/JIT descriptor 语义。
+- dispatch planner 当前按 `(dst_scaleout_rank, dst_scaleup_lane, expert_id)` 做
+  semantic batching，并保留 `topk_slot`。
+
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 
 ### 5. Dispatch direct expanded layout
