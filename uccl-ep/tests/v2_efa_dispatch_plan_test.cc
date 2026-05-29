@@ -340,6 +340,20 @@ int main() {
   assert(resolved_rank3_ops[0].target_lane == 1);
   assert(resolved_rank3_ops[0].remote_addr == 305000);
   assert(resolved_rank3_ops[0].rkey == 789);
+  HostV2TransferD2HQueue<16> resolving_proxy_queue;
+  resolving_proxy_queue.submit(dispatch_commands.commands);
+  resolving_proxy_queue.submit(combine_commands.commands);
+  RecordingResolvedEfaPostSink resolved_proxy_sink;
+  ResolvingEfaPostSink resolving_sink(&endpoints, &resolved_proxy_sink);
+  HostV2TransferProxy<16> resolving_proxy(&resolving_sink);
+  resolving_proxy.add_queue(&resolving_proxy_queue);
+  assert(resolving_proxy.drain_once() == dispatch_commands.commands.size() +
+                                           combine_commands.commands.size());
+  assert(resolved_proxy_sink.ops.size() == dispatch_commands.commands.size() +
+                                             combine_commands.commands.size());
+  assert(resolved_proxy_sink.ops[0].remote_addr == 102000);
+  assert(resolving_proxy_queue.queue().volatile_tail() ==
+         resolving_proxy_queue.queue().volatile_head());
   auto oversized = v2_sink.ops[0];
   oversized.remote_offset = 8188;
   oversized.bytes = 8;

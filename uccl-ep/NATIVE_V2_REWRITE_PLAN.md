@@ -406,6 +406,8 @@ device enqueue EFA proxy descriptors
 - 已新增 `EndpointTable` -> `ResolvedEfaPostOp` 解析层，把 V2 command 里的
   `(target_rank, target_lane, remote_offset)` 解析成真实 EFA remote address / rkey，
   并在 proxy post 前做 window 越界检查。
+- 已新增 `ResolvingEfaPostSink`，让 retained CPU proxy 可以继续只产出 transport-neutral
+  `EfaPostOp`，同时由 sink 负责 endpoint table 解析并转发给真实 EFA verbs sink。
 - 已新增 native V2 `V2TransferCmd`，替代旧 `TransferCmd` 作为后续 command ring wire
   format。它保持 16B/128-bit FIFO slot 宽度，字段来自 V2 descriptor/layout 解析后的
   EFA post 需求，而不是 V1 low-latency bitfield。

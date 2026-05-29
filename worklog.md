@@ -1270,3 +1270,5 @@ README 风格 EP8x2 性能：
     EFA remote address / rkey。
   - 解析时检查 `remote_offset + bytes <= endpoint.bytes`，防止 descriptor/layout bug
     变成越界 RDMA write。
+  - 新增 `ResolvingEfaPostSink`，真实 proxy 可保持 `EfaPostSink` 接口不变，由 sink
+    负责 endpoint table 解析并转发到后续 verbs sink。

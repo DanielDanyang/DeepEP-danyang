@@ -55,10 +55,24 @@ class EfaPostSink {
   virtual void post(const EfaPostOp& op) = 0;
 };
 
+class ResolvedEfaPostSink {
+ public:
+  virtual ~ResolvedEfaPostSink() = default;
+  virtual void post_resolved(const ResolvedEfaPostOp& op) = 0;
+};
+
 class RecordingEfaPostSink final : public EfaPostSink {
  public:
   void post(const EfaPostOp& op) override { ops.push_back(op); }
   std::vector<EfaPostOp> ops;
+};
+
+class RecordingResolvedEfaPostSink final : public ResolvedEfaPostSink {
+ public:
+  void post_resolved(const ResolvedEfaPostOp& op) override {
+    ops.push_back(op);
+  }
+  std::vector<ResolvedEfaPostOp> ops;
 };
 
 class EndpointTable {
@@ -151,6 +165,25 @@ inline std::vector<ResolvedEfaPostOp> resolve_efa_post_ops(
   }
   return resolved;
 }
+
+class ResolvingEfaPostSink final : public EfaPostSink {
+ public:
+  ResolvingEfaPostSink(const EndpointTable* endpoints,
+                       ResolvedEfaPostSink* sink)
+      : endpoints_(endpoints), sink_(sink) {
+    if (endpoints_ == nullptr || sink_ == nullptr) {
+      throw std::invalid_argument("V2 resolving EFA sink input is null");
+    }
+  }
+
+  void post(const EfaPostOp& op) override {
+    sink_->post_resolved(resolve_efa_post_op(op, *endpoints_));
+  }
+
+ private:
+  const EndpointTable* endpoints_ = nullptr;
+  ResolvedEfaPostSink* sink_ = nullptr;
+};
 
 inline EfaPostOp make_efa_post_op_from_packed_v2_transfer(uint64_t first,
                                                           uint64_t second) {
