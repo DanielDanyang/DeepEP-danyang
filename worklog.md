@@ -44,6 +44,10 @@
     segment coalescing、`-1` topk 跳过和 scale flag。
   - 本地命令通过：
     `c++ -std=c++17 -Iuccl-ep/include uccl-ep/tests/v2_efa_dispatch_plan_test.cc uccl-ep/src/v2_efa_runtime.cc -o /tmp/v2_efa_dispatch_plan_test && /tmp/v2_efa_dispatch_plan_test`。
+  - 新增 `include/v2_efa/combine_plan.hpp`，从 dispatch plan 反推 reduced-combine
+    reference descriptor，保留 `expanded_slot`、`reduced_token_slot`、`topk_slot`。
+  - nanobind runtime skeleton 暴露 `build_reference_roundtrip_plan`，用于后续 Python
+    对拍 dispatch/combine descriptor。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

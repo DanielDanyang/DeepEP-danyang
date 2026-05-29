@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 
+#include "v2_efa/combine_plan.hpp"
 #include "v2_efa/descriptor.hpp"
 #include "v2_efa/dispatch_plan.hpp"
 #include "v2_efa/topology.hpp"
@@ -40,6 +41,8 @@ class V2EfaRuntime {
                                              int payload_bytes,
                                              int scale_bytes,
                                              bool has_topk_weight) const;
+  CombinePlan build_reference_combine_plan_from_dispatch(
+      const DispatchPlan& dispatch_plan, int payload_bytes) const;
 
   [[noreturn]] void launch_dispatch() const;
   [[noreturn]] void launch_combine() const;

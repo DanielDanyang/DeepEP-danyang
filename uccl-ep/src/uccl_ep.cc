@@ -123,6 +123,47 @@ nb::dict dispatch_plan_to_dict(const v2::DispatchPlan& plan) {
   return out;
 }
 
+nb::dict combine_segment_to_dict(const v2::CombineSegmentDescriptor& segment) {
+  nb::dict out;
+  out["dst_original_rank"] = segment.dst_original_rank;
+  out["src_scaleout_rank"] = segment.src_scaleout_rank;
+  out["expert_id"] = segment.expert_id;
+  out["count"] = segment.count;
+  out["expanded_slot_begin"] = segment.expanded_slot_begin;
+  out["expanded_slot_index_offset"] = segment.expanded_slot_index_offset;
+  out["topk_slot"] = segment.topk_slot;
+  out["reduced_token_slot"] = segment.reduced_token_slot;
+  out["payload_bytes"] = segment.payload_bytes;
+  out["flags"] = segment.flags;
+  return out;
+}
+
+nb::dict combine_batch_to_dict(const v2::CombineExpertBatch& batch) {
+  nb::dict out;
+  out["dst_original_rank"] = batch.dst_original_rank;
+  out["src_scaleout_rank"] = batch.src_scaleout_rank;
+  out["expert_id"] = batch.expert_id;
+  out["first_segment"] = batch.first_segment;
+  out["num_segments"] = batch.num_segments;
+  out["total_tokens"] = batch.total_tokens;
+  return out;
+}
+
+nb::dict combine_plan_to_dict(const v2::CombinePlan& plan) {
+  nb::list segments;
+  for (const auto& segment : plan.segments) {
+    segments.append(combine_segment_to_dict(segment));
+  }
+  nb::list batches;
+  for (const auto& batch : plan.batches) {
+    batches.append(combine_batch_to_dict(batch));
+  }
+  nb::dict out;
+  out["segments"] = segments;
+  out["batches"] = batches;
+  return out;
+}
+
 std::vector<int64_t> sequence_to_i64_vector(const nb::sequence& values) {
   std::vector<int64_t> out;
   out.reserve(static_cast<size_t>(values.size()));
@@ -204,6 +245,27 @@ NB_MODULE(ep, m) {
              return dispatch_plan_to_dict(self.build_reference_dispatch_plan(
                  topk.data(), num_tokens, payload_bytes, scale_bytes,
                  has_topk_weight));
+           })
+      .def("build_reference_roundtrip_plan",
+           [](const v2::V2EfaRuntime& self, nb::sequence topk_idx_flat,
+              int num_tokens, int dispatch_payload_bytes, int scale_bytes,
+              int combine_payload_bytes, bool has_topk_weight) {
+             if (topk_idx_flat.size() !=
+                 static_cast<size_t>(num_tokens * self.config().num_topk)) {
+               throw std::invalid_argument(
+                   "topk_idx_flat length must equal num_tokens * num_topk");
+             }
+             auto topk = sequence_to_i64_vector(topk_idx_flat);
+             const auto dispatch_plan = self.build_reference_dispatch_plan(
+                 topk.data(), num_tokens, dispatch_payload_bytes, scale_bytes,
+                 has_topk_weight);
+             const auto combine_plan =
+                 self.build_reference_combine_plan_from_dispatch(
+                     dispatch_plan, combine_payload_bytes);
+             nb::dict out;
+             out["dispatch"] = dispatch_plan_to_dict(dispatch_plan);
+             out["combine"] = combine_plan_to_dict(combine_plan);
+             return out;
            })
       .def("launch_dispatch", &v2::V2EfaRuntime::launch_dispatch)
       .def("launch_combine", &v2::V2EfaRuntime::launch_combine);

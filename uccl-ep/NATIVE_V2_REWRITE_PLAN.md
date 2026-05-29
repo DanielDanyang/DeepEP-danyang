@@ -343,6 +343,8 @@ device enqueue EFA proxy descriptors
 - 已实现 CPU reference dispatch planner，用来固定 CUDA/JIT descriptor 语义。
 - dispatch planner 当前按 `(dst_scaleout_rank, dst_scaleup_lane, expert_id)` 做
   semantic batching，并保留 `topk_slot`。
+- 已实现 CPU reference combine planner，从 dispatch plan 反推 reduced-combine
+  descriptor，保留 expanded/reduced slot 和 `topk_slot`。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 

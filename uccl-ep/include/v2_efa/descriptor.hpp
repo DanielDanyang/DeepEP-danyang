@@ -56,6 +56,7 @@ struct CombineSegmentDescriptor {
   int32_t count = 0;
   int32_t expanded_slot_begin = 0;
   int32_t expanded_slot_index_offset = -1;
+  int32_t topk_slot = 0;
   int32_t reduced_token_slot = 0;
   int32_t payload_bytes = 0;
   uint32_t flags = static_cast<uint32_t>(DescriptorFlags::kReduce);

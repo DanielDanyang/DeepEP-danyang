@@ -98,6 +98,15 @@ DispatchPlan V2EfaRuntime::build_reference_dispatch_plan(
                                                      plan_config);
 }
 
+CombinePlan V2EfaRuntime::build_reference_combine_plan_from_dispatch(
+    const DispatchPlan& dispatch_plan, int payload_bytes) const {
+  CombinePlanConfig plan_config;
+  plan_config.dst_original_rank = config_.rank;
+  plan_config.payload_bytes = payload_bytes;
+  return uccl::v2_efa::build_reference_combine_plan_from_dispatch(
+      dispatch_plan, plan_config);
+}
+
 void V2EfaRuntime::launch_dispatch() const { fail_not_ready(); }
 
 void V2EfaRuntime::launch_combine() const { fail_not_ready(); }

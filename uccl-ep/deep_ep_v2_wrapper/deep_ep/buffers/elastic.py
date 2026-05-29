@@ -207,6 +207,26 @@ class ElasticBuffer:
             bool(has_topk_weight),
         )
 
+    def build_reference_roundtrip_plan(
+        self,
+        topk_idx_flat,
+        num_tokens: int,
+        dispatch_payload_bytes: int,
+        combine_payload_bytes: int,
+        scale_bytes: int = 0,
+        has_topk_weight: bool = True,
+    ):
+        if isinstance(topk_idx_flat, torch.Tensor):
+            topk_idx_flat = topk_idx_flat.detach().cpu().reshape(-1).tolist()
+        return self.runtime.build_reference_roundtrip_plan(
+            topk_idx_flat,
+            int(num_tokens),
+            int(dispatch_payload_bytes),
+            int(scale_bytes),
+            int(combine_payload_bytes),
+            bool(has_topk_weight),
+        )
+
     def get_comm_stream(self) -> torch.Stream:
         raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)
 

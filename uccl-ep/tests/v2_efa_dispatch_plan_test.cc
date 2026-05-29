@@ -66,5 +66,16 @@ int main() {
   assert((sparse_plan.segments[0].flags &
           static_cast<uint32_t>(DescriptorFlags::kHasScale)) != 0);
 
+  const auto combine_plan =
+      runtime.build_reference_combine_plan_from_dispatch(plan, 32);
+  assert(combine_plan.batches.size() == 4);
+  assert(combine_plan.segments.size() == 4);
+  assert(combine_plan.batches[2].src_scaleout_rank == 1);
+  assert(combine_plan.batches[2].expert_id == 4);
+  assert(combine_plan.segments[2].expanded_slot_begin == 0);
+  assert(combine_plan.segments[2].topk_slot == 1);
+  assert(combine_plan.segments[2].reduced_token_slot == 0);
+  assert(combine_plan.segments[2].count == 2);
+
   return 0;
 }
