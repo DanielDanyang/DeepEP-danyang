@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-#include "v2_efa/proxy_queue.cuh"
+#include "v2_efa/descriptor.hpp"
 
 namespace uccl::v2_efa {
 
@@ -57,25 +57,29 @@ struct V2TransferCmd {
 static_assert(sizeof(V2TransferCmd) == 64,
               "V2TransferCmd must stay one 64-byte cache line");
 
+struct DispatchTransferLayout {
+  uint64_t local_payload_base = 0;
+  uint64_t remote_payload_base = 0;
+  uint64_t remote_signal_base = 0;
+  uint32_t src_token_stride = 0;
+  uint32_t expanded_slot_stride = 0;
+  uint32_t batch_payload_stride = 0;
+  uint32_t signal_stride = sizeof(uint32_t);
+};
+
+struct CombineTransferLayout {
+  uint64_t local_payload_base = 0;
+  uint64_t remote_payload_base = 0;
+  uint64_t remote_signal_base = 0;
+  uint32_t expanded_slot_stride = 0;
+  uint32_t reduced_token_stride = 0;
+  uint32_t batch_payload_stride = 0;
+  uint32_t signal_stride = sizeof(uint32_t);
+};
+
 inline bool is_v2_transfer_cmd(const V2TransferCmd& cmd) {
   return cmd.magic == kV2TransferCmdMagic &&
          cmd.version == kV2TransferCmdVersion;
-}
-
-inline V2TransferCmdKind proxy_kind_to_v2_transfer_kind(uint32_t kind) {
-  if (kind == static_cast<uint32_t>(ProxyCommandKind::kDispatchPayload)) {
-    return V2TransferCmdKind::kDispatchPayload;
-  }
-  if (kind == static_cast<uint32_t>(ProxyCommandKind::kDispatchSignal)) {
-    return V2TransferCmdKind::kDispatchSignal;
-  }
-  if (kind == static_cast<uint32_t>(ProxyCommandKind::kCombinePayload)) {
-    return V2TransferCmdKind::kCombinePayload;
-  }
-  if (kind == static_cast<uint32_t>(ProxyCommandKind::kCombineSignal)) {
-    return V2TransferCmdKind::kCombineSignal;
-  }
-  throw std::invalid_argument("unknown proxy command kind");
 }
 
 inline uint32_t v2_transfer_flags(V2TransferCmdKind kind) {
@@ -96,92 +100,106 @@ inline uint32_t v2_transfer_flags(V2TransferCmdKind kind) {
   throw std::invalid_argument("unknown V2 transfer command kind");
 }
 
-inline V2TransferCmd make_v2_transfer_cmd(const ProxyCommand& command,
-                                          uint32_t expert_id = 0,
-                                          uint32_t count = 0) {
-  const auto kind = proxy_kind_to_v2_transfer_kind(command.kind);
+inline V2TransferCmd make_v2_transfer_cmd(V2TransferCmdKind kind,
+                                          uint32_t target_rank,
+                                          uint32_t target_lane,
+                                          uint32_t descriptor_index,
+                                          uint32_t batch_index,
+                                          uint32_t expert_id,
+                                          uint32_t count,
+                                          uint32_t bytes,
+                                          uint32_t signal_value,
+                                          uint64_t local_offset,
+                                          uint64_t remote_offset) {
   V2TransferCmd out;
   out.kind = static_cast<uint8_t>(kind);
-  out.target_rank = static_cast<uint16_t>(command.target_rank);
-  out.target_lane = static_cast<uint16_t>(command.target_lane);
+  out.target_rank = static_cast<uint16_t>(target_rank);
+  out.target_lane = static_cast<uint16_t>(target_lane);
   out.flags = v2_transfer_flags(kind);
-  out.descriptor_index = command.descriptor_index;
-  out.batch_index = command.batch_index;
+  out.descriptor_index = descriptor_index;
+  out.batch_index = batch_index;
   out.expert_id = expert_id;
   out.count = count;
-  out.bytes = command.bytes;
-  out.signal_value = command.signal_value;
-  out.local_offset = command.local_offset;
-  out.remote_offset = command.remote_offset;
+  out.bytes = bytes;
+  out.signal_value = signal_value;
+  out.local_offset = local_offset;
+  out.remote_offset = remote_offset;
   return out;
 }
 
 inline V2TransferCmd make_v2_dispatch_payload_cmd(
     const DispatchSegmentDescriptor& segment, uint32_t segment_idx,
-    uint32_t batch_idx, const DispatchProxyLayout& layout) {
+    uint32_t batch_idx, const DispatchTransferLayout& layout) {
   return make_v2_transfer_cmd(
-      make_dispatch_payload_command(segment, segment_idx, batch_idx, layout),
+      V2TransferCmdKind::kDispatchPayload,
+      static_cast<uint32_t>(segment.dst_scaleout_rank),
+      static_cast<uint32_t>(segment.dst_scaleup_lane),
+      segment_idx, batch_idx,
       static_cast<uint32_t>(segment.expert_id),
-      static_cast<uint32_t>(segment.count));
+      static_cast<uint32_t>(segment.count),
+      static_cast<uint32_t>(segment.count * segment.payload_bytes),
+      /*signal_value=*/0,
+      layout.local_payload_base +
+          static_cast<uint64_t>(segment.src_token_begin) * layout.src_token_stride,
+      layout.remote_payload_base +
+          static_cast<uint64_t>(batch_idx) * layout.batch_payload_stride +
+          static_cast<uint64_t>(segment.expanded_slot_begin) *
+              layout.expanded_slot_stride);
 }
 
 inline V2TransferCmd make_v2_dispatch_signal_cmd(
     const DispatchExpertBatch& batch, uint32_t batch_idx,
-    const DispatchProxyLayout& layout) {
+    const DispatchTransferLayout& layout) {
   return make_v2_transfer_cmd(
-      make_dispatch_signal_command(batch, batch_idx, layout),
+      V2TransferCmdKind::kDispatchSignal,
+      static_cast<uint32_t>(batch.dst_scaleout_rank),
+      static_cast<uint32_t>(batch.dst_scaleup_lane),
+      static_cast<uint32_t>(batch.first_segment), batch_idx,
       static_cast<uint32_t>(batch.expert_id),
-      static_cast<uint32_t>(batch.total_tokens));
+      static_cast<uint32_t>(batch.total_tokens),
+      sizeof(uint32_t),
+      static_cast<uint32_t>(batch.total_tokens),
+      /*local_offset=*/0,
+      layout.remote_signal_base +
+          static_cast<uint64_t>(batch_idx) * layout.signal_stride);
 }
 
 inline V2TransferCmd make_v2_combine_payload_cmd(
     const CombineSegmentDescriptor& segment, uint32_t segment_idx,
-    uint32_t batch_idx, const CombineProxyLayout& layout) {
+    uint32_t batch_idx, const CombineTransferLayout& layout) {
   return make_v2_transfer_cmd(
-      make_combine_payload_command(segment, segment_idx, batch_idx, layout),
+      V2TransferCmdKind::kCombinePayload,
+      static_cast<uint32_t>(segment.dst_original_rank),
+      /*target_lane=*/0,
+      segment_idx, batch_idx,
       static_cast<uint32_t>(segment.expert_id),
-      static_cast<uint32_t>(segment.count));
+      static_cast<uint32_t>(segment.count),
+      static_cast<uint32_t>(segment.count * segment.payload_bytes),
+      /*signal_value=*/0,
+      layout.local_payload_base +
+          static_cast<uint64_t>(segment.expanded_slot_begin) *
+              layout.expanded_slot_stride,
+      layout.remote_payload_base +
+          static_cast<uint64_t>(batch_idx) * layout.batch_payload_stride +
+          static_cast<uint64_t>(segment.reduced_token_slot) *
+              layout.reduced_token_stride);
 }
 
 inline V2TransferCmd make_v2_combine_signal_cmd(
     const CombineExpertBatch& batch, uint32_t batch_idx,
-    const CombineProxyLayout& layout) {
+    const CombineTransferLayout& layout) {
   return make_v2_transfer_cmd(
-      make_combine_signal_command(batch, batch_idx, layout),
+      V2TransferCmdKind::kCombineSignal,
+      static_cast<uint32_t>(batch.dst_original_rank),
+      /*target_lane=*/0,
+      static_cast<uint32_t>(batch.first_segment), batch_idx,
       static_cast<uint32_t>(batch.expert_id),
-      static_cast<uint32_t>(batch.total_tokens));
-}
-
-inline ProxyCommand v2_transfer_cmd_to_proxy_command(
-    const V2TransferCmd& command) {
-  if (!is_v2_transfer_cmd(command)) {
-    throw std::invalid_argument("invalid V2 transfer command header");
-  }
-  ProxyCommand out;
-  out.kind = 0;
-  switch (static_cast<V2TransferCmdKind>(command.kind)) {
-    case V2TransferCmdKind::kDispatchPayload:
-      out.kind = static_cast<uint32_t>(ProxyCommandKind::kDispatchPayload);
-      break;
-    case V2TransferCmdKind::kDispatchSignal:
-      out.kind = static_cast<uint32_t>(ProxyCommandKind::kDispatchSignal);
-      break;
-    case V2TransferCmdKind::kCombinePayload:
-      out.kind = static_cast<uint32_t>(ProxyCommandKind::kCombinePayload);
-      break;
-    case V2TransferCmdKind::kCombineSignal:
-      out.kind = static_cast<uint32_t>(ProxyCommandKind::kCombineSignal);
-      break;
-  }
-  out.descriptor_index = command.descriptor_index;
-  out.batch_index = command.batch_index;
-  out.bytes = command.bytes;
-  out.signal_value = command.signal_value;
-  out.target_rank = command.target_rank;
-  out.target_lane = command.target_lane;
-  out.local_offset = command.local_offset;
-  out.remote_offset = command.remote_offset;
-  return out;
+      static_cast<uint32_t>(batch.total_tokens),
+      sizeof(uint32_t),
+      static_cast<uint32_t>(batch.total_tokens),
+      /*local_offset=*/0,
+      layout.remote_signal_base +
+          static_cast<uint64_t>(batch_idx) * layout.signal_stride);
 }
 
 struct V2TransferQueueView {

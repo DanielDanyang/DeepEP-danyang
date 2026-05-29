@@ -1,7 +1,6 @@
 #pragma once
 
 #include "v2_efa/descriptor.hpp"
-#include "v2_efa/proxy_queue.cuh"
 #include "v2_efa/transfer_cmd.hpp"
 
 namespace uccl::v2_efa {
@@ -133,40 +132,12 @@ __global__ void v2_efa_dispatch_descriptor_kernel(
   counters[kDescriptorCounterOverflow] = 0;
 }
 
-__global__ void v2_efa_dispatch_enqueue_proxy_kernel(
-    const DispatchSegmentDescriptor* segments,
-    const DispatchExpertBatch* batches, int num_batches,
-    ProxyQueueView queue, DispatchProxyLayout layout) {
-  // Device-side reference enqueue. The high-throughput version will split
-  // batches across CTAs/warps, but it must preserve this command ordering:
-  // all payload writes for a batch first, then one signal command.
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-
-  for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-    const auto& batch = batches[batch_idx];
-    for (int i = 0; i < batch.num_segments; ++i) {
-      const auto segment_idx =
-          static_cast<uint32_t>(batch.first_segment + i);
-      enqueue_proxy_command(
-          queue, make_dispatch_payload_command(
-                     segments[segment_idx], segment_idx,
-                     static_cast<uint32_t>(batch_idx), layout));
-    }
-    enqueue_proxy_command(
-        queue, make_dispatch_signal_command(
-                   batch, static_cast<uint32_t>(batch_idx), layout));
-  }
-}
-
 __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
     const DispatchSegmentDescriptor* segments,
     const DispatchExpertBatch* batches, int num_batches,
-    V2TransferQueueView queue, DispatchProxyLayout layout) {
+    V2TransferQueueView queue, DispatchTransferLayout layout) {
   // Preferred native V2 command-ring path. It writes 64-byte V2TransferCmd
-  // entries directly instead of round-tripping through the legacy command
-  // format or the temporary ProxyCommand host representation.
+  // entries directly.
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }

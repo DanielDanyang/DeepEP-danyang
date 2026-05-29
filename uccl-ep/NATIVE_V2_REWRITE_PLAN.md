@@ -70,7 +70,7 @@ V2 semantic descriptors
         v
 AWS EFA proxy transport
         |
-        +--> device enqueue batched proxy commands
+        +--> device enqueue native V2 transfer commands
         +--> host proxy posts EFA writes/sends
         +--> receiver writes directly into V2 layout
 ```
@@ -148,7 +148,9 @@ uccl-ep/
   include/v2_efa/
     descriptor.hpp
     runtime.hpp
-    proxy_queue.cuh
+    transfer_cmd.hpp
+    transfer_cmd_plan.hpp
+    transfer_queue_host.hpp
     dispatch_jit.cuh
     combine_jit.cuh
     workspace.hpp
@@ -272,7 +274,7 @@ receiver 端要直接落到 V2 reduced-combine layout，让官方 V2 reduce epil
 - `csrc/kernels/elastic/dispatch.hpp`
   - 复制其 `DispatchRuntime` 的 JIT 参数组织方式。
   - 保持 `BufferLayout` / `TokenLayout` / `num_sms` / `hidden` / `num_topk` 等编译期参数。
-  - 将 Gin device communication include 替换为 `v2_efa/proxy_queue.cuh`。
+  - 将 Gin device communication include 替换为 `v2_efa/transfer_cmd.hpp`。
 - `csrc/kernels/elastic/combine.hpp`
   - 同样保持 `CombineRuntime` / `CombineReduceEpilogueRuntime` 的 JIT 编译模型。
   - 替换跨机传输段，不替换 V2 reduce 语义。
@@ -339,7 +341,7 @@ device enqueue EFA proxy descriptors
 
 当前进度：
 
-- 已定义 dispatch/combine descriptor 和 proxy command scaffold。
+- 已定义 dispatch/combine descriptor 和 native V2 transfer command scaffold。
 - 已实现 CPU reference dispatch planner，用来固定 CUDA/JIT descriptor 语义。
 - dispatch planner 当前按 `(dst_scaleout_rank, dst_scaleup_lane, expert_id)` 做
   semantic batching，并保留 `topk_slot`。
@@ -349,13 +351,13 @@ device enqueue EFA proxy descriptors
   serial expert scan 并行化并接入 DeepEP V2 `hybrid_dispatch` JIT。
 - `combine_jit.cuh` 已实现从 dispatch descriptor 反推 combine descriptor 的
   device-side reference generator，后续需要改为直接读取 V2 forward metadata。
-- 已新增 reference proxy command planner，将 descriptor 转成 payload/signal command，
-  后续 device enqueue 和 host proxy command format 都应对齐这套语义。
-- 已新增 device-side reference enqueue kernel，把 dispatch/combine descriptor 写入
-  `ProxyQueueView`。当前是 serial reference 版本，后续需要并行化并接到 retained
-  EFA host proxy。
+- 已新增 native transfer command planner，将 descriptor 直接转成
+  `V2TransferCmd` payload/signal command；不再保留旧 `ProxyCommand` 过渡层。
+- 已新增 device-side transfer enqueue kernel，把 dispatch/combine descriptor 写入
+  `V2TransferQueueView`。当前是 serial reference 版本，后续需要并行化并接到
+  retained EFA host proxy。
 - 已新增 host loopback executor，用本地 byte buffers 验证 payload copy 和 signal write。
-- proxy command 已包含 signal value 和目标 rank/lane；layout 里有
+- transfer command 已包含 signal value 和目标 rank/lane；layout 里有
   `batch_payload_stride`，用于隔离 per-expert semantic batch 的远端 payload 区域。
 - 已新增 fixed-capacity host queue scaffold，模拟 host proxy 从 command ring drain
   commands；下一步可以把这个 queue adapter 接到 retained EFA posting path。
@@ -363,9 +365,9 @@ device enqueue EFA proxy descriptors
   应实现这个接口，避免把 native V2 command 再编码回旧协议。
 - 已新增 native V2 `V2TransferCmd`，替代旧 `TransferCmd` 作为后续 command ring wire
   format。它保留 V2 expert/batch/descriptor 语义和 64-bit offsets。
-- JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。`ProxyCommand`
-  保留为 reference/adapter 层，真实 native V2 command ring 应逐步切到
-  `V2TransferCmd`。
+- JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。旧
+  `ProxyCommand` enqueue/reference 路径已删除，host transfer queue 和 EFA adapter
+  都直接消费 `V2TransferCmd`。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 
@@ -401,7 +403,7 @@ device enqueue EFA proxy descriptors
 - 观察：
   - 每 rank descriptor 数。
   - 每 descriptor 平均 payload。
-  - proxy command 合并率。
+  - transfer command 合并率。
   - EFA CQ/post 饱和度。
   - 每 NIC/rail 实际流量。
 - 目标不是单纯做大块传输，而是复刻 UCCL EP 的 per-expert / low-latency semantic batching。

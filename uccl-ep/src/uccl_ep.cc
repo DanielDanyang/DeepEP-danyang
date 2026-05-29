@@ -5,8 +5,8 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
-#include "v2_efa/proxy_queue.cuh"
 #include "v2_efa/runtime.hpp"
+#include "v2_efa/transfer_cmd.hpp"
 
 namespace nb = nanobind;
 namespace v2 = uccl::v2_efa;
@@ -277,7 +277,7 @@ NB_MODULE(ep, m) {
     out["dispatch_batch"] = sizeof(v2::DispatchExpertBatch);
     out["combine_segment"] = sizeof(v2::CombineSegmentDescriptor);
     out["combine_batch"] = sizeof(v2::CombineExpertBatch);
-    out["proxy_command"] = sizeof(v2::ProxyCommand);
+    out["transfer_cmd"] = sizeof(v2::V2TransferCmd);
     return out;
   });
 

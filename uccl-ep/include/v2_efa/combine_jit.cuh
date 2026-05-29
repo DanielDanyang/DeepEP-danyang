@@ -1,7 +1,6 @@
 #pragma once
 
 #include "v2_efa/descriptor.hpp"
-#include "v2_efa/proxy_queue.cuh"
 #include "v2_efa/transfer_cmd.hpp"
 
 namespace uccl::v2_efa {
@@ -84,35 +83,9 @@ __global__ void v2_efa_combine_descriptor_kernel(
   counters[kDescriptorCounterOverflow] = 0;
 }
 
-__global__ void v2_efa_combine_enqueue_proxy_kernel(
-    const CombineSegmentDescriptor* segments, const CombineExpertBatch* batches,
-    int num_batches, ProxyQueueView queue, CombineProxyLayout layout) {
-  // Device-side reference enqueue. As with dispatch, the final version can
-  // parallelize payload commands as long as signal commands remain after their
-  // corresponding batch payloads.
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-
-  for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-    const auto& batch = batches[batch_idx];
-    for (int i = 0; i < batch.num_segments; ++i) {
-      const auto segment_idx =
-          static_cast<uint32_t>(batch.first_segment + i);
-      enqueue_proxy_command(
-          queue, make_combine_payload_command(
-                     segments[segment_idx], segment_idx,
-                     static_cast<uint32_t>(batch_idx), layout));
-    }
-    enqueue_proxy_command(
-        queue, make_combine_signal_command(
-                   batch, static_cast<uint32_t>(batch_idx), layout));
-  }
-}
-
 __global__ void v2_efa_combine_enqueue_transfer_kernel(
     const CombineSegmentDescriptor* segments, const CombineExpertBatch* batches,
-    int num_batches, V2TransferQueueView queue, CombineProxyLayout layout) {
+    int num_batches, V2TransferQueueView queue, CombineTransferLayout layout) {
   // Preferred native V2 command-ring path. Signal commands are emitted after
   // all payload commands for the same semantic batch.
   if (blockIdx.x != 0 || threadIdx.x != 0) {

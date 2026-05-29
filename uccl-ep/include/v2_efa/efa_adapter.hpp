@@ -4,7 +4,6 @@
 #include <stdexcept>
 #include <vector>
 
-#include "v2_efa/proxy_queue_host.hpp"
 #include "v2_efa/transfer_cmd.hpp"
 
 namespace uccl::v2_efa {
@@ -76,7 +75,10 @@ class EndpointTable {
   std::vector<EfaRemoteEndpoint> endpoints_;
 };
 
-inline EfaPostOp make_efa_post_op(const ProxyCommand& command) {
+inline EfaPostOp make_efa_post_op(const V2TransferCmd& command) {
+  if (!is_v2_transfer_cmd(command)) {
+    throw std::invalid_argument("invalid V2 transfer command header");
+  }
   EfaPostOp op;
   op.target_rank = command.target_rank;
   op.target_lane = command.target_lane;
@@ -87,28 +89,19 @@ inline EfaPostOp make_efa_post_op(const ProxyCommand& command) {
   op.descriptor_index = command.descriptor_index;
   op.batch_index = command.batch_index;
 
-  if (is_payload_command(command.kind)) {
+  const auto kind = static_cast<V2TransferCmdKind>(command.kind);
+  if (kind == V2TransferCmdKind::kDispatchPayload ||
+      kind == V2TransferCmdKind::kCombinePayload) {
     op.kind = EfaPostOpKind::kWrite;
     return op;
   }
-  if (is_signal_command(command.kind)) {
+  if (kind == V2TransferCmdKind::kDispatchSignal ||
+      kind == V2TransferCmdKind::kCombineSignal) {
     op.kind = EfaPostOpKind::kSignalWrite;
     op.bytes = sizeof(uint32_t);
     return op;
   }
-  throw std::invalid_argument("unknown proxy command kind");
-}
-
-inline EfaPostOp make_efa_post_op(const V2TransferCmd& command) {
-  return make_efa_post_op(v2_transfer_cmd_to_proxy_command(command));
-}
-
-inline void drain_host_queue_to_efa_posts(const HostProxyQueue& queue,
-                                          EfaPostSink& sink) {
-  const auto commands = queue.snapshot();
-  for (const auto& command : commands) {
-    sink.post(make_efa_post_op(make_v2_transfer_cmd(command)));
-  }
+  throw std::invalid_argument("unknown V2 transfer command kind");
 }
 
 inline void drain_v2_transfer_cmds_to_efa_posts(

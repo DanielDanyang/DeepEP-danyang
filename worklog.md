@@ -27,7 +27,7 @@
     workspace layout。
   - 新增 `include/v2_efa/runtime.hpp` 与 `src/v2_efa_runtime.cc`，提供
     `V2EfaRuntime` 配置、worst-case descriptor stats 和 workspace plan。
-  - 新增 `include/v2_efa/proxy_queue.cuh`、`dispatch_jit.cuh`、`combine_jit.cuh`
+  - 新增 `include/v2_efa/transfer_cmd.hpp`、`dispatch_jit.cuh`、`combine_jit.cuh`
     作为后续 JIT kernel 接入点；目前只放 scaffold，不再引入 V1 static kernel。
   - Python `ElasticBuffer` 现在可以构造 runtime 并查询 status/workspace plan，但
     dispatch/combine 仍明确 fail-fast。
@@ -54,21 +54,21 @@
   - `combine_jit.cuh` 已能从 dispatch descriptor 生成 roundtrip combine descriptor，
     用于后续和 V2 forward metadata 版本对拍。
   - workspace counter 从 2 words 扩展到 3 words：segments、batches、overflow。
-  - 新增 `include/v2_efa/proxy_command_plan.hpp`，把 dispatch/combine descriptor
-    转成 reference proxy payload/signal command，并在本地 C++ 测试里校验 offset。
-  - proxy layout 和 `make_*_command` helper 已移动到 `proxy_queue.cuh`，host reference
-    planner 和 device enqueue kernel 共用同一套 offset 规则。
-  - 新增 `v2_efa_dispatch_enqueue_proxy_kernel` 和 `v2_efa_combine_enqueue_proxy_kernel`，
-    现在 CUDA/JIT 侧已经具备 descriptor -> proxy queue 的 reference enqueue 路径。
-  - 新增 `include/v2_efa/proxy_loopback.hpp`，host loopback executor 可以按 proxy command
+  - 新增 `include/v2_efa/transfer_cmd_plan.hpp`，把 dispatch/combine descriptor
+    直接转成 native V2 payload/signal transfer command，并在本地 C++ 测试里校验 offset。
+  - transfer layout 和 `make_v2_*_cmd` helper 已移动到 `transfer_cmd.hpp`，host planner
+    和 device enqueue kernel 共用同一套 offset 规则。
+  - 新增 `v2_efa_dispatch_enqueue_transfer_kernel` 和
+    `v2_efa_combine_enqueue_transfer_kernel`，现在 CUDA/JIT 侧已经具备
+    descriptor -> V2 transfer queue 的 reference enqueue 路径。
+  - 新增 `include/v2_efa/transfer_loopback.hpp`，host loopback executor 可以按 transfer command
     在本地 byte buffers 上执行 payload copy 和 signal write。
-  - `ProxyCommand` 增加 `signal_value`、`target_rank`、`target_lane`；layout 增加
-    `batch_payload_stride`，避免不同 expert/batch 的 expanded slot 0 写到同一 remote
-    offset。
-  - 新增 `include/v2_efa/proxy_queue_host.hpp`，提供 fixed-capacity host queue
-    scaffold，可以模拟 device 写入 `ProxyQueueView` 后由 host proxy drain 到 loopback
+  - `V2TransferCmd` 包含 `signal_value`、`target_rank`、`target_lane`；layout 包含
+    `batch_payload_stride`，避免不同 expert/batch 的 expanded slot 0 写到同一 remote offset。
+  - 新增 `include/v2_efa/transfer_queue_host.hpp`，提供 fixed-capacity host queue
+    scaffold，可以模拟 device 写入 `V2TransferQueueView` 后由 host proxy drain 到 loopback
     executor。
-  - 新增 `include/v2_efa/efa_adapter.hpp`，把 native V2 `ProxyCommand` 转成
+  - 新增 `include/v2_efa/efa_adapter.hpp`，把 native V2 `V2TransferCmd` 转成
     transport-neutral `EfaPostOp`，并提供 `RecordingEfaPostSink` 和 endpoint table
     scaffold。真实 EFA verbs sink 后续实现这个接口，不回退到旧 `TransferCmd` 协议。
   - 新增 `include/v2_efa/transfer_cmd.hpp`，定义 64-byte native V2 `V2TransferCmd`：
@@ -81,6 +81,14 @@
     `v2_efa_combine_enqueue_transfer_kernel`。
   - `V2TransferCmd` helper 现在可直接从 dispatch/combine descriptor 生成 command，
     保留 expert id 和 token count。
+  - 已删除旧的 `ProxyCommand` 过渡/reference 路径：
+    `proxy_queue.cuh`、`proxy_command_plan.hpp`、`proxy_loopback.hpp`、
+    `proxy_queue_host.hpp` 全部移除；host queue、loopback 和 EFA adapter 都只接受
+    `V2TransferCmd`。
+  - 本地 roundtrip 测试通过：
+    `python -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py uccl-ep/deep_ep_v2_wrapper/deep_ep/proxy_transport.py uccl-ep/deep_ep_v2_wrapper/deep_ep/__init__.py`。
+  - 本地 command/helper/host queue 测试通过：
+    `c++ -std=c++17 -Iuccl-ep/include uccl-ep/tests/v2_efa_dispatch_plan_test.cc uccl-ep/src/v2_efa_runtime.cc -o /tmp/v2_efa_dispatch_plan_test && /tmp/v2_efa_dispatch_plan_test`。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

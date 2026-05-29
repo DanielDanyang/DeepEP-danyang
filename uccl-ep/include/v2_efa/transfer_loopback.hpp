@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "v2_efa/proxy_queue.cuh"
+#include "v2_efa/transfer_cmd.hpp"
 
 namespace uccl::v2_efa {
 
@@ -24,27 +24,31 @@ struct LoopbackStats {
   uint64_t payload_bytes = 0;
 };
 
-inline bool is_payload_command(uint32_t kind) {
-  return kind == static_cast<uint32_t>(ProxyCommandKind::kDispatchPayload) ||
-         kind == static_cast<uint32_t>(ProxyCommandKind::kCombinePayload);
+inline bool is_transfer_payload_command(const V2TransferCmd& command) {
+  return command.kind == static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload) ||
+         command.kind == static_cast<uint8_t>(V2TransferCmdKind::kCombinePayload);
 }
 
-inline bool is_signal_command(uint32_t kind) {
-  return kind == static_cast<uint32_t>(ProxyCommandKind::kDispatchSignal) ||
-         kind == static_cast<uint32_t>(ProxyCommandKind::kCombineSignal);
+inline bool is_transfer_signal_command(const V2TransferCmd& command) {
+  return command.kind == static_cast<uint8_t>(V2TransferCmdKind::kDispatchSignal) ||
+         command.kind == static_cast<uint8_t>(V2TransferCmdKind::kCombineSignal);
 }
 
 inline void check_loopback_range(const char* name, uint64_t offset,
                                  uint32_t bytes, size_t capacity) {
   if (offset > capacity || static_cast<uint64_t>(bytes) > capacity - offset) {
-    throw std::out_of_range(std::string(name) + " proxy command range");
+    throw std::out_of_range(std::string(name) + " transfer command range");
   }
 }
 
-inline void execute_loopback_proxy_command(const ProxyCommand& command,
-                                           const LoopbackMemoryView& memory,
-                                           LoopbackStats* stats = nullptr) {
-  if (is_payload_command(command.kind)) {
+inline void execute_loopback_transfer_cmd(const V2TransferCmd& command,
+                                          const LoopbackMemoryView& memory,
+                                          LoopbackStats* stats = nullptr) {
+  if (!is_v2_transfer_cmd(command)) {
+    throw std::invalid_argument("invalid V2 transfer command header");
+  }
+
+  if (is_transfer_payload_command(command)) {
     if (memory.local == nullptr || memory.remote == nullptr) {
       throw std::invalid_argument("loopback payload memory must not be null");
     }
@@ -61,7 +65,7 @@ inline void execute_loopback_proxy_command(const ProxyCommand& command,
     return;
   }
 
-  if (is_signal_command(command.kind)) {
+  if (is_transfer_signal_command(command)) {
     if (memory.remote == nullptr) {
       throw std::invalid_argument("loopback signal memory must not be null");
     }
@@ -75,15 +79,15 @@ inline void execute_loopback_proxy_command(const ProxyCommand& command,
     return;
   }
 
-  throw std::invalid_argument("unknown proxy command kind");
+  throw std::invalid_argument("unknown V2 transfer command kind");
 }
 
-inline LoopbackStats execute_loopback_proxy_commands(
-    const std::vector<ProxyCommand>& commands,
+inline LoopbackStats execute_loopback_transfer_cmds(
+    const std::vector<V2TransferCmd>& commands,
     const LoopbackMemoryView& memory) {
   LoopbackStats stats;
   for (const auto& command : commands) {
-    execute_loopback_proxy_command(command, memory, &stats);
+    execute_loopback_transfer_cmd(command, memory, &stats);
   }
   return stats;
 }
