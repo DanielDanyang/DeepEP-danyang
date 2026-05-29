@@ -1299,3 +1299,11 @@ README 风格 EP8x2 性能：
   - `V2EfaRuntime` 和 Python wrapper 新增 `build_dispatch_jit_plan` /
     `build_combine_jit_plan`。当前先验证 source/launch plan，下一步再接
     `deep_ep::jit::compiler->build` 和真实 launch。
+- 继续接入 DeepEP JIT compiler bridge：
+  - 新增 `src/v2_efa_deep_ep_jit.cc`。
+  - 新增 Python `deep_ep.init_deep_ep_jit(...)`，调用 native bridge 初始化
+    DeepEP JIT root、CUDA root 和 NCCL root。
+  - 新增 `compile_dispatch_jit` / `compile_combine_jit`，生成 V2 EFA JIT plan 后调用
+    `deep_ep::jit::compiler->build()` 编译到 cubin cache。
+  - 当前还没有保存 `KernelRuntime` handle 或 launch kernel；下一步要把 compile
+    结果接到 `jit::LaunchRuntime`/`launch_kernel`。

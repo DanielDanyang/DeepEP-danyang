@@ -143,9 +143,17 @@ if __name__ == "__main__":
     # Native V2 rewrite: do not glob ./src/*.cu. The removed V1 implementation
     # used static internode/intranode/layout kernels, and globbing would
     # silently pull those paths back into the extension if they reappeared.
-    sources = ["./src/uccl_ep.cc", "./src/v2_efa_runtime.cc"]
+    sources = [
+        "./src/uccl_ep.cc",
+        "./src/v2_efa_runtime.cc",
+        "./src/v2_efa_deep_ep_jit.cc",
+    ]
     libraries = ["ibverbs", "nl-3", "nl-route-3"]
-    include_dirs = [PROJECT_ROOT / "include", PROJECT_ROOT / ".." / "include"]
+    include_dirs = [
+        PROJECT_ROOT / "include",
+        PROJECT_ROOT / ".." / "deep_ep" / "include",
+        PROJECT_ROOT / ".." / "include",
+    ]
     # Nanobind stable-ABI bindings
     nb_dir = Path(nanobind.__file__).parent
     include_dirs.extend([nb_dir / "include", nb_dir / "ext" / "robin_map" / "include"])

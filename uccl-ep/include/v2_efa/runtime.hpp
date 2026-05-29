@@ -26,6 +26,12 @@ struct RuntimeConfig {
   int num_sms = 0;
 };
 
+void init_deep_ep_jit_bridge(const std::string& library_root_path,
+                             const std::string& cuda_home_path,
+                             const std::string& nccl_root_path);
+bool is_deep_ep_jit_bridge_initialized();
+void compile_v2_efa_jit_plan(const V2EfaJitLaunchPlan& plan);
+
 class V2EfaRuntime {
  public:
   explicit V2EfaRuntime(RuntimeConfig config);

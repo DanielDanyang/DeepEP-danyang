@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -272,6 +273,33 @@ class ElasticBuffer:
             str(uccl_include_path),
         )
 
+    def compile_dispatch_jit(
+        self,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels_per_sm: int = 1,
+        scale_bytes: int = 0,
+        has_topk_weight: bool = True,
+        cached_mode: bool = False,
+        deterministic: bool = False,
+        do_cpu_sync: bool = False,
+        smem_bytes: int = 228 * 1024,
+        uccl_include_path: str = "",
+    ):
+        tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        return self.runtime.compile_dispatch_jit(
+            tokens,
+            int(num_channels_per_sm),
+            int(scale_bytes),
+            bool(has_topk_weight),
+            bool(cached_mode),
+            bool(deterministic),
+            bool(do_cpu_sync),
+            int(smem_bytes),
+            str(uccl_include_path),
+        )
+
     def build_combine_jit_plan(
         self,
         num_max_tokens_per_rank: Optional[int] = None,
@@ -284,6 +312,29 @@ class ElasticBuffer:
     ):
         tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
         return self.runtime.build_combine_jit_plan(
+            tokens,
+            int(num_channels),
+            int(payload_bytes),
+            bool(use_expanded_layout),
+            bool(allow_multiple_reduction),
+            int(smem_bytes),
+            str(uccl_include_path),
+        )
+
+    def compile_combine_jit(
+        self,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels: int = 1,
+        payload_bytes: int = 0,
+        use_expanded_layout: bool = True,
+        allow_multiple_reduction: bool = True,
+        smem_bytes: int = 228 * 1024,
+        uccl_include_path: str = "",
+    ):
+        tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        return self.runtime.compile_combine_jit(
             tokens,
             int(num_channels),
             int(payload_bytes),

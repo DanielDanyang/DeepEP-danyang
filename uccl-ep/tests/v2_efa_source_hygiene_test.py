@@ -40,10 +40,12 @@ def test_extension_build_is_v2_only() -> None:
     setup_py = read("setup.py")
     makefile = read("Makefile")
 
-    assert 'sources = ["./src/uccl_ep.cc", "./src/v2_efa_runtime.cc"]' in setup_py
+    assert '"./src/uccl_ep.cc"' in setup_py
+    assert '"./src/v2_efa_runtime.cc"' in setup_py
+    assert '"./src/v2_efa_deep_ep_jit.cc"' in setup_py
     assert "glob(\"./src/*.cu\")" not in setup_py
     assert "SRC_CU  :=" in makefile
-    assert "SRC_CC_LIB := src/v2_efa_runtime.cc" in makefile
+    assert "SRC_CC_LIB := src/v2_efa_runtime.cc src/v2_efa_deep_ep_jit.cc" in makefile
 
     forbidden_build_sources = [
         "internode.cu",

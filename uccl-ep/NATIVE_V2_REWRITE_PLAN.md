@@ -390,10 +390,17 @@ device enqueue EFA proxy descriptors
     和真实 CUDA launch。
 - `V2EfaRuntime` / Python wrapper 已暴露 `build_dispatch_jit_plan` 和
   `build_combine_jit_plan`，可检查生成 source、launch 维度和 include 路径。
+- 已新增 `src/v2_efa_deep_ep_jit.cc`，把 native V2 EFA JIT plan 接到官方
+  `deep_ep::jit::compiler->build()`：
+  - Python 可调用 `deep_ep.init_deep_ep_jit(...)` 初始化 DeepEP JIT root、CUDA root、
+    NCCL root。
+  - `V2EfaRuntime.compile_dispatch_jit` / `compile_combine_jit` 会生成 plan 并编译进
+    DeepEP JIT cubin cache。
+  - 当前只 build/缓存 kernel，还没有保存 `KernelRuntime` handle 并 launch。
 
 交付标准：不同 hidden/topk/expert/num_sms 配置能生成不同 JIT kernel。当前已能生成
-不同 JIT source/launch plan；下一步要把 plan 交给 `deep_ep::jit::compiler->build`
-并 launch。
+不同 JIT source/launch plan，并提供 `compiler->build` 入口；下一步要保存
+`KernelRuntime` handle 并 launch。
 
 ### 4. 设计 V2 EFA command queue
 

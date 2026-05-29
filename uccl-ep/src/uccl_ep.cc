@@ -403,6 +403,27 @@ NB_MODULE(ep, m) {
            nb::arg("do_cpu_sync") = false,
            nb::arg("smem_bytes") = 228 * 1024,
            nb::arg("uccl_include_path") = "")
+      .def("compile_dispatch_jit",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
+              bool cached_mode, bool deterministic, bool do_cpu_sync,
+              int smem_bytes, const std::string& uccl_include_path) {
+             const auto plan = self.build_dispatch_jit_plan(
+                 num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
+                 has_topk_weight, cached_mode, deterministic, do_cpu_sync,
+                 smem_bytes, uccl_include_path);
+             v2::compile_v2_efa_jit_plan(plan);
+             return jit_launch_plan_to_dict(plan);
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm") = 1,
+           nb::arg("scale_bytes") = 0,
+           nb::arg("has_topk_weight") = true,
+           nb::arg("cached_mode") = false,
+           nb::arg("deterministic") = false,
+           nb::arg("do_cpu_sync") = false,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("uccl_include_path") = "")
       .def("build_combine_jit_plan",
            [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
               int num_channels, int payload_bytes, bool use_expanded_layout,
@@ -412,6 +433,25 @@ NB_MODULE(ep, m) {
                  num_max_tokens_per_rank, num_channels, payload_bytes,
                  use_expanded_layout, allow_multiple_reduction, smem_bytes,
                  uccl_include_path));
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels") = 1,
+           nb::arg("payload_bytes") = 0,
+           nb::arg("use_expanded_layout") = true,
+           nb::arg("allow_multiple_reduction") = true,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("uccl_include_path") = "")
+      .def("compile_combine_jit",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              int num_channels, int payload_bytes, bool use_expanded_layout,
+              bool allow_multiple_reduction, int smem_bytes,
+              const std::string& uccl_include_path) {
+             const auto plan = self.build_combine_jit_plan(
+                 num_max_tokens_per_rank, num_channels, payload_bytes,
+                 use_expanded_layout, allow_multiple_reduction, smem_bytes,
+                 uccl_include_path);
+             v2::compile_v2_efa_jit_plan(plan);
+             return jit_launch_plan_to_dict(plan);
            },
            nb::arg("num_max_tokens_per_rank"),
            nb::arg("num_channels") = 1,
@@ -436,4 +476,8 @@ NB_MODULE(ep, m) {
 
   m.def("is_native_v2_ready", []() { return false; });
   m.def("native_v2_rewrite_message", []() { return std::string(kRewriteMessage); });
+  m.def("init_deep_ep_jit", &v2::init_deep_ep_jit_bridge,
+        nb::arg("library_root_path"), nb::arg("cuda_home_path"),
+        nb::arg("nccl_root_path"));
+  m.def("is_deep_ep_jit_initialized", &v2::is_deep_ep_jit_bridge_initialized);
 }
