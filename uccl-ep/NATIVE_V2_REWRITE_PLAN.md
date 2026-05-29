@@ -351,6 +351,9 @@ device enqueue EFA proxy descriptors
   device-side reference generator，后续需要改为直接读取 V2 forward metadata。
 - 已新增 reference proxy command planner，将 descriptor 转成 payload/signal command，
   后续 device enqueue 和 host proxy command format 都应对齐这套语义。
+- 已新增 device-side reference enqueue kernel，把 dispatch/combine descriptor 写入
+  `ProxyQueueView`。当前是 serial reference 版本，后续需要并行化并接到 retained
+  EFA host proxy。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 

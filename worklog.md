@@ -56,6 +56,10 @@
   - workspace counter 从 2 words 扩展到 3 words：segments、batches、overflow。
   - 新增 `include/v2_efa/proxy_command_plan.hpp`，把 dispatch/combine descriptor
     转成 reference proxy payload/signal command，并在本地 C++ 测试里校验 offset。
+  - proxy layout 和 `make_*_command` helper 已移动到 `proxy_queue.cuh`，host reference
+    planner 和 device enqueue kernel 共用同一套 offset 规则。
+  - 新增 `v2_efa_dispatch_enqueue_proxy_kernel` 和 `v2_efa_combine_enqueue_proxy_kernel`，
+    现在 CUDA/JIT 侧已经具备 descriptor -> proxy queue 的 reference enqueue 路径。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

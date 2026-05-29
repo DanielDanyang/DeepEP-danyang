@@ -102,6 +102,17 @@ int main() {
   assert(dispatch_commands.commands[1].kind ==
          static_cast<uint32_t>(ProxyCommandKind::kDispatchSignal));
   assert(dispatch_commands.commands[1].remote_offset == 3000);
+  const auto direct_dispatch_payload = make_dispatch_payload_command(
+      plan.segments[0], 0, 0, dispatch_layout);
+  const auto direct_dispatch_signal = make_dispatch_signal_command(
+      plan.batches[0], 0, dispatch_layout);
+  assert(direct_dispatch_payload.kind == dispatch_commands.commands[0].kind);
+  assert(direct_dispatch_payload.local_offset ==
+         dispatch_commands.commands[0].local_offset);
+  assert(direct_dispatch_payload.remote_offset ==
+         dispatch_commands.commands[0].remote_offset);
+  assert(direct_dispatch_signal.remote_offset ==
+         dispatch_commands.commands[1].remote_offset);
 
   CombineProxyLayout combine_layout;
   combine_layout.local_payload_base = 4000;
@@ -118,6 +129,17 @@ int main() {
   assert(combine_commands.commands[0].bytes == 64);
   assert(combine_commands.commands[0].local_offset == 4000);
   assert(combine_commands.commands[0].remote_offset == 5000);
+  const auto direct_combine_payload = make_combine_payload_command(
+      combine_plan.segments[0], 0, 0, combine_layout);
+  const auto direct_combine_signal =
+      make_combine_signal_command(combine_plan.batches[0], 0, combine_layout);
+  assert(direct_combine_payload.kind == combine_commands.commands[0].kind);
+  assert(direct_combine_payload.local_offset ==
+         combine_commands.commands[0].local_offset);
+  assert(direct_combine_payload.remote_offset ==
+         combine_commands.commands[0].remote_offset);
+  assert(direct_combine_signal.remote_offset ==
+         combine_commands.commands[1].remote_offset);
 
   return 0;
 }
