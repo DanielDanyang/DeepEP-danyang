@@ -384,12 +384,14 @@ device enqueue EFA proxy descriptors
   -> ack -> advance tail。
 - `dispatch_jit.cuh` / `combine_jit.cuh` 已新增直接写 `V2TransferD2HQueueView` 的
   enqueue kernel scaffold。下一步是把这个 view 映射到 retained CPU proxy 的真实
-  pinned D2H queue，并让 proxy poll loop 分流 V2 command。
+  pinned D2H queue，并让 proxy poll loop 只消费 V2 command。
 - `efa_adapter.hpp` 已新增从 host V2 D2H queue 直接 drain 到 `EfaPostSink` 的 adapter，
   作为真实 proxy poll loop 的 reference 入口。
 - 已新增 V2-only host proxy scaffold：`v2_efa/proxy.hpp`。它只接受
   `HostV2TransferD2HQueue`，只产出 `EfaPostOp`，不再接收旧 V1 `TransferCmd`。
-  当前 reference test 已覆盖多个 V2 queue 一次 drain、post 计数和 ack/tail advance。
+  当前 reference test 已覆盖单个 V2 queue 同时承载 dispatch/combine command、
+  post 计数和 ack/tail advance。多 queue 只表示多 channel/proxy thread，不表示
+  dispatch/combine 分离。
 - JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。旧
   `ProxyCommand` enqueue/reference 路径已删除，host transfer queue 和 EFA adapter
   都直接消费 `V2TransferCmd`。

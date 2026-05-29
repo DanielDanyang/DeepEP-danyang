@@ -119,8 +119,9 @@
     V2 D2H queue 直接 drain 到 `EfaPostSink` 并 ack/advance tail。
   - 新增 `include/v2_efa/proxy.hpp`，提供 V2-only host proxy scaffold。它只注册
     `HostV2TransferD2HQueue`，只输出 `EfaPostOp`，不再兼容旧 V1 `TransferCmd`。
-  - 本地测试覆盖两个 V2 queue 同时 drain 到 proxy sink，并验证 write/signal 计数和
-    ack 后 tail/head 对齐。
+  - 本地测试改为单个 V2 queue 同时承载 dispatch/combine command，并验证
+    write/signal 计数和 ack 后 tail/head 对齐。多 queue 只代表多 channel/proxy
+    thread，不代表按 dispatch/combine 语义分队列。
   - 本地没有 nanobind header，`uccl_ep.cc` 只能等服务器/构建环境做 extension 编译；
     当前已完成 Python `py_compile` 和 C++ header/runtime 单测。
 - 服务器当前未执行任何 build/test/profiling/benchmark。

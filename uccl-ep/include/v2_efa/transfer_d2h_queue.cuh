@@ -110,9 +110,9 @@ struct alignas(128) V2TransferD2HQueue {
     size_t local = static_cast<size_t>(tail % Capacity);
     size_t next = next_unacked(local);
     if (next == Capacity) {
+      clear_acked_range(local, Capacity);
+      tail += Capacity - local;
       if (local != 0) {
-        clear_acked_range(local, Capacity);
-        tail += Capacity - local;
         const auto wrapped_next = next_unacked(0);
         if (wrapped_next > 0 && wrapped_next <= local) {
           clear_acked_range(0, wrapped_next);
