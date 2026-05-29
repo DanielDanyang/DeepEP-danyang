@@ -77,5 +77,11 @@ int main() {
   assert(combine_plan.segments[2].reduced_token_slot == 0);
   assert(combine_plan.segments[2].count == 2);
 
+  const auto workspace = runtime.workspace_plan(4);
+  assert(workspace.dispatch_counters.bytes ==
+         sizeof(uint32_t) * kDescriptorCounterWords);
+  assert(workspace.combine_counters.bytes ==
+         sizeof(uint32_t) * kDescriptorCounterWords);
+
   return 0;
 }

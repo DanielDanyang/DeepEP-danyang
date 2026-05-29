@@ -10,6 +10,10 @@ namespace uccl::v2_efa {
 constexpr int kDescriptorVersion = 1;
 constexpr int kInvalidRank = -1;
 constexpr int kInvalidExpert = -1;
+constexpr int kDescriptorCounterWords = 3;
+constexpr int kDescriptorCounterSegments = 0;
+constexpr int kDescriptorCounterBatches = 1;
+constexpr int kDescriptorCounterOverflow = 2;
 
 enum class DescriptorFlags : uint32_t {
   kNone = 0,

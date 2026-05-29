@@ -48,6 +48,12 @@
     reference descriptor，保留 `expanded_slot`、`reduced_token_slot`、`topk_slot`。
   - nanobind runtime skeleton 暴露 `build_reference_roundtrip_plan`，用于后续 Python
     对拍 dispatch/combine descriptor。
+  - `dispatch_jit.cuh` 已从空 scaffold 推进到 device-side reference descriptor
+    generator：按 expert 顺序扫描 topk，生成/合并 dispatch segment，并写
+    segment/batch/overflow counters。
+  - `combine_jit.cuh` 已能从 dispatch descriptor 生成 roundtrip combine descriptor，
+    用于后续和 V2 forward metadata 版本对拍。
+  - workspace counter 从 2 words 扩展到 3 words：segments、batches、overflow。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

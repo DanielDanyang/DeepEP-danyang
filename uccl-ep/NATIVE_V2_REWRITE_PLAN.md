@@ -345,6 +345,10 @@ device enqueue EFA proxy descriptors
   semantic batching，并保留 `topk_slot`。
 - 已实现 CPU reference combine planner，从 dispatch plan 反推 reduced-combine
   descriptor，保留 expanded/reduced slot 和 `topk_slot`。
+- `dispatch_jit.cuh` 已实现 device-side reference descriptor generator，后续需要把
+  serial expert scan 并行化并接入 DeepEP V2 `hybrid_dispatch` JIT。
+- `combine_jit.cuh` 已实现从 dispatch descriptor 反推 combine descriptor 的
+  device-side reference generator，后续需要改为直接读取 V2 forward metadata。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 

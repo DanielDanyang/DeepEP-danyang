@@ -50,8 +50,10 @@ inline WorkspacePlan build_workspace_plan(int64_t max_dispatch_segments,
                                      static_cast<size_t>(max_combine_segments));
   plan.combine_batches = add_region(sizeof(CombineExpertBatch) *
                                     static_cast<size_t>(max_combine_batches));
-  plan.dispatch_counters = add_region(sizeof(uint32_t) * 2);
-  plan.combine_counters = add_region(sizeof(uint32_t) * 2);
+  plan.dispatch_counters =
+      add_region(sizeof(uint32_t) * kDescriptorCounterWords);
+  plan.combine_counters =
+      add_region(sizeof(uint32_t) * kDescriptorCounterWords);
   plan.total_bytes = cursor;
   return plan;
 }
