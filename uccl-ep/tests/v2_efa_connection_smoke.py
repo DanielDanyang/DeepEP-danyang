@@ -4,6 +4,7 @@ import time
 import torch
 import torch.distributed as dist
 
+import deep_ep
 from deep_ep.buffers.elastic import ElasticBuffer
 from uccl import ep
 
@@ -21,7 +22,7 @@ def _init_dist():
             world_size=world,
         )
     else:
-        dist.init_process_group("gloo")
+        dist.init_process_group("nccl")
 
 
 def main():
@@ -29,6 +30,15 @@ def main():
     rank = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
+    repo_root = os.environ.get(
+        "DEEPEP_REPO_ROOT",
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
+    )
+    deep_ep.init_deep_ep_jit(
+        os.path.join(repo_root, "deep_ep"),
+        os.environ.get("CUDA_HOME", "/usr/local/cuda"),
+        deep_ep.find_nccl_root(),
+    )
 
     group = dist.group.WORLD
     buf = ElasticBuffer(
@@ -99,9 +109,37 @@ def main():
             assert got == list(range(16)), got
             print(f"rank={rank} remote_rdma_recv_ok=True", flush=True)
 
+        window.zero_()
+        x = (torch.arange(16, dtype=torch.uint8, device=window.device) + rank * 64).reshape(1, 16)
+        topk_idx = torch.tensor([[1 - rank]], dtype=torch.int64, device=window.device)
+        _, _, _, handle, _ = buf.dispatch(
+            x,
+            topk_idx=topk_idx,
+            num_experts=2,
+            num_max_tokens_per_rank=4,
+            do_cpu_sync=True,
+        )
+        for _ in range(1000):
+            if buf._v2_efa_connection.poll_completions(16):
+                break
+            time.sleep(0.001)
+        dist.barrier()
+        torch.cuda.synchronize()
+        layout = handle.transport_handle.dispatch_layout
+        offset = int(layout["remote_payload_base"])
+        got = window[offset: offset + 16].cpu().tolist()
+        expected = (torch.arange(16, dtype=torch.uint8) + (1 - rank) * 64).tolist()
+        assert got == expected, (got, expected, layout, handle.transport_handle.dispatch_drain_stats)
+        print(
+            f"rank={rank} dispatch_rdma_recv_ok=True "
+            f"stats={handle.transport_handle.dispatch_drain_stats}",
+            flush=True,
+        )
+
     dist.barrier()
     if rank == 0:
         print("v2_efa_connection_smoke_ok", flush=True)
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

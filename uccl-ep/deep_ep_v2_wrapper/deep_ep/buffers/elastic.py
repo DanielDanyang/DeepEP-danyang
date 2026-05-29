@@ -62,6 +62,8 @@ class V2TransportHandle:
     num_combine_segments: int
     payload_bytes: int
     scale_bytes: int
+    dispatch_drain_stats: Optional[dict] = None
+    combine_drain_stats: Optional[dict] = None
 
 
 class ElasticBuffer:
@@ -131,6 +133,7 @@ class ElasticBuffer:
         self.prefer_overlap_with_compute = bool(prefer_overlap_with_compute)
         self._v2_efa_window: Optional[torch.Tensor] = None
         self._v2_efa_connection = None
+        self._v2_efa_window_bytes = 0
 
     def _make_runtime(
         self,
@@ -567,7 +570,53 @@ class ElasticBuffer:
         connection.connect(all_infos)
         self._v2_efa_window = window
         self._v2_efa_connection = connection
+        self._v2_efa_window_bytes = int(bytes_in_window if num_bytes is None else num_bytes)
         return local_info
+
+    def _require_v2_efa_window(self, required_bytes: int) -> torch.Tensor:
+        if self._v2_efa_window is None or self._v2_efa_connection is None:
+            raise RuntimeError("native V2 EFA transport has not been initialized")
+        if int(required_bytes) > self._v2_efa_window_bytes:
+            raise RuntimeError(
+                f"native V2 EFA window is too small: need {int(required_bytes)} bytes, "
+                f"have {self._v2_efa_window_bytes}"
+            )
+        return self._v2_efa_window
+
+    def _stage_tensor_bytes_to_v2_window(self, tensor: torch.Tensor, base: int) -> int:
+        _require_cuda_contiguous(tensor, "tensor")
+        num_bytes = int(tensor.numel() * tensor.element_size())
+        window = self._require_v2_efa_window(int(base) + num_bytes)
+        byte_view = tensor.reshape(-1).view(torch.uint8)
+        window[int(base): int(base) + num_bytes].copy_(byte_view.reshape(-1))
+        return num_bytes
+
+    def _make_dispatch_window_layout(
+        self,
+        num_tokens: int,
+        num_max_tokens_per_rank: int,
+        payload_bytes: int,
+        max_batches: int,
+    ) -> dict:
+        src_bytes = _align(int(num_tokens) * int(payload_bytes), 64)
+        batch_payload_stride = _align(int(num_max_tokens_per_rank) * int(payload_bytes), 64)
+        remote_payload_bytes = int(max_batches) * batch_payload_stride
+        remote_payload_base = src_bytes
+        remote_signal_base = _align(remote_payload_base + remote_payload_bytes, 64)
+        total_bytes = _align(remote_signal_base + int(max_batches) * 4, 64)
+        self._require_v2_efa_window(total_bytes)
+        return {
+            "local_payload_base": 0,
+            "remote_payload_base": remote_payload_base,
+            "remote_signal_base": remote_signal_base,
+            "src_token_stride": int(payload_bytes),
+            "expanded_slot_stride": int(payload_bytes),
+            "batch_payload_stride": batch_payload_stride,
+            "signal_stride": 4,
+            "src_payload_bytes": src_bytes,
+            "remote_payload_bytes": remote_payload_bytes,
+            "total_window_bytes": total_bytes,
+        }
 
     def has_native_v2_efa_transport(self) -> bool:
         return self._v2_efa_connection is not None
@@ -981,6 +1030,7 @@ class ElasticBuffer:
         self.configure_native_v2(num_experts, num_topk, hidden, elem_bytes, num_sms)
 
         transport = self._launch_native_dispatch_transport(
+            x_tensor=x_tensor,
             topk_idx=topk_idx,
             num_tokens=num_tokens,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
@@ -1087,6 +1137,7 @@ class ElasticBuffer:
 
     def _launch_native_dispatch_transport(
         self,
+        x_tensor: torch.Tensor,
         topk_idx: torch.Tensor,
         num_tokens: int,
         num_max_tokens_per_rank: int,
@@ -1105,15 +1156,24 @@ class ElasticBuffer:
         counters = torch.zeros((3,), dtype=torch.int32, device=topk_idx.device)
         queue_capacity = _next_power_of_two(max_segments + max_batches + 1)
         queue = self.allocate_d2h_queue(queue_capacity)
-        layout = {
-            "local_payload_base": 0,
-            "remote_payload_base": 0,
-            "remote_signal_base": _align(max_batches * num_max_tokens_per_rank * payload_bytes, 64),
-            "src_token_stride": payload_bytes,
-            "expanded_slot_stride": payload_bytes,
-            "batch_payload_stride": _align(num_max_tokens_per_rank * payload_bytes, 64),
-            "signal_stride": 4,
-        }
+        if self._v2_efa_connection is not None:
+            layout = self._make_dispatch_window_layout(
+                num_tokens=num_tokens,
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
+                payload_bytes=payload_bytes,
+                max_batches=max_batches,
+            )
+            self._stage_tensor_bytes_to_v2_window(x_tensor, int(layout["local_payload_base"]))
+        else:
+            layout = {
+                "local_payload_base": 0,
+                "remote_payload_base": 0,
+                "remote_signal_base": _align(max_batches * num_max_tokens_per_rank * payload_bytes, 64),
+                "src_token_stride": payload_bytes,
+                "expanded_slot_stride": payload_bytes,
+                "batch_payload_stride": _align(num_max_tokens_per_rank * payload_bytes, 64),
+                "signal_stride": 4,
+            }
         self.launch_dispatch_descriptor_enqueue_d2h_queue(
             topk_idx=topk_idx.reshape(-1),
             segments=segments,
@@ -1131,6 +1191,9 @@ class ElasticBuffer:
         torch.cuda.current_stream().synchronize()
         num_segments = int(counters[0].item())
         num_batches = int(counters[1].item())
+        dispatch_drain_stats = None
+        if self._v2_efa_connection is not None:
+            dispatch_drain_stats = self._v2_efa_connection.drain_queue(queue, True, True)
         return V2TransportHandle(
             dispatch_segments=segments,
             dispatch_batches=batches,
@@ -1148,6 +1211,7 @@ class ElasticBuffer:
             num_combine_segments=0,
             payload_bytes=payload_bytes,
             scale_bytes=scale_bytes,
+            dispatch_drain_stats=dispatch_drain_stats,
         )
 
     def _launch_native_combine_transport(self, x: torch.Tensor, handle: EPHandle) -> None:

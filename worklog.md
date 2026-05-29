@@ -1543,3 +1543,39 @@ README 风格 EP8x2 性能：
       写 16B；
     - rank0 poll 到 send completion；
     - rank1 读回自身 CUDA window `[128:144] == 0..15`。
+
+## 2026-05-29 V2 dispatch payload RDMA staging
+
+- 修正 native V2 dispatch RDMA 数据面的一个关键前提：
+  - 旧 scaffold 的 `V2TransferCmd.local_offset` 默认从 0 开始，语义上指向输入
+    tensor row；
+  - 但真实 verbs sink 注册的是 `V2EfaConnection` 的 CUDA RDMA window；
+  - 因此直接 drain 会从 window offset 0 读，而不是从 `x_tensor` 读。
+- Python `ElasticBuffer` 现在在已初始化 `V2EfaConnection` 时：
+  - 为 dispatch 构造显式 V2 window layout：
+    - `local_payload_base = 0`
+    - `remote_payload_base = align(num_tokens * payload_bytes, 64)`
+    - `remote_signal_base = align(remote_payload_base + max_batches *
+      batch_payload_stride, 64)`
+  - dispatch 前把 `x_tensor` 的 byte view staging 到 local payload 区；
+  - JIT descriptor enqueue 后自动把 D2H queue drain 到 `V2EfaConnection`；
+  - drain stats 存入 `handle.transport_handle.dispatch_drain_stats`。
+- `uccl-ep/tests/v2_efa_connection_smoke.py` 增加双机 dispatch payload RDMA 检查：
+  - EP1x2，rank0 的 token route 到 expert/rank1，rank1 的 token route 到
+    expert/rank0；
+  - 两边 dispatch 都产生 2 个 native V2 commands：1 个 payload write + 1 个
+    signal write；
+  - 两边 poll completion 后，直接检查本地 V2 RDMA window 的
+    `remote_payload_base` 内容等于 peer token bytes。
+- 服务器验证：
+  - 双机 EP1x2 smoke 通过：
+    - rank0:
+      `dispatch_rdma_recv_ok=True stats={'drained_commands': 2,
+      'posted_writes': 1, 'posted_signals': 1, 'posted_bytes': 20, ...}`
+    - rank1:
+      `dispatch_rdma_recv_ok=True stats={'drained_commands': 2,
+      'posted_writes': 1, 'posted_signals': 1, 'posted_bytes': 20, ...}`
+- 仍未完成：
+  - public `dispatch()` 的返回值仍用 semantic all-to-all fallback 生成；
+  - combine payload 还没有同样 staging 到 V2 window；
+  - receiver 的 expanded/reduced tensor view 还没有默认直接绑定到 RDMA window。
