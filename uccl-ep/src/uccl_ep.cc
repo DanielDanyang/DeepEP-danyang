@@ -14,6 +14,7 @@
 #include "v2_efa/transfer_cmd_plan.hpp"
 #include "v2_efa/transfer_d2h_queue.cuh"
 #include "v2_efa/transfer_layout.hpp"
+#include "v2_efa/verbs_sink.hpp"
 
 namespace nb = nanobind;
 namespace v2 = uccl::v2_efa;
@@ -1005,4 +1006,11 @@ NB_MODULE(ep, m) {
         nb::arg("library_root_path"), nb::arg("cuda_home_path"),
         nb::arg("nccl_root_path"));
   m.def("is_deep_ep_jit_initialized", &v2::is_deep_ep_jit_bridge_initialized);
+  m.def("v2_has_verbs_sink", []() {
+#if UCCL_V2_EFA_HAS_VERBS
+    return true;
+#else
+    return false;
+#endif
+  });
 }

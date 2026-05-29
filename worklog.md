@@ -1463,3 +1463,40 @@ README 风格 EP8x2 性能：
       `recv=(4, 16) dispatch_desc=1/1 dispatch_ops=2 combine_desc=1/1 combine_ops=2 ok=True weights_ok=True`
     - torchrun rendezvous 退出时有一个 `TCPStore recvVector failed` shutdown warning，
       但两个 rank 进程 exit code 为 0，smoke assertions 通过。
+
+## 2026-05-29 V2 EFA verbs sink scaffold
+
+- 新增 `uccl-ep/include/v2_efa/verbs_sink.hpp`：
+  - 定义 `V2EfaVerbsPostSink`，直接消费新的 `EfaPostOp`，不经过旧 V1
+    `TransferCmd` decode。
+  - payload op 映射为 RDMA write，signal op 映射为 4B RDMA write 到
+    descriptor layout 给出的 signal offset。
+  - EFA 环境下使用 `ibv_qp_ex` / `ibv_wr_rdma_write` /
+    `ibv_wr_set_ud_addr` / `ibv_wr_set_sge` / `ibv_wr_complete`。
+  - 非 EFA verbs 环境保留 RC `ibv_post_send` fallback，方便同一 sink 做单元验证。
+  - signal write 使用调用者提供的 registered scratch ring，避免把栈上
+    `signal_value` 指针交给 NIC。
+- 新增 retained proxy substrate adapter：
+  - `make_v2_verbs_local_window_from_proxy_ctx`
+  - `make_v2_verbs_endpoint_from_proxy_ctx`
+  - `make_v2_verbs_endpoint_table_from_proxy_ctxs`
+  - 这层只复用 `ProxyCtx` 已建好的 QP/AH/rkey/remote_addr，不复用 V1 command
+    bitfield、V1 staging offset 或 V1 immediate 编码。
+- `uccl.ep` 绑定新增 `v2_has_verbs_sink()`，用于确认扩展是在带 verbs headers 的
+  环境中构建。
+- 验证：
+  - 本地 `py_compile`、source hygiene、C++ reference planner、`git diff --check`
+    均通过。
+  - `p5en_0` 上 `make -j$(nproc)`、`make install` 通过，
+    `uccl.ep.v2_has_verbs_sink()` 返回 `True`。
+  - `p5en_1` 上 `make install` 通过，
+    `uccl.ep.v2_has_verbs_sink()` 返回 `True`。
+  - `p5en_0` 单 GPU native V2 wrapper smoke 仍通过：
+    `rank=0 recv=(4, 16) dispatch_desc=1/1 dispatch_ops=2 combine_desc=1/1 combine_ops=2 ok=True weights_ok=True`。
+- 下一步：
+  - 在 native V2 runtime 中创建真实 registered V2 local/remote windows 和 signal
+    scratch；
+  - 用 retained connection setup 填充 `ProxyCtx` / `V2VerbsEndpointTable`；
+  - 把 Python smoke 中的 recording drain 替换成 CPU proxy drain 到
+    `V2EfaVerbsPostSink`，并验证 receiver buffer 中的 V2 expanded/reduced layout
+    被真实 RDMA write 填充。
