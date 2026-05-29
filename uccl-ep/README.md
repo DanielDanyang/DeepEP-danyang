@@ -1,23 +1,22 @@
 # UCCL EP for DeepEP V2 on AWS EFA
 
-这个目录现在只维护 DeepEP V2 在 AWS EFA 上的 native proxy backend。旧的
-DeepEP V1 wrapper、低延迟 API 示例和 V1 benchmark 入口已经移除，避免后续开发继续
-围绕旧接口语义打补丁。
+这个目录的当前实现已经被标记为过渡实现：它名义上服务 DeepEP V2 on AWS EFA，但源码
+主体仍然继承了 DeepEP V1/UCCL EP 的 static CUDA kernel、staged buffer 和 prefix-matrix
+协议。后续开发不再在这条路径上继续补丁式优化，而是按
+`NATIVE_V2_REWRITE_PLAN.md` 删除 V1 数据面并重写为 DeepEP V2 JIT backend。
 
 ## 当前边界
 
 - Python 入口在 `deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`。
 - 内部 transport 在 `deep_ep_v2_wrapper/deep_ep/proxy_transport.py`。
-- Native 扩展在 `src/uccl_ep.cc`，CUDA kernel 在 `src/internode.cu` 和
-  `src/intranode.cu`。
-- V2 metadata、expanded dispatch payload、reduced combine input 已经由
-  `NativeElasticProxyBuffer` 直接调用 CUDA helper，并和 UCCL proxy 数据面共用同一个
-  native runtime/comm stream。
-- `uccl.ep.Buffer` 和 `uccl.ep.ElasticProxyBuffer` 不再作为 public API 暴露；
-  旧 base 只保留为内部 `_LegacyProxyBuffer`，用于逐步替换剩余 V1 internode
-  kernel 数据面。
-- 剩余大块工作是把 dispatch/combine 的实际跨机 transfer plan 继续下沉到 native
-  V2 kernels，最终删除 `ProxyTransport` 里的兼容 transport 调度层。
+- Native 扩展在 `src/uccl_ep.cc`，但其中仍暴露 V1 风格的
+  `internode_prepare/dispatch/combine` 和 `intranode_prepare/dispatch/combine`。
+- CUDA kernel 仍在 `src/internode.cu`、`src/intranode.cu`、`src/layout.cu`，这些不是
+  DeepEP V2 的 JIT `.cuh` kernel。
+- `ProxyTransport` 仍然包含 V1 handle 字段，例如 `rank_prefix_matrix`、
+  `rdma_channel_prefix_matrix`、`gbl_channel_prefix_matrix`。
+- 下一步不是继续调这些 kernel，而是删除旧数据面，新增 `V2EfaRuntime` 和 V2 JIT
+  descriptor/proxy backend。
 
 ## 构建
 

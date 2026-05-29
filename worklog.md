@@ -1,5 +1,19 @@
 # DeepEP / NCCL GIN Worklog
 
+## 2026-05-28 native V2 方向纠偏
+
+- 确认当前 `uccl-ep` 仍然是 V1/UCCL EP normal path 的派生实现，而不是 DeepEP V2
+  native backend。
+- 关键证据：
+  - `src/internode.cu` 仍有 `SourceMeta`、`rdma_channel_prefix_matrix`、
+    `gbl_channel_prefix_matrix`、`recv_rdma_rank_prefix_sum`。
+  - `src/intranode.cu` 仍有 `rank_prefix_matrix` 和 V1 intranode packed path。
+  - `proxy_transport.py` 仍然维护 V1 transport handle 字段。
+  - `setup.py` 仍然 glob 编译 `src/*.cu`，会把旧 static kernel 全部带入 build。
+- 已新增 `uccl-ep/NATIVE_V2_REWRITE_PLAN.md`，明确后续要删除 V1 数据面，并按 DeepEP V2
+  JIT `.cuh` 路径重写 AWS EFA backend。
+- 服务器当前未执行任何 build/test/profiling/benchmark。
+
 ## 2026-05-27 设备空闲检查
 
 - 在 `p5en_0` 和 `p5en_1` 上检查 `nvidia-smi`。
