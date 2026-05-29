@@ -151,6 +151,7 @@ API 不能再命中。
 uccl-ep/
   include/v2_efa/
     descriptor.hpp
+    proxy.hpp
     runtime.hpp
     transfer_cmd.hpp
     transfer_cmd_plan.hpp
@@ -386,6 +387,9 @@ device enqueue EFA proxy descriptors
   pinned D2H queue，并让 proxy poll loop 分流 V2 command。
 - `efa_adapter.hpp` 已新增从 host V2 D2H queue 直接 drain 到 `EfaPostSink` 的 adapter，
   作为真实 proxy poll loop 的 reference 入口。
+- 已新增 V2-only host proxy scaffold：`v2_efa/proxy.hpp`。它只接受
+  `HostV2TransferD2HQueue`，只产出 `EfaPostOp`，不再接收旧 V1 `TransferCmd`。
+  当前 reference test 已覆盖多个 V2 queue 一次 drain、post 计数和 ack/tail advance。
 - JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。旧
   `ProxyCommand` enqueue/reference 路径已删除，host transfer queue 和 EFA adapter
   都直接消费 `V2TransferCmd`。

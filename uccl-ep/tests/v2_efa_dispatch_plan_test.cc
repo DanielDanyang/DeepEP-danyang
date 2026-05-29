@@ -1,5 +1,6 @@
 #include "v2_efa/dispatch_plan.hpp"
 #include "v2_efa/efa_adapter.hpp"
+#include "v2_efa/proxy.hpp"
 #include "v2_efa/runtime.hpp"
 #include "v2_efa/transfer_cmd.hpp"
 #include "v2_efa/transfer_cmd_plan.hpp"
@@ -249,6 +250,27 @@ int main() {
   assert(adapter_d2h_sink.ops[0].local_offset == v2_sink.ops[0].local_offset);
   assert(adapter_d2h_queue.queue().volatile_tail() ==
          adapter_d2h_queue.queue().volatile_head());
+
+  HostV2TransferD2HQueue<16> proxy_d2h_queue_a;
+  HostV2TransferD2HQueue<16> proxy_d2h_queue_b;
+  proxy_d2h_queue_a.submit(dispatch_commands.commands);
+  proxy_d2h_queue_b.submit(combine_commands.commands);
+  V2ProxyPostSink proxy_sink;
+  HostV2TransferProxy<16> proxy(&proxy_sink);
+  proxy.add_queue(&proxy_d2h_queue_a);
+  proxy.add_queue(&proxy_d2h_queue_b);
+  assert(proxy.num_queues() == 2);
+  const auto proxy_drained = proxy.drain_once();
+  assert(proxy_drained == dispatch_commands.commands.size() +
+                              combine_commands.commands.size());
+  assert(proxy.stats().drained_commands == proxy_drained);
+  assert(proxy_sink.ops.size() == proxy_drained);
+  assert(proxy_sink.stats.posted_writes == 8);
+  assert(proxy_sink.stats.posted_signals == 8);
+  assert(proxy_d2h_queue_a.queue().volatile_tail() ==
+         proxy_d2h_queue_a.queue().volatile_head());
+  assert(proxy_d2h_queue_b.queue().volatile_tail() ==
+         proxy_d2h_queue_b.queue().volatile_head());
 
   const auto queued_dispatch_stats = dispatch_queue.drain_loopback(
       LoopbackMemoryView{dispatch_local.data(), dispatch_local.size(),
