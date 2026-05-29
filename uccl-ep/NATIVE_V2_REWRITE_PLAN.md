@@ -373,6 +373,9 @@ device enqueue EFA proxy descriptors
   span 自动计算 per-batch payload stride 和 signal base。combine 路径按
   `reduced_token_slot + count` 计算跨度，避免把 V2 reduced layout 误当作 batch-local
   packed layout。
+- nanobind/Python runtime 已新增 `build_reference_transfer_roundtrip_plan`，可导出
+  descriptor、contiguous layout 和 `V2TransferCmd` 列表，作为接入真实 V2 JIT/handle
+  metadata 前的对拍入口。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 

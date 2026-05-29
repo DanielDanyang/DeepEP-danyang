@@ -94,6 +94,11 @@
   - 修正 combine layout 语义：`reduced_token_slot` 是原始 token/reduced layout slot，
     不能按 batch-local `total_tokens` 推导 stride；现在使用
     `max(reduced_token_slot + count)` 防止 batch payload 覆盖 signal 区域。
+  - Python/nanobind runtime 增加 `build_reference_transfer_roundtrip_plan` 调试入口，
+    一次返回 dispatch/combine descriptor、contiguous transfer layout 和
+    `V2TransferCmd` 列表，后续可直接和官方 V2 handle metadata 对拍。
+  - 本地没有 nanobind header，`uccl_ep.cc` 只能等服务器/构建环境做 extension 编译；
+    当前已完成 Python `py_compile` 和 C++ header/runtime 单测。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

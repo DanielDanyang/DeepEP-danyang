@@ -7,6 +7,8 @@
 
 #include "v2_efa/runtime.hpp"
 #include "v2_efa/transfer_cmd.hpp"
+#include "v2_efa/transfer_cmd_plan.hpp"
+#include "v2_efa/transfer_layout.hpp"
 
 namespace nb = nanobind;
 namespace v2 = uccl::v2_efa;
@@ -164,6 +166,59 @@ nb::dict combine_plan_to_dict(const v2::CombinePlan& plan) {
   return out;
 }
 
+nb::dict dispatch_transfer_layout_to_dict(
+    const v2::DispatchTransferLayout& layout) {
+  nb::dict out;
+  out["local_payload_base"] = layout.local_payload_base;
+  out["remote_payload_base"] = layout.remote_payload_base;
+  out["remote_signal_base"] = layout.remote_signal_base;
+  out["src_token_stride"] = layout.src_token_stride;
+  out["expanded_slot_stride"] = layout.expanded_slot_stride;
+  out["batch_payload_stride"] = layout.batch_payload_stride;
+  out["signal_stride"] = layout.signal_stride;
+  return out;
+}
+
+nb::dict combine_transfer_layout_to_dict(
+    const v2::CombineTransferLayout& layout) {
+  nb::dict out;
+  out["local_payload_base"] = layout.local_payload_base;
+  out["remote_payload_base"] = layout.remote_payload_base;
+  out["remote_signal_base"] = layout.remote_signal_base;
+  out["expanded_slot_stride"] = layout.expanded_slot_stride;
+  out["reduced_token_stride"] = layout.reduced_token_stride;
+  out["batch_payload_stride"] = layout.batch_payload_stride;
+  out["signal_stride"] = layout.signal_stride;
+  return out;
+}
+
+nb::dict transfer_cmd_to_dict(const v2::V2TransferCmd& cmd) {
+  nb::dict out;
+  out["magic"] = cmd.magic;
+  out["version"] = cmd.version;
+  out["kind"] = cmd.kind;
+  out["target_rank"] = cmd.target_rank;
+  out["target_lane"] = cmd.target_lane;
+  out["flags"] = cmd.flags;
+  out["descriptor_index"] = cmd.descriptor_index;
+  out["batch_index"] = cmd.batch_index;
+  out["expert_id"] = cmd.expert_id;
+  out["count"] = cmd.count;
+  out["bytes"] = cmd.bytes;
+  out["signal_value"] = cmd.signal_value;
+  out["local_offset"] = cmd.local_offset;
+  out["remote_offset"] = cmd.remote_offset;
+  return out;
+}
+
+nb::list transfer_cmds_to_list(const v2::V2TransferCmdPlan& plan) {
+  nb::list out;
+  for (const auto& cmd : plan.commands) {
+    out.append(transfer_cmd_to_dict(cmd));
+  }
+  return out;
+}
+
 std::vector<int64_t> sequence_to_i64_vector(const nb::sequence& values) {
   std::vector<int64_t> out;
   out.reserve(static_cast<size_t>(values.size()));
@@ -265,6 +320,49 @@ NB_MODULE(ep, m) {
              nb::dict out;
              out["dispatch"] = dispatch_plan_to_dict(dispatch_plan);
              out["combine"] = combine_plan_to_dict(combine_plan);
+             return out;
+           })
+      .def("build_reference_transfer_roundtrip_plan",
+           [](const v2::V2EfaRuntime& self, nb::sequence topk_idx_flat,
+              int num_tokens, int dispatch_payload_bytes, int scale_bytes,
+              int combine_payload_bytes, bool has_topk_weight) {
+             if (topk_idx_flat.size() !=
+                 static_cast<size_t>(num_tokens * self.config().num_topk)) {
+               throw std::invalid_argument(
+                   "topk_idx_flat length must equal num_tokens * num_topk");
+             }
+             auto topk = sequence_to_i64_vector(topk_idx_flat);
+             const auto dispatch_plan = self.build_reference_dispatch_plan(
+                 topk.data(), num_tokens, dispatch_payload_bytes, scale_bytes,
+                 has_topk_weight);
+             const auto combine_plan =
+                 self.build_reference_combine_plan_from_dispatch(
+                     dispatch_plan, combine_payload_bytes);
+             const auto dispatch_layout =
+                 v2::make_contiguous_dispatch_transfer_layout(
+                     dispatch_plan,
+                     static_cast<uint32_t>(dispatch_payload_bytes),
+                     static_cast<uint32_t>(dispatch_payload_bytes));
+             const auto combine_layout =
+                 v2::make_contiguous_combine_transfer_layout(
+                     combine_plan,
+                     static_cast<uint32_t>(combine_payload_bytes),
+                     static_cast<uint32_t>(combine_payload_bytes));
+             const auto dispatch_commands =
+                 v2::build_dispatch_transfer_cmd_plan(dispatch_plan,
+                                                      dispatch_layout);
+             const auto combine_commands =
+                 v2::build_combine_transfer_cmd_plan(combine_plan,
+                                                     combine_layout);
+             nb::dict out;
+             out["dispatch"] = dispatch_plan_to_dict(dispatch_plan);
+             out["combine"] = combine_plan_to_dict(combine_plan);
+             out["dispatch_layout"] =
+                 dispatch_transfer_layout_to_dict(dispatch_layout);
+             out["combine_layout"] =
+                 combine_transfer_layout_to_dict(combine_layout);
+             out["dispatch_commands"] = transfer_cmds_to_list(dispatch_commands);
+             out["combine_commands"] = transfer_cmds_to_list(combine_commands);
              return out;
            })
       .def("launch_dispatch", &v2::V2EfaRuntime::launch_dispatch)
