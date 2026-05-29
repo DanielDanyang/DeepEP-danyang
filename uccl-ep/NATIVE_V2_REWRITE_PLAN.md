@@ -361,6 +361,11 @@ device enqueue EFA proxy descriptors
 - 已新增 `V2EfaRuntime` skeleton。
 - 已暴露 runtime config、descriptor stats、workspace plan。
 - dispatch/combine 仍明确返回未实现错误。
+- 已清理旧 bench、dummy `ep_runtime`、legacy `ProxyTransport` / `utils_uccl`
+  入口，避免 native V2 wrapper 继续暴露 V1 过渡路径。
+- 已新增 `tests/v2_efa_source_hygiene_test.py`，固定 V2-only build 入口：
+  extension 只能编译 `uccl_ep.cc` 和 `v2_efa_runtime.cc`，旧
+  internode/intranode/layout/bench/runtime 源不能重新进入 build。
 
 交付标准：Python 可以 import，runtime 可以初始化 EFA proxy 资源，但 dispatch/combine
 明确返回未实现错误。

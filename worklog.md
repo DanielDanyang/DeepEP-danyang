@@ -1272,3 +1272,13 @@ README 风格 EP8x2 性能：
     变成越界 RDMA write。
   - 新增 `ResolvingEfaPostSink`，真实 proxy 可保持 `EfaPostSink` 接口不变，由 sink
     负责 endpoint table 解析并转发到后续 verbs sink。
+- 清理已确认无用的旧代码：
+  - 删除旧 bench：`bench/proxy_rdma_fifo.py`、`bench/v2_proxy_smoke.py`。
+  - 删除旧 dummy runtime / bench kernel：
+    `src/ep_runtime.cu`、`src/bench_kernel.cu`、`src/uccl_bench.cpp` 及对应 header。
+  - 删除 wrapper 里的 legacy `ProxyTransport` / `utils_uccl` 入口，避免用户继续误用
+    V1 transport shim。
+  - 保留 `rdma/proxy/uccl_proxy` substrate，后续真实 EFA verbs sink 仍可能从这里提取
+    provider、MR、QP/CQ 管理逻辑。
+- 新增 `tests/v2_efa_source_hygiene_test.py`，检查旧路径不存在、Python wrapper 不导出
+  legacy transport，并确认 build 只包含 V2 runtime/binding 源。
