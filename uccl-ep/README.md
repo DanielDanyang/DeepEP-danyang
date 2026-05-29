@@ -11,7 +11,11 @@ DeepEP V1 wrapper、低延迟 API 示例和 V1 benchmark 入口已经移除，�
 - Native 扩展在 `src/uccl_ep.cc`，CUDA kernel 在 `src/internode.cu` 和
   `src/intranode.cu`。
 - V2 metadata、expanded dispatch payload、reduced combine input 已经由
-  `ElasticProxyBuffer` 直接调用 CUDA helper，不再经过旧 `Buffer` wrapper。
+  `NativeElasticProxyBuffer` 直接调用 CUDA helper，并和 UCCL proxy 数据面共用同一个
+  native runtime/comm stream。
+- `uccl.ep.Buffer` 和 `uccl.ep.ElasticProxyBuffer` 不再作为 public API 暴露；
+  旧 base 只保留为内部 `_LegacyProxyBuffer`，用于逐步替换剩余 V1 internode
+  kernel 数据面。
 - 剩余大块工作是把 dispatch/combine 的实际跨机 transfer plan 继续下沉到 native
   V2 kernels，最终删除 `ProxyTransport` 里的兼容 transport 调度层。
 

@@ -2,7 +2,7 @@ import os
 from contextlib import nullcontext
 import torch
 import torch.distributed as dist
-from typing import Callable, Tuple, Optional, Union, List
+from typing import Callable, NamedTuple, Tuple, Optional, Union, List
 
 try:
     from uccl import ep
@@ -21,6 +21,31 @@ from .utils_uccl import (
     destroy_uccl,
     _fp8_e4m3_dtype,
 )
+
+
+class IntranodeDispatchHandle(NamedTuple):
+    rank_prefix_matrix: torch.Tensor
+    channel_prefix_matrix: torch.Tensor
+    recv_channel_prefix_matrix: torch.Tensor
+    num_recv_tokens: int
+    recv_src_idx: torch.Tensor
+    is_token_in_rank: torch.Tensor
+    send_head: torch.Tensor
+
+
+class InternodeDispatchHandle(NamedTuple):
+    is_token_in_rank: torch.Tensor
+    rdma_channel_prefix_matrix: torch.Tensor
+    gbl_channel_prefix_matrix: torch.Tensor
+    recv_rdma_channel_prefix_matrix: torch.Tensor
+    recv_rdma_rank_prefix_sum: torch.Tensor
+    recv_gbl_channel_prefix_matrix: torch.Tensor
+    recv_gbl_rank_prefix_sum: torch.Tensor
+    num_recv_tokens: int
+    num_rdma_recv_tokens: int
+    recv_src_meta: torch.Tensor
+    send_rdma_head: torch.Tensor
+    send_nvl_head: torch.Tensor
 
 
 def _record_stream_safe(tensors, stream):
@@ -225,221 +250,6 @@ class ProxyTransport:
 
     def connect_atomic_buffer(self, proxy: "ep.UcclProxy"):
         ep.connect_atomic_buffer(proxy, self.runtime)
-
-    def build_v2_dispatch_metadata(
-        self,
-        recv_src_meta: torch.Tensor,
-        recv_topk_idx: torch.Tensor,
-        num_scaleup_ranks: int,
-        num_local_experts: int,
-        num_max_tokens_per_rank: int,
-        expert_alignment: int,
-        previous_event: Optional[EventOverlap] = None,
-        async_finish: bool = False,
-        allocate_on_comm_stream: bool = False,
-    ):
-        alloc_ctx = (
-            torch.cuda.stream(self.get_comm_stream())
-            if allocate_on_comm_stream
-            else nullcontext()
-        )
-        num_recv_tokens = int(recv_topk_idx.size(0))
-        num_topk = int(recv_topk_idx.size(1))
-        with alloc_ctx:
-            recv_src_metadata = torch.empty(
-                (max(num_recv_tokens, 1), 2 + num_topk),
-                dtype=torch.int32,
-                device=recv_topk_idx.device,
-            )
-            psum_scaleup = torch.empty(
-                (num_scaleup_ranks,), dtype=torch.int32, device=recv_topk_idx.device
-            )
-            psum_expert = torch.empty(
-                (num_local_experts,), dtype=torch.int32, device=recv_topk_idx.device
-            )
-            dst_buffer_slot_idx = torch.empty(
-                (max(num_recv_tokens, 1),), dtype=torch.int32, device=recv_topk_idx.device
-            )
-            raw_expert_counts = torch.empty(
-                (num_local_experts,), dtype=torch.int32, device=recv_topk_idx.device
-            )
-            expanded_expert_cursor = torch.empty(
-                (num_local_experts,), dtype=torch.int32, device=recv_topk_idx.device
-            )
-
-        event = self.runtime.build_v2_dispatch_metadata(
-            recv_src_meta.data_ptr(),
-            recv_topk_idx.data_ptr(),
-            num_recv_tokens,
-            num_topk,
-            int(num_scaleup_ranks),
-            int(num_local_experts),
-            int(num_max_tokens_per_rank),
-            int(expert_alignment),
-            recv_src_metadata.data_ptr(),
-            psum_scaleup.data_ptr(),
-            psum_expert.data_ptr(),
-            dst_buffer_slot_idx.data_ptr(),
-            raw_expert_counts.data_ptr(),
-            expanded_expert_cursor.data_ptr(),
-            getattr(previous_event, "event", None),
-            bool(async_finish),
-            bool(allocate_on_comm_stream),
-            self._compute_stream_ptr(recv_topk_idx.device),
-        )
-        tensors_to_record = (
-            recv_src_meta,
-            recv_topk_idx,
-            recv_src_metadata,
-            psum_scaleup,
-            psum_expert,
-            dst_buffer_slot_idx,
-            raw_expert_counts,
-            expanded_expert_cursor,
-        )
-        return (
-            recv_src_metadata[:num_recv_tokens],
-            psum_scaleup,
-            psum_expert,
-            dst_buffer_slot_idx[:num_recv_tokens],
-            raw_expert_counts,
-            EventOverlap(event, tensors_to_record if async_finish else None),
-        )
-
-    def build_v2_expanded_payload(
-        self,
-        recv_x,
-        recv_topk_idx: torch.Tensor,
-        recv_topk_weights: Optional[torch.Tensor],
-        recv_src_metadata: torch.Tensor,
-        psum_num_recv_tokens_per_expert: torch.Tensor,
-        previous_event: Optional[EventOverlap] = None,
-        async_finish: bool = False,
-        allocate_on_comm_stream: bool = False,
-    ):
-        x_tensor, x_scales = recv_x if isinstance(recv_x, tuple) else (recv_x, None)
-        num_recv_tokens, hidden = x_tensor.shape
-        num_topk = int(recv_topk_idx.size(1))
-        num_expanded_tokens = max(int(psum_num_recv_tokens_per_expert[-1].item()), 1)
-        num_scales = 0
-        scale_tail_shape = ()
-        if x_scales is not None:
-            scale_tail_shape = tuple(x_scales.shape[1:])
-            num_scales = 1
-            for dim in scale_tail_shape:
-                num_scales *= int(dim)
-
-        alloc_ctx = (
-            torch.cuda.stream(self.get_comm_stream())
-            if allocate_on_comm_stream
-            else nullcontext()
-        )
-        with alloc_ctx:
-            expanded_x = torch.empty(
-                (num_expanded_tokens, hidden),
-                dtype=x_tensor.dtype,
-                device=x_tensor.device,
-            )
-            expanded_scales = (
-                None
-                if x_scales is None
-                else torch.empty(
-                    (num_expanded_tokens,) + scale_tail_shape,
-                    dtype=x_scales.dtype,
-                    device=x_scales.device,
-                )
-            )
-            expanded_weights = (
-                None
-                if recv_topk_weights is None
-                else torch.empty(
-                    (num_expanded_tokens,),
-                    dtype=recv_topk_weights.dtype,
-                    device=recv_topk_weights.device,
-                )
-            )
-
-        event = self.runtime.build_v2_expanded_payload(
-            x_tensor.data_ptr(),
-            0 if x_scales is None else x_scales.data_ptr(),
-            0 if recv_topk_weights is None else recv_topk_weights.data_ptr(),
-            recv_src_metadata.data_ptr(),
-            num_recv_tokens,
-            num_topk,
-            int(hidden * x_tensor.element_size()),
-            int(num_scales),
-            expanded_x.data_ptr(),
-            0 if expanded_scales is None else expanded_scales.data_ptr(),
-            0 if expanded_weights is None else expanded_weights.data_ptr(),
-            getattr(previous_event, "event", None),
-            bool(async_finish),
-            bool(allocate_on_comm_stream),
-            self._compute_stream_ptr(x_tensor.device),
-        )
-        packed_x = (
-            (expanded_x, expanded_scales)
-            if expanded_scales is not None
-            else expanded_x
-        )
-        tensors_to_record = (
-            x_tensor,
-            x_scales,
-            recv_topk_idx,
-            recv_topk_weights,
-            recv_src_metadata,
-            psum_num_recv_tokens_per_expert,
-            expanded_x,
-            expanded_scales,
-            expanded_weights,
-        )
-        return packed_x, expanded_weights, EventOverlap(
-            event, tensors_to_record if async_finish else None
-        )
-
-    def build_v2_reduced_combine_input(
-        self,
-        expanded_x: torch.Tensor,
-        recv_src_metadata: torch.Tensor,
-        num_topk: int,
-        previous_event: Optional[EventOverlap] = None,
-        async_finish: bool = False,
-        allocate_on_comm_stream: bool = False,
-    ):
-        num_recv_tokens = int(recv_src_metadata.size(0))
-        hidden = int(expanded_x.size(1))
-        alloc_ctx = (
-            torch.cuda.stream(self.get_comm_stream())
-            if allocate_on_comm_stream
-            else nullcontext()
-        )
-        with alloc_ctx:
-            reduced_x = torch.empty(
-                (max(num_recv_tokens, 1), hidden),
-                dtype=expanded_x.dtype,
-                device=expanded_x.device,
-            )
-
-        event = self.runtime.build_v2_reduced_combine_input(
-            expanded_x.data_ptr(),
-            recv_src_metadata.data_ptr(),
-            num_recv_tokens,
-            int(num_topk),
-            hidden,
-            ProxyTransport._dtype_code(expanded_x.dtype),
-            reduced_x.data_ptr(),
-            getattr(previous_event, "event", None),
-            bool(async_finish),
-            bool(allocate_on_comm_stream),
-            self._compute_stream_ptr(expanded_x.device),
-        )
-        tensors_to_record = (
-            expanded_x,
-            recv_src_metadata,
-            reduced_x,
-        )
-        return reduced_x[:num_recv_tokens], EventOverlap(
-            event, tensors_to_record if async_finish else None
-        )
 
     def destroy(self):
         """
@@ -851,15 +661,14 @@ class ProxyTransport:
         x, x_scales = x if isinstance(x, tuple) else (x, None)
         if handle is not None:
             assert topk_idx is None and topk_weights is None
-            (
-                rank_prefix_matrix,
-                channel_prefix_matrix,
-                recv_channel_prefix_matrix,
-                num_recv_tokens,
-                recv_src_idx,
-                is_token_in_rank,
-                send_head,
-            ) = handle
+            assert isinstance(handle, IntranodeDispatchHandle)
+            rank_prefix_matrix = handle.rank_prefix_matrix
+            channel_prefix_matrix = handle.channel_prefix_matrix
+            recv_channel_prefix_matrix = handle.recv_channel_prefix_matrix
+            num_recv_tokens = handle.num_recv_tokens
+            recv_src_idx = handle.recv_src_idx
+            is_token_in_rank = handle.is_token_in_rank
+            send_head = handle.send_head
             num_topk = 0
             num_scales = (
                 0
@@ -1072,17 +881,19 @@ class ProxyTransport:
                 recv_topk_weights = recv_topk_weights[:num_recv_tokens]
             if recv_x_scales is not None:
                 recv_x_scales = recv_x_scales[:num_recv_tokens]
-            handle = (
-                rank_prefix_matrix,
-                channel_prefix_matrix,
-                recv_channel_prefix_matrix,
-                # Keep the logical count separate from the storage tensor so
-                # cached dispatch avoids a GPU sync while cached combine still
-                # gets a valid src_idx pointer when the count is 0.
-                num_recv_tokens,
-                recv_src_idx if num_recv_tokens > 0 else recv_src_idx.new_empty((1,)),
-                is_token_in_rank,
-                send_head,
+            # Keep the logical count separate from the storage tensor so cached
+            # dispatch avoids a GPU sync while cached combine still gets a
+            # valid src_idx pointer when the count is 0.
+            handle = IntranodeDispatchHandle(
+                rank_prefix_matrix=rank_prefix_matrix,
+                channel_prefix_matrix=channel_prefix_matrix,
+                recv_channel_prefix_matrix=recv_channel_prefix_matrix,
+                num_recv_tokens=num_recv_tokens,
+                recv_src_idx=recv_src_idx
+                if num_recv_tokens > 0
+                else recv_src_idx.new_empty((1,)),
+                is_token_in_rank=is_token_in_rank,
+                send_head=send_head,
             )
             previous_tensors_to_record = (
                 ()
@@ -1167,15 +978,12 @@ class ProxyTransport:
             )
 
         # NOTES: the second `_` is for the sending side, so we should use the third one
-        (
-            rank_prefix_matrix,
-            _,
-            channel_prefix_matrix,
-            _,
-            src_idx,
-            is_recv_token_in_rank,
-            send_head,
-        ) = handle
+        assert isinstance(handle, IntranodeDispatchHandle)
+        rank_prefix_matrix = handle.rank_prefix_matrix
+        channel_prefix_matrix = handle.recv_channel_prefix_matrix
+        src_idx = handle.recv_src_idx
+        is_recv_token_in_rank = handle.is_token_in_rank
+        send_head = handle.send_head
         bias_0, bias_1 = ProxyTransport._unpack_bias(bias)
 
         # Launch the kernel
@@ -1302,20 +1110,14 @@ class ProxyTransport:
         num_channels = int(getattr(config, "num_sms", ProxyTransport.num_sms)) // 2
         if handle is not None:
             assert topk_idx is None and topk_weights is None
-            (
-                is_token_in_rank,
-                rdma_channel_prefix_matrix,
-                gbl_channel_prefix_matrix,
-                recv_rdma_channel_prefix_matrix,
-                recv_rdma_rank_prefix_sum,
-                recv_gbl_channel_prefix_matrix,
-                recv_gbl_rank_prefix_sum,
-                num_recv_tokens,
-                num_rdma_recv_tokens,
-                recv_src_meta,
-                send_rdma_head,
-                send_nvl_head,
-            ) = handle
+            assert isinstance(handle, InternodeDispatchHandle)
+            is_token_in_rank = handle.is_token_in_rank
+            rdma_channel_prefix_matrix = handle.rdma_channel_prefix_matrix
+            gbl_channel_prefix_matrix = handle.gbl_channel_prefix_matrix
+            recv_rdma_rank_prefix_sum = handle.recv_rdma_rank_prefix_sum
+            recv_gbl_rank_prefix_sum = handle.recv_gbl_rank_prefix_sum
+            num_recv_tokens = handle.num_recv_tokens
+            num_rdma_recv_tokens = handle.num_rdma_recv_tokens
             # Allocate at least 1 row so data_ptr() is never null (zero-token ranks
             # produce empty tensors whose data_ptr()==0, which trips C++ assertions).
             alloc_recv_tokens = max(num_recv_tokens, 1)
@@ -1579,19 +1381,19 @@ class ProxyTransport:
             # Keep at least 1 row so data_ptr() is never null (zero-token combine
             # assertion guard, matching the alloc_rdma_recv_tokens pattern above).
             send_nvl_head = send_nvl_head[: max(num_rdma_recv_tokens, 1)]
-            handle = (
-                is_token_in_rank,
-                rdma_channel_prefix_matrix,
-                gbl_channel_prefix_matrix,
-                recv_rdma_channel_prefix_matrix,
-                recv_rdma_rank_prefix_sum,
-                recv_gbl_channel_prefix_matrix,
-                recv_gbl_rank_prefix_sum,
-                num_recv_tokens,
-                num_rdma_recv_tokens,
-                recv_src_meta,
-                send_rdma_head,
-                send_nvl_head,
+            handle = InternodeDispatchHandle(
+                is_token_in_rank=is_token_in_rank,
+                rdma_channel_prefix_matrix=rdma_channel_prefix_matrix,
+                gbl_channel_prefix_matrix=gbl_channel_prefix_matrix,
+                recv_rdma_channel_prefix_matrix=recv_rdma_channel_prefix_matrix,
+                recv_rdma_rank_prefix_sum=recv_rdma_rank_prefix_sum,
+                recv_gbl_channel_prefix_matrix=recv_gbl_channel_prefix_matrix,
+                recv_gbl_rank_prefix_sum=recv_gbl_rank_prefix_sum,
+                num_recv_tokens=num_recv_tokens,
+                num_rdma_recv_tokens=num_rdma_recv_tokens,
+                recv_src_meta=recv_src_meta,
+                send_rdma_head=send_rdma_head,
+                send_nvl_head=send_nvl_head,
             )
             previous_tensors_to_record = (
                 ()
@@ -1650,20 +1452,15 @@ class ProxyTransport:
         assert config is not None
 
         # Unpack handle and bias
-        (
-            is_combined_token_in_rank,
-            _,
-            _,
-            rdma_channel_prefix_matrix,
-            rdma_rank_prefix_sum,
-            gbl_channel_prefix_matrix,
-            gbl_rank_prefix_sum,
-            _,
-            _,
-            src_meta,
-            send_rdma_head,
-            send_nvl_head,
-        ) = handle
+        assert isinstance(handle, InternodeDispatchHandle)
+        is_combined_token_in_rank = handle.is_token_in_rank
+        rdma_channel_prefix_matrix = handle.recv_rdma_channel_prefix_matrix
+        rdma_rank_prefix_sum = handle.recv_rdma_rank_prefix_sum
+        gbl_channel_prefix_matrix = handle.recv_gbl_channel_prefix_matrix
+        gbl_rank_prefix_sum = handle.recv_gbl_rank_prefix_sum
+        src_meta = handle.recv_src_meta
+        send_rdma_head = handle.send_rdma_head
+        send_nvl_head = handle.send_nvl_head
         bias_0, bias_1 = ProxyTransport._unpack_bias(bias)
 
         num_combined_tokens = int(is_combined_token_in_rank.size(0))

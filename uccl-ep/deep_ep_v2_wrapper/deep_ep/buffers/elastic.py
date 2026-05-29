@@ -10,7 +10,11 @@ import torch.distributed as dist
 from uccl import ep
 from uccl.ep import Config
 
-from ..proxy_transport import ProxyTransport
+from ..proxy_transport import (
+    InternodeDispatchHandle,
+    IntranodeDispatchHandle,
+    ProxyTransport,
+)
 from ..utils.event import EventOverlap
 
 
@@ -342,10 +346,10 @@ class ElasticBuffer:
         expanded_expert_cursor = torch.empty(
             (num_local_experts,), dtype=torch.int32, device=recv_topk_idx.device
         )
-        if len(transport_handle) >= 10:
+        if isinstance(transport_handle, InternodeDispatchHandle):
             # Internode path: UCCL packet metadata carries source RDMA rank,
             # source NVL rank, and source token index.
-            recv_src_meta = transport_handle[9]
+            recv_src_meta = transport_handle.recv_src_meta
             self.runtime.build_v2_dispatch_metadata(
                 recv_src_meta.data_ptr(),
                 recv_topk_idx.data_ptr(),
@@ -367,11 +371,13 @@ class ElasticBuffer:
                 self._compute_stream_ptr(),
             )
         else:
+            if not isinstance(transport_handle, IntranodeDispatchHandle):
+                raise TypeError(f"Unexpected dispatch handle: {type(transport_handle)!r}")
             # Intranode path: transport returns source token indices plus a
             # rank-prefix matrix. The native helper reconstructs V2 global
             # source token ids from those two tensors.
-            rank_prefix_matrix = transport_handle[0]
-            recv_src_idx = transport_handle[4]
+            rank_prefix_matrix = transport_handle.rank_prefix_matrix
+            recv_src_idx = transport_handle.recv_src_idx
             self.runtime.build_v2_intranode_dispatch_metadata(
                 recv_src_idx.data_ptr(),
                 rank_prefix_matrix.data_ptr(),

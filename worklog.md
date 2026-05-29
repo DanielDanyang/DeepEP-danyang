@@ -969,3 +969,58 @@ chunk sweep 观察：
 - 结论：当前 legacy UCCL internode kernels 对 chunk 尺寸有隐含布局/流控约束，
   不能简单靠放大 chunk 跑满 EFA；下一步应继续真正重写 V2-native
   dispatch/combine 数据面，而不是在 V1 staging 参数上扫太远。
+
+## 2026-05-29 V2 handle 命名化，去掉未使用 facade
+
+代码清理：
+
+- `ProxyTransport` 中未使用的 Python `build_v2_dispatch_metadata` /
+  `build_v2_expanded_payload` / `build_v2_reduced_combine_input` facade 已删除。
+  这些路径已经由 `ElasticBuffer` 直接调用 `NativeElasticProxyBuffer`，继续保留会让
+  后续开发误以为 `ProxyTransport` 仍是 V2 epilogue owner。
+- 新增命名化 transport handle：
+  - `IntranodeDispatchHandle`
+  - `InternodeDispatchHandle`
+- `ElasticBuffer._build_v2_metadata` 不再靠 `transport_handle[9]` /
+  `transport_handle[0]` 这种裸 tuple 索引区分 internode/intranode，而是根据
+  handle 类型和字段名读取 `recv_src_meta`、`rank_prefix_matrix`、`recv_src_idx`。
+- `ProxyTransport.dispatch` / `combine` 的 cached path 和 combine path 也改为字段访问，
+  为后续把 handle 下沉为 C++ native object 做准备。
+- `uccl-ep/README.md` 更新为当前 runtime 状态：
+  `NativeElasticProxyBuffer` 是唯一 public native V2 runtime，
+  `Buffer`/`ElasticProxyBuffer` 不再 public 暴露。
+
+验证：
+
+- 本地：
+  - `python -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/proxy_transport.py
+    uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+  - `git diff --check`
+- 单机 EP2 smoke：
+  - 日志：`/tmp/v2_named_handle_ep2_smoke.log`
+  - 通过。
+  - rank0：dispatch `0.786 ms`，expanded dispatch `0.603 ms`，
+    cached dispatch `0.157 ms`，combine `0.108 ms`，reduced combine
+    `0.165 ms`。
+- EP 8 x 2，`#SM=20` 快速复测：
+  - 日志：
+    `/tmp/v2_named_handle_ep8x2_sms20_rank0.log`,
+    `/tmp/v2_named_handle_ep8x2_sms20_rank1.log`
+  - `rank=0/16`：
+    - dispatch `8 GB/s (SO)`, `7725.640 us`
+    - expanded dispatch `9 GB/s (SO)`, `6611.912 us`
+    - cached dispatch `18 GB/s (SO)`, `3326.514 us`
+    - combine `8 GB/s (SO)`, `14462.642 us`
+    - reduced combine `7 GB/s (SO)`, `16134.865 us`
+  - `rank=8/16`：
+    - dispatch `8 GB/s (SO)`, `7622.536 us`
+    - expanded dispatch `10 GB/s (SO)`, `6159.341 us`
+    - cached dispatch `19 GB/s (SO)`, `3260.971 us`
+    - combine `8 GB/s (SO)`, `14603.108 us`
+    - reduced combine `7 GB/s (SO)`, `16302.328 us`
+
+结论：
+
+- `#SM=20` 对 combine 略好，但 dispatch/cached dispatch 明显低于默认自动 32 SM；
+  现在不应该把默认 SM 改回 20。
+- named handle 本身不改变带宽；它是后续把 V2 handle 迁入 native/C++ 的结构准备。
