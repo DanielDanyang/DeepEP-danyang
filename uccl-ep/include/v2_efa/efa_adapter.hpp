@@ -27,6 +27,20 @@ struct EfaPostOp {
   uint32_t batch_index = 0;
 };
 
+struct ResolvedEfaPostOp {
+  EfaPostOpKind kind = EfaPostOpKind::kWrite;
+  uint32_t target_rank = 0;
+  uint32_t target_lane = 0;
+  uint32_t bytes = 0;
+  uint32_t signal_value = 0;
+  uint64_t local_offset = 0;
+  uint64_t remote_offset = 0;
+  uint64_t remote_addr = 0;
+  uint32_t rkey = 0;
+  uint32_t descriptor_index = 0;
+  uint32_t batch_index = 0;
+};
+
 struct EfaRemoteEndpoint {
   uint32_t rank = 0;
   uint32_t lane = 0;
@@ -103,6 +117,39 @@ inline EfaPostOp make_efa_post_op(const V2TransferCmd& command) {
     return op;
   }
   throw std::invalid_argument("unknown V2 transfer command kind");
+}
+
+inline ResolvedEfaPostOp resolve_efa_post_op(const EfaPostOp& op,
+                                             const EndpointTable& endpoints) {
+  const auto& endpoint = endpoints.get(op.target_rank, op.target_lane);
+  if (op.remote_offset > endpoint.bytes ||
+      static_cast<uint64_t>(op.bytes) > endpoint.bytes - op.remote_offset) {
+    throw std::out_of_range("V2 EFA post exceeds remote endpoint window");
+  }
+
+  ResolvedEfaPostOp resolved;
+  resolved.kind = op.kind;
+  resolved.target_rank = op.target_rank;
+  resolved.target_lane = op.target_lane;
+  resolved.bytes = op.bytes;
+  resolved.signal_value = op.signal_value;
+  resolved.local_offset = op.local_offset;
+  resolved.remote_offset = op.remote_offset;
+  resolved.remote_addr = endpoint.remote_base + op.remote_offset;
+  resolved.rkey = endpoint.rkey;
+  resolved.descriptor_index = op.descriptor_index;
+  resolved.batch_index = op.batch_index;
+  return resolved;
+}
+
+inline std::vector<ResolvedEfaPostOp> resolve_efa_post_ops(
+    const std::vector<EfaPostOp>& ops, const EndpointTable& endpoints) {
+  std::vector<ResolvedEfaPostOp> resolved;
+  resolved.reserve(ops.size());
+  for (const auto& op : ops) {
+    resolved.push_back(resolve_efa_post_op(op, endpoints));
+  }
+  return resolved;
 }
 
 inline EfaPostOp make_efa_post_op_from_packed_v2_transfer(uint64_t first,

@@ -1264,3 +1264,9 @@ README 风格 EP8x2 性能：
   对齐，避免 make 构建出来的 extension 缺少 runtime 符号。
 - `uccl-ep/NATIVE_V2_REWRITE_PLAN.md` 新增 rank/lane 语义差异理由：这是 V2
   proxy endpoint table 一致性的要求，不是实现风格差异。
+- 继续补齐 proxy post 前的 endpoint 解析层：
+  - 新增 `ResolvedEfaPostOp` 和 `resolve_efa_post_op(s)`。
+  - proxy 可以把 V2 command 里的 `(target_rank, target_lane, remote_offset)` 解析成
+    EFA remote address / rkey。
+  - 解析时检查 `remote_offset + bytes <= endpoint.bytes`，防止 descriptor/layout bug
+    变成越界 RDMA write。

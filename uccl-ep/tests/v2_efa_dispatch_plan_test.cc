@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -314,13 +315,41 @@ int main() {
 
   EndpointTable endpoints(/*num_ranks=*/2, /*num_lanes=*/2);
   endpoints.set(EfaRemoteEndpoint{/*rank=*/0, /*lane=*/0,
-                                  /*remote_base=*/2000, /*rkey=*/123,
-                                  /*bytes=*/4096});
+                                  /*remote_base=*/100000, /*rkey=*/123,
+                                  /*bytes=*/8192});
+  endpoints.set(EfaRemoteEndpoint{/*rank=*/0, /*lane=*/1,
+                                  /*remote_base=*/150000, /*rkey=*/234,
+                                  /*bytes=*/8192});
   endpoints.set(EfaRemoteEndpoint{/*rank=*/1, /*lane=*/0,
-                                  /*remote_base=*/2256, /*rkey=*/456,
-                                  /*bytes=*/4096});
+                                  /*remote_base=*/200000, /*rkey=*/456,
+                                  /*bytes=*/8192});
+  endpoints.set(EfaRemoteEndpoint{/*rank=*/1, /*lane=*/1,
+                                  /*remote_base=*/300000, /*rkey=*/789,
+                                  /*bytes=*/8192});
   assert(endpoints.get(0, 0).rkey == 123);
-  assert(endpoints.get(1, 0).remote_base == 2256);
+  assert(endpoints.get(1, 0).remote_base == 200000);
+  const auto resolved_ops = resolve_efa_post_ops(v2_sink.ops, endpoints);
+  assert(resolved_ops.size() == v2_sink.ops.size());
+  assert(resolved_ops[0].remote_addr == 102000);
+  assert(resolved_ops[0].rkey == 123);
+  RecordingEfaPostSink rank3_sink;
+  drain_v2_transfer_cmds_to_efa_posts(rank3_combine_commands.commands,
+                                      rank3_sink);
+  const auto resolved_rank3_ops = resolve_efa_post_ops(rank3_sink.ops, endpoints);
+  assert(resolved_rank3_ops[0].target_rank == 1);
+  assert(resolved_rank3_ops[0].target_lane == 1);
+  assert(resolved_rank3_ops[0].remote_addr == 305000);
+  assert(resolved_rank3_ops[0].rkey == 789);
+  auto oversized = v2_sink.ops[0];
+  oversized.remote_offset = 8188;
+  oversized.bytes = 8;
+  bool saw_oob = false;
+  try {
+    (void)resolve_efa_post_op(oversized, endpoints);
+  } catch (const std::out_of_range&) {
+    saw_oob = true;
+  }
+  assert(saw_oob);
 
   std::vector<uint8_t> combine_local(8192, 0);
   std::vector<uint8_t> combine_remote(8192, 0);
