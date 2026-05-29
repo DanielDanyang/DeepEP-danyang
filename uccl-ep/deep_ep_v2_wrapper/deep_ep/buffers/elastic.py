@@ -53,9 +53,13 @@ class V2TransportHandle:
     combine_batches: Optional[torch.Tensor]
     combine_counters: Optional[torch.Tensor]
     d2h_queue: object
+    combine_d2h_queue: Optional[object]
     dispatch_layout: dict
+    combine_layout: Optional[dict]
     num_dispatch_batches: int
     num_dispatch_segments: int
+    num_combine_batches: int
+    num_combine_segments: int
     payload_bytes: int
     scale_bytes: int
 
@@ -1058,9 +1062,13 @@ class ElasticBuffer:
             combine_batches=None,
             combine_counters=None,
             d2h_queue=queue,
+            combine_d2h_queue=None,
             dispatch_layout=layout,
+            combine_layout=None,
             num_dispatch_batches=num_batches,
             num_dispatch_segments=num_segments,
+            num_combine_batches=0,
+            num_combine_segments=0,
             payload_bytes=payload_bytes,
             scale_bytes=scale_bytes,
         )
@@ -1105,6 +1113,10 @@ class ElasticBuffer:
         transport.combine_segments = segments
         transport.combine_batches = batches
         transport.combine_counters = counters
+        transport.combine_d2h_queue = queue
+        transport.combine_layout = layout
+        transport.num_combine_segments = int(counters[0].item())
+        transport.num_combine_batches = int(counters[1].item())
 
     def _semantic_dispatch_data(
         self,
@@ -1245,15 +1257,24 @@ class ElasticBuffer:
         out = torch.zeros((handle.topk_idx.shape[0], hidden), dtype=x.dtype, device=x.device)
         src = handle.recv_src_metadata[:, 0].long()
         if handle.do_expand:
+            payloads = []
+            src_tokens = []
             for slot in range(handle.topk_idx.shape[1]):
                 expanded_idx = handle.recv_src_metadata[:, 2 + slot].long()
                 mask = expanded_idx >= 0
                 if mask.any():
-                    token = (src[mask] % handle.num_max_tokens_per_rank).long()
-                    out[token] += x[expanded_idx[mask]].float().to(out.dtype)
+                    payloads.append(x[expanded_idx[mask]])
+                    src_tokens.append(src[mask])
+            if payloads:
+                send_x = torch.cat(payloads, dim=0)
+                send_src = torch.cat(src_tokens, dim=0)
+                recv_x, recv_token = self._semantic_all_to_all_back(
+                    send_x, send_src, handle.num_max_tokens_per_rank)
+                out.index_add_(0, recv_token.long(), recv_x)
         else:
-            token = (src % handle.num_max_tokens_per_rank).long()
-            out.index_add_(0, token, x[:src.numel()])
+            recv_x, recv_token = self._semantic_all_to_all_back(
+                x[:src.numel()], src, handle.num_max_tokens_per_rank)
+            out.index_add_(0, recv_token.long(), recv_x)
         if isinstance(bias, tuple):
             out += bias[0] + bias[1]
         elif bias is not None:
@@ -1263,9 +1284,49 @@ class ElasticBuffer:
     def _semantic_combine_weights(self, topk_weights: torch.Tensor, handle: EPHandle) -> torch.Tensor:
         out = torch.zeros(handle.topk_idx.shape, dtype=topk_weights.dtype, device=topk_weights.device)
         src = handle.recv_src_metadata[:, 0].long()
-        token = (src % handle.num_max_tokens_per_rank).long()
-        out[token] = topk_weights[:src.numel()]
+        recv_w, recv_token = self._semantic_all_to_all_back(
+            topk_weights[:src.numel()], src, handle.num_max_tokens_per_rank)
+        if recv_w.numel() > 0:
+            out[recv_token.long()] = recv_w
         return out
+
+    def _semantic_all_to_all_back(
+        self,
+        payload: torch.Tensor,
+        src_global: torch.Tensor,
+        num_max_tokens_per_rank: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if payload.numel() == 0:
+            shape = (0,) + tuple(payload.shape[1:])
+            return payload.new_empty(shape), torch.empty((0,), dtype=torch.int64, device=payload.device)
+
+        src_rank = (src_global // num_max_tokens_per_rank).long()
+        src_token = (src_global % num_max_tokens_per_rank).long()
+        send_payload_parts = []
+        send_token_parts = []
+        send_counts = torch.zeros((self.num_ranks,), dtype=torch.int32, device=payload.device)
+        for rank in range(self.num_ranks):
+            mask = src_rank == rank
+            indices = mask.nonzero(as_tuple=True)[0]
+            send_counts[rank] = indices.numel()
+            send_payload_parts.append(payload[indices])
+            send_token_parts.append(src_token[indices])
+
+        recv_counts = torch.empty_like(send_counts)
+        dist.all_to_all_single(recv_counts, send_counts, group=self.group)
+        send_counts_l = [int(v) for v in send_counts.cpu().tolist()]
+        recv_counts_l = [int(v) for v in recv_counts.cpu().tolist()]
+        total_recv = sum(recv_counts_l)
+
+        send_payload = torch.cat(send_payload_parts, dim=0)
+        recv_shape = (total_recv,) + tuple(payload.shape[1:])
+        recv_payload = payload.new_empty(recv_shape)
+        dist.all_to_all_single(recv_payload, send_payload, recv_counts_l, send_counts_l, group=self.group)
+
+        send_token = torch.cat(send_token_parts, dim=0)
+        recv_token = torch.empty((total_recv,), dtype=send_token.dtype, device=send_token.device)
+        dist.all_to_all_single(recv_token, send_token, recv_counts_l, send_counts_l, group=self.group)
+        return recv_payload, recv_token
 
 
 def _align_2mb(x: int) -> int:

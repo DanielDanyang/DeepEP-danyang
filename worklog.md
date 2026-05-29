@@ -1428,3 +1428,38 @@ README 风格 EP8x2 性能：
     `known_hosts` host key mismatch 拦截。
   - 未绕过 strict host key checking，未在服务器执行构建、测试、profiling 或
     benchmark。
+
+## 2026-05-29 ElasticBuffer native V2 smoke 验证推进
+
+- AWS 实例/公网映射已变化，刷新本机 `known_hosts` 后重新确认：
+  - `p5en_0`: hostname `ip-172-31-78-36`，内网 IP `172.31.78.36`
+  - `p5en_1`: hostname `ip-172-31-72-96`，内网 IP `172.31.72.96`
+- 验证前后均确认 `p5en_0` / `p5en_1` 没有其他 GPU compute 进程。
+- 新实例本地盘没有旧 venv，已在两台机器重建专用环境：
+  `/home/ubuntu/.venvs/deepep-danyang-cu13`。
+  - 安装 `torch==2.12.0`、`nanobind==2.12.0`、`ninja`、`numpy`。
+  - DeepEP V2 JIT 需要 NCCL 2.30 的 GIN device API，因此把 venv 内
+    `nvidia-nccl-cu13` 升到 `2.30.4`；默认 `2.29.7` 会缺
+    `ncclGinResourceSharingMode` / `ncclGinRequest_t` 等符号。
+- `p5en_0` / `p5en_1` 上 `uccl-ep make install` 均通过，安装到各自 venv 的
+  `site-packages/uccl/ep.abi3.so`。
+- `ElasticBuffer` native V2 surface 继续补齐：
+  - `V2TransportHandle` 现在同时保存 dispatch 和 combine 的 D2H queue、layout、
+    descriptor/batch/counter 数量。
+  - semantic fallback combine 改成根据 `recv_src_metadata` 做反向 all-to-all，
+    EP>1 时会把结果返回原始 token rank；这只是 correctness fallback，真实 payload
+    数据面下一步仍要替换成 EFA verbs sink。
+  - 新增 `uccl-ep/tests/v2_efa_elastic_smoke.py`，用于单机/多机 native V2
+    wrapper smoke。
+- 服务器 smoke 结果：
+  - 单机 EP1 GPU0：
+    - dispatch: `recv=(8, 16)`，`dispatch_desc=1/1`，`dispatch_ops=2`
+    - combine: `combine_desc=1/1`，`combine_ops=2`，`torch.equal(combined, x)=True`
+  - 单机 EP2（`p5en_0`，GPU0/GPU1）：
+    - rank0/rank1 均输出
+      `recv=(4, 16) dispatch_desc=1/1 dispatch_ops=2 combine_desc=1/1 combine_ops=2 ok=True weights_ok=True`
+  - 双机 EP2（`p5en_0` GPU0 + `p5en_1` GPU0）：
+    - rank0/rank1 均输出
+      `recv=(4, 16) dispatch_desc=1/1 dispatch_ops=2 combine_desc=1/1 combine_ops=2 ok=True weights_ok=True`
+    - torchrun rendezvous 退出时有一个 `TCPStore recvVector failed` shutdown warning，
+      但两个 rank 进程 exit code 为 0，smoke assertions 通过。
