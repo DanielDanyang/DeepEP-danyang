@@ -65,6 +65,9 @@
   - `ProxyCommand` 增加 `signal_value`、`target_rank`、`target_lane`；layout 增加
     `batch_payload_stride`，避免不同 expert/batch 的 expanded slot 0 写到同一 remote
     offset。
+  - 新增 `include/v2_efa/proxy_queue_host.hpp`，提供 fixed-capacity host queue
+    scaffold，可以模拟 device 写入 `ProxyQueueView` 后由 host proxy drain 到 loopback
+    executor。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

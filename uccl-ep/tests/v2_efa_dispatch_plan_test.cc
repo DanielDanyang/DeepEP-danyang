@@ -1,6 +1,7 @@
 #include "v2_efa/dispatch_plan.hpp"
 #include "v2_efa/proxy_command_plan.hpp"
 #include "v2_efa/proxy_loopback.hpp"
+#include "v2_efa/proxy_queue_host.hpp"
 #include "v2_efa/runtime.hpp"
 
 #include <cassert>
@@ -166,6 +167,22 @@ int main() {
   std::memcpy(&dispatch_signal, dispatch_remote.data() + 3000,
               sizeof(uint32_t));
   assert(dispatch_signal == 2);
+
+  std::vector<uint8_t> queued_dispatch_remote(4096, 0);
+  HostProxyQueue dispatch_queue(
+      static_cast<uint32_t>(dispatch_commands.commands.size()));
+  const auto queue_stats =
+      submit_proxy_commands(dispatch_queue, dispatch_commands.commands);
+  assert(queue_stats.submitted == dispatch_commands.commands.size());
+  assert(queue_stats.overflow == 0);
+  assert(dispatch_queue.tail() == dispatch_commands.commands.size());
+  const auto queued_dispatch_stats = dispatch_queue.drain_loopback(
+      LoopbackMemoryView{dispatch_local.data(), dispatch_local.size(),
+                         queued_dispatch_remote.data(),
+                         queued_dispatch_remote.size()});
+  assert(queued_dispatch_stats.payload_commands == 4);
+  assert(std::memcmp(queued_dispatch_remote.data() + 2000,
+                     dispatch_local.data() + 1000, 64) == 0);
 
   std::vector<uint8_t> combine_local(8192, 0);
   std::vector<uint8_t> combine_remote(8192, 0);

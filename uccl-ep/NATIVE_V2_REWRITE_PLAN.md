@@ -357,6 +357,8 @@ device enqueue EFA proxy descriptors
 - 已新增 host loopback executor，用本地 byte buffers 验证 payload copy 和 signal write。
 - proxy command 已包含 signal value 和目标 rank/lane；layout 里有
   `batch_payload_stride`，用于隔离 per-expert semantic batch 的远端 payload 区域。
+- 已新增 fixed-capacity host queue scaffold，模拟 host proxy 从 command ring drain
+  commands；下一步可以把这个 queue adapter 接到 retained EFA posting path。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 
