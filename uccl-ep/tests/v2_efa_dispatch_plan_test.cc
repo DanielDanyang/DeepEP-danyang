@@ -239,6 +239,17 @@ int main() {
   d2h_queue.ack_ready();
   assert(d2h_queue.queue().volatile_tail() == d2h_queue.queue().volatile_head());
 
+  HostV2TransferD2HQueue<16> adapter_d2h_queue;
+  adapter_d2h_queue.submit(dispatch_commands.commands);
+  RecordingEfaPostSink adapter_d2h_sink;
+  const auto drained_count =
+      drain_v2_d2h_queue_to_efa_posts(adapter_d2h_queue, adapter_d2h_sink);
+  assert(drained_count == dispatch_commands.commands.size());
+  assert(adapter_d2h_sink.ops.size() == v2_sink.ops.size());
+  assert(adapter_d2h_sink.ops[0].local_offset == v2_sink.ops[0].local_offset);
+  assert(adapter_d2h_queue.queue().volatile_tail() ==
+         adapter_d2h_queue.queue().volatile_head());
+
   const auto queued_dispatch_stats = dispatch_queue.drain_loopback(
       LoopbackMemoryView{dispatch_local.data(), dispatch_local.size(),
                          queued_dispatch_remote.data(),

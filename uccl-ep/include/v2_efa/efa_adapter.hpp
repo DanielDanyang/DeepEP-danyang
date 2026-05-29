@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "v2_efa/transfer_cmd.hpp"
+#include "v2_efa/transfer_d2h_queue.cuh"
 
 namespace uccl::v2_efa {
 
@@ -123,6 +124,18 @@ inline void drain_packed_v2_transfer_cmds_to_efa_posts(
     sink.post(make_efa_post_op_from_packed_v2_transfer(command.first,
                                                        command.second));
   }
+}
+
+template <uint32_t Capacity>
+inline size_t drain_v2_d2h_queue_to_efa_posts(
+    HostV2TransferD2HQueue<Capacity>& queue, EfaPostSink& sink,
+    bool ack_after_drain = true) {
+  const auto commands = queue.poll_ready();
+  drain_v2_transfer_cmds_to_efa_posts(commands, sink);
+  if (ack_after_drain) {
+    queue.ack_ready();
+  }
+  return commands.size();
 }
 
 }  // namespace uccl::v2_efa

@@ -115,6 +115,8 @@
     ack -> tail 追上 head。
   - `transfer_d2h_queue.cuh` 暴露 `V2TransferD2HQueueView`；`dispatch_jit.cuh` 和
     `combine_jit.cuh` 新增直接 enqueue 到 V2 D2H ring 的 kernel scaffold。
+  - `efa_adapter.hpp` 新增 `drain_v2_d2h_queue_to_efa_posts`，host proxy 侧可以从
+    V2 D2H queue 直接 drain 到 `EfaPostSink` 并 ack/advance tail。
   - 本地没有 nanobind header，`uccl_ep.cc` 只能等服务器/构建环境做 extension 编译；
     当前已完成 Python `py_compile` 和 C++ header/runtime 单测。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
