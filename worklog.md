@@ -1282,3 +1282,10 @@ README 风格 EP8x2 性能：
     provider、MR、QP/CQ 管理逻辑。
 - 新增 `tests/v2_efa_source_hygiene_test.py`，检查旧路径不存在、Python wrapper 不导出
   legacy transport，并确认 build 只包含 V2 runtime/binding 源。
+- 继续推进 V2 proxy adapter：
+  - 新增 `CoalescingEfaPostSink`。
+  - 它只合并同 `target_rank/target_lane` 且 local/remote offset 连续的 payload write。
+  - signal/non-write command 会先 flush pending write，保持 FIFO ordering 和 completion
+    语义不变。
+  - 目的：在不改变 V2 descriptor/FIFO 语义的前提下，让 CPU proxy post 前减少 EFA
+    小 write 数量。

@@ -185,6 +185,62 @@ class ResolvingEfaPostSink final : public EfaPostSink {
   ResolvedEfaPostSink* sink_ = nullptr;
 };
 
+inline bool can_coalesce_efa_write(const EfaPostOp& pending,
+                                   const EfaPostOp& next) {
+  if (pending.kind != EfaPostOpKind::kWrite ||
+      next.kind != EfaPostOpKind::kWrite) {
+    return false;
+  }
+  if (pending.target_rank != next.target_rank ||
+      pending.target_lane != next.target_lane) {
+    return false;
+  }
+  return pending.local_offset + pending.bytes == next.local_offset &&
+         pending.remote_offset + pending.bytes == next.remote_offset;
+}
+
+class CoalescingEfaPostSink final : public EfaPostSink {
+ public:
+  explicit CoalescingEfaPostSink(EfaPostSink* sink) : sink_(sink) {
+    if (sink_ == nullptr) {
+      throw std::invalid_argument("V2 coalescing EFA sink input is null");
+    }
+  }
+
+  ~CoalescingEfaPostSink() override { flush(); }
+
+  void post(const EfaPostOp& op) override {
+    if (op.kind != EfaPostOpKind::kWrite) {
+      flush();
+      sink_->post(op);
+      return;
+    }
+
+    if (has_pending_ && can_coalesce_efa_write(pending_, op)) {
+      pending_.bytes += op.bytes;
+      return;
+    }
+
+    flush();
+    pending_ = op;
+    has_pending_ = true;
+  }
+
+  void flush() {
+    if (!has_pending_) {
+      return;
+    }
+    sink_->post(pending_);
+    pending_ = EfaPostOp{};
+    has_pending_ = false;
+  }
+
+ private:
+  EfaPostSink* sink_ = nullptr;
+  EfaPostOp pending_;
+  bool has_pending_ = false;
+};
+
 inline EfaPostOp make_efa_post_op_from_packed_v2_transfer(uint64_t first,
                                                           uint64_t second) {
   return make_efa_post_op(unpack_v2_transfer_cmd(first, second));

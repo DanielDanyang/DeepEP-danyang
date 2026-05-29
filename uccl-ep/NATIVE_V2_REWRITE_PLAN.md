@@ -108,6 +108,7 @@ Gin device communication 的跨机传输实现，同时保持 V2 buffer/handle/k
 | D2H queue 语义 | 单个 FIFO 可混排不同 V1 command kind | 单个 V2 FIFO 混排 dispatch/combine/signal command，多 FIFO 只表示 channel/proxy thread 并行 | V1 没有按 dispatch/combine 分队列，V2 也不应该按语义分队列。分队列只能用于并行度和 NIC/channel 映射，否则会凭空改变 proxy ordering 和 backpressure 行为。 |
 | descriptor 层 | V1 kernel 直接从 prefix/staging 生成 transfer command | V2 JIT 中先形成 semantic descriptor，再压缩成 `V2TransferCmd` | V2 的 dispatch/combine 是两套不同 layout 语义。descriptor 是为了把 V2 handle 中的 rank/lane/expert/range/slot/count 显式化，避免重新引入 V1 packed token staging。 |
 | receiver 落点 | 写入 V1 staging / low-latency buffer，再由 V1 combine/epilogue 消费 | 直接写入 V2 expanded layout 或 V2 reduced-combine 目标区域 | 性能目标来自避免 V1 staging 往返；正确性目标来自保持官方 DeepEP V2 epilogue 所期待的 layout。 |
+| proxy write 合并 | V1 proxy 有 batching / post list，按旧 command 语义组织 | V2 proxy sink 在不改变 FIFO 语义的前提下合并同 endpoint 且 local/remote 连续的 payload write | AWS EFA 小消息性能差，V2 descriptor 仍可能产生多个相邻 payload command。合并只发生在 CPU post 前，signal 会强制 flush，不改变 V2 dispatch/combine ordering。 |
 | Python handle | V1 prepare/dispatch/combine binding，包装成类似 V2 接口 | 直接暴露 `V2EfaRuntime`，返回官方 V2 handle/cache 语义 | 兼容包装会让 Python 看起来是 V2，native 实际仍跑 V1 layout，导致 cached dispatch/combine 与官方 V2 语义不一致。 |
 | proxy 框架 | CPU proxy/FIFO/EFA post 可复用 | 继续复用同一类 proxy 方法，但只 decode `V2TransferCmd` | transport substrate 和 V1 语义耦合较弱，应保持同构；唯一必须变化的是 command decode 后的 offset/signal 解释。 |
 
@@ -413,6 +414,8 @@ device enqueue EFA proxy descriptors
   并在 proxy post 前做 window 越界检查。
 - 已新增 `ResolvingEfaPostSink`，让 retained CPU proxy 可以继续只产出 transport-neutral
   `EfaPostOp`，同时由 sink 负责 endpoint table 解析并转发给真实 EFA verbs sink。
+- 已新增 `CoalescingEfaPostSink`，在 CPU proxy post 前合并同 endpoint 且 local/remote
+  连续的 payload writes；signal/non-write command 会 flush，保持 V2 command ordering。
 - 已新增 native V2 `V2TransferCmd`，替代旧 `TransferCmd` 作为后续 command ring wire
   format。它保持 16B/128-bit FIFO slot 宽度，字段来自 V2 descriptor/layout 解析后的
   EFA post 需求，而不是 V1 low-latency bitfield。

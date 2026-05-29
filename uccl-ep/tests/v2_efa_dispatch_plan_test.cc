@@ -354,6 +354,37 @@ int main() {
   assert(resolved_proxy_sink.ops[0].remote_addr == 102000);
   assert(resolving_proxy_queue.queue().volatile_tail() ==
          resolving_proxy_queue.queue().volatile_head());
+  RecordingEfaPostSink coalesced_sink;
+  CoalescingEfaPostSink coalescing_sink(&coalesced_sink);
+  coalescing_sink.post(EfaPostOp{EfaPostOpKind::kWrite,
+                                 /*target_rank=*/1,
+                                 /*target_lane=*/1,
+                                 /*bytes=*/32,
+                                 /*signal_value=*/0,
+                                 /*local_offset=*/64,
+                                 /*remote_offset=*/128});
+  coalescing_sink.post(EfaPostOp{EfaPostOpKind::kWrite,
+                                 /*target_rank=*/1,
+                                 /*target_lane=*/1,
+                                 /*bytes=*/32,
+                                 /*signal_value=*/0,
+                                 /*local_offset=*/96,
+                                 /*remote_offset=*/160});
+  coalescing_sink.post(EfaPostOp{EfaPostOpKind::kSignalWrite,
+                                 /*target_rank=*/1,
+                                 /*target_lane=*/1,
+                                 /*bytes=*/4,
+                                 /*signal_value=*/2,
+                                 /*local_offset=*/0,
+                                 /*remote_offset=*/256});
+  coalescing_sink.flush();
+  assert(coalesced_sink.ops.size() == 2);
+  assert(coalesced_sink.ops[0].kind == EfaPostOpKind::kWrite);
+  assert(coalesced_sink.ops[0].bytes == 64);
+  assert(coalesced_sink.ops[0].local_offset == 64);
+  assert(coalesced_sink.ops[0].remote_offset == 128);
+  assert(coalesced_sink.ops[1].kind == EfaPostOpKind::kSignalWrite);
+  assert(coalesced_sink.ops[1].signal_value == 2);
   auto oversized = v2_sink.ops[0];
   oversized.remote_offset = 8188;
   oversized.bytes = 8;
