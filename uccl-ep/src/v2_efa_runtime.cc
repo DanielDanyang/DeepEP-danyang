@@ -29,6 +29,11 @@ void validate_config(const RuntimeConfig& config) {
     throw std::invalid_argument(
         "num_scaleout_ranks * num_scaleup_ranks must equal world_size");
   }
+  if (config.scaleout_rank * config.num_scaleup_ranks + config.scaleup_rank !=
+      config.rank) {
+    throw std::invalid_argument(
+        "rank must equal scaleout_rank * num_scaleup_ranks + scaleup_rank");
+  }
   (void)experts_per_rank(config.num_experts, config.world_size);
 }
 
@@ -102,6 +107,7 @@ CombinePlan V2EfaRuntime::build_reference_combine_plan_from_dispatch(
     const DispatchPlan& dispatch_plan, int payload_bytes) const {
   CombinePlanConfig plan_config;
   plan_config.dst_original_rank = config_.rank;
+  plan_config.num_scaleup_ranks = config_.num_scaleup_ranks;
   plan_config.payload_bytes = payload_bytes;
   return uccl::v2_efa::build_reference_combine_plan_from_dispatch(
       dispatch_plan, plan_config);

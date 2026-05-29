@@ -243,8 +243,8 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_combine_payload_cmd(
     uint32_t batch_idx, const CombineTransferLayout& layout) {
   return make_v2_transfer_cmd(
       V2TransferCmdKind::kCombinePayload,
-      static_cast<uint32_t>(segment.dst_original_rank),
-      /*target_lane=*/0,
+      static_cast<uint32_t>(segment.dst_scaleout_rank),
+      static_cast<uint32_t>(segment.dst_scaleup_lane),
       segment_idx, batch_idx,
       static_cast<uint32_t>(segment.count * segment.payload_bytes),
       /*signal_value=*/0,
@@ -262,8 +262,8 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_combine_signal_cmd(
     const CombineTransferLayout& layout) {
   return make_v2_transfer_cmd(
       V2TransferCmdKind::kCombineSignal,
-      static_cast<uint32_t>(batch.dst_original_rank),
-      /*target_lane=*/0,
+      static_cast<uint32_t>(batch.dst_scaleout_rank),
+      static_cast<uint32_t>(batch.dst_scaleup_lane),
       static_cast<uint32_t>(batch.first_segment), batch_idx,
       sizeof(uint32_t),
       static_cast<uint32_t>(batch.total_tokens),

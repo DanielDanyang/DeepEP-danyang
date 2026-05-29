@@ -95,7 +95,7 @@ INCLUDES  += $(EFA_CFLAGS) $(GH_CFLAGS) $(DMABUF_CFLAGS) $(NORMAL_CFLAGS)
 SRC_CPP :=
 SRC_CU  :=
 # Non-binding .cc translation units linked into the shared library.
-SRC_CC_LIB :=
+SRC_CC_LIB := src/v2_efa_runtime.cc
 
 OBJ_CPP := $(SRC_CPP:.cpp=.o)
 OBJ_CU  := $(SRC_CU:.cu=.o)

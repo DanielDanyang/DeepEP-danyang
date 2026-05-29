@@ -128,6 +128,8 @@ nb::dict dispatch_plan_to_dict(const v2::DispatchPlan& plan) {
 nb::dict combine_segment_to_dict(const v2::CombineSegmentDescriptor& segment) {
   nb::dict out;
   out["dst_original_rank"] = segment.dst_original_rank;
+  out["dst_scaleout_rank"] = segment.dst_scaleout_rank;
+  out["dst_scaleup_lane"] = segment.dst_scaleup_lane;
   out["src_scaleout_rank"] = segment.src_scaleout_rank;
   out["expert_id"] = segment.expert_id;
   out["count"] = segment.count;
@@ -143,6 +145,8 @@ nb::dict combine_segment_to_dict(const v2::CombineSegmentDescriptor& segment) {
 nb::dict combine_batch_to_dict(const v2::CombineExpertBatch& batch) {
   nb::dict out;
   out["dst_original_rank"] = batch.dst_original_rank;
+  out["dst_scaleout_rank"] = batch.dst_scaleout_rank;
+  out["dst_scaleup_lane"] = batch.dst_scaleup_lane;
   out["src_scaleout_rank"] = batch.src_scaleout_rank;
   out["expert_id"] = batch.expert_id;
   out["first_segment"] = batch.first_segment;

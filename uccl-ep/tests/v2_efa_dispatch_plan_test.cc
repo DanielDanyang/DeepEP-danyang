@@ -20,9 +20,11 @@ using namespace uccl::v2_efa;
 int main() {
   RuntimeConfig runtime_config;
   runtime_config.world_size = 4;
+  runtime_config.rank = 0;
   runtime_config.num_scaleout_ranks = 2;
   runtime_config.num_scaleup_ranks = 2;
   runtime_config.scaleout_rank = 0;
+  runtime_config.scaleup_rank = 0;
   runtime_config.num_experts = 8;
   runtime_config.num_topk = 2;
   runtime_config.hidden = 16;
@@ -81,11 +83,28 @@ int main() {
   assert(combine_plan.batches.size() == 4);
   assert(combine_plan.segments.size() == 4);
   assert(combine_plan.batches[2].src_scaleout_rank == 1);
+  assert(combine_plan.batches[2].dst_scaleout_rank == 0);
+  assert(combine_plan.batches[2].dst_scaleup_lane == 0);
   assert(combine_plan.batches[2].expert_id == 4);
+  assert(combine_plan.segments[2].dst_scaleout_rank == 0);
+  assert(combine_plan.segments[2].dst_scaleup_lane == 0);
   assert(combine_plan.segments[2].expanded_slot_begin == 0);
   assert(combine_plan.segments[2].topk_slot == 1);
   assert(combine_plan.segments[2].reduced_token_slot == 0);
   assert(combine_plan.segments[2].count == 2);
+
+  auto rank3_config = runtime_config;
+  rank3_config.rank = 3;
+  rank3_config.scaleout_rank = 1;
+  rank3_config.scaleup_rank = 1;
+  V2EfaRuntime rank3_runtime(rank3_config);
+  const auto rank3_combine_plan =
+      rank3_runtime.build_reference_combine_plan_from_dispatch(plan, 32);
+  assert(rank3_combine_plan.batches[0].dst_original_rank == 3);
+  assert(rank3_combine_plan.batches[0].dst_scaleout_rank == 1);
+  assert(rank3_combine_plan.batches[0].dst_scaleup_lane == 1);
+  assert(rank3_combine_plan.segments[0].dst_scaleout_rank == 1);
+  assert(rank3_combine_plan.segments[0].dst_scaleup_lane == 1);
 
   const auto workspace = runtime.workspace_plan(4);
   assert(workspace.dispatch_counters.bytes ==
@@ -152,6 +171,15 @@ int main() {
   assert(v2_transfer_local_offset(combine_commands.commands[0]) == 4000);
   assert(v2_transfer_remote_offset(combine_commands.commands[0]) == 5000);
   assert(combine_commands.commands[0].target_rank == 0);
+  assert(combine_commands.commands[0].target_lane == 0);
+  const auto rank3_combine_layout = make_contiguous_combine_transfer_layout(
+      rank3_combine_plan, /*expanded_slot_stride=*/32,
+      /*reduced_token_stride=*/32, /*local_payload_base=*/4000,
+      /*remote_payload_base=*/5000);
+  const auto rank3_combine_commands =
+      build_combine_transfer_cmd_plan(rank3_combine_plan, rank3_combine_layout);
+  assert(rank3_combine_commands.commands[0].target_rank == 1);
+  assert(rank3_combine_commands.commands[0].target_lane == 1);
   const auto direct_combine_payload = make_v2_combine_payload_cmd(
       combine_plan.segments[0], 0, 0, combine_layout);
   const auto direct_combine_signal =

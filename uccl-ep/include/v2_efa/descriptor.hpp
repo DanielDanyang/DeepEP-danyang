@@ -55,6 +55,8 @@ struct DispatchExpertBatch {
 
 struct CombineSegmentDescriptor {
   int32_t dst_original_rank = kInvalidRank;
+  int32_t dst_scaleout_rank = kInvalidRank;
+  int32_t dst_scaleup_lane = kInvalidRank;
   int32_t src_scaleout_rank = kInvalidRank;
   int32_t expert_id = kInvalidExpert;
   int32_t count = 0;
@@ -64,11 +66,12 @@ struct CombineSegmentDescriptor {
   int32_t reduced_token_slot = 0;
   int32_t payload_bytes = 0;
   uint32_t flags = static_cast<uint32_t>(DescriptorFlags::kReduce);
-  int32_t reserved = 0;
 };
 
 struct CombineExpertBatch {
   int32_t dst_original_rank = kInvalidRank;
+  int32_t dst_scaleout_rank = kInvalidRank;
+  int32_t dst_scaleup_lane = kInvalidRank;
   int32_t src_scaleout_rank = kInvalidRank;
   int32_t expert_id = kInvalidExpert;
   int32_t first_segment = 0;

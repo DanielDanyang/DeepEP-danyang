@@ -28,6 +28,8 @@ __global__ void v2_efa_combine_descriptor_kernel(
 
   int num_segments = 0;
   int num_batches = 0;
+  const int dst_scaleout_rank = dst_original_rank / kNumScaleupRanks;
+  const int dst_scaleup_lane = dst_original_rank % kNumScaleupRanks;
 
   for (int dispatch_batch_idx = 0; dispatch_batch_idx < num_dispatch_batches;
        ++dispatch_batch_idx) {
@@ -45,6 +47,8 @@ __global__ void v2_efa_combine_descriptor_kernel(
     const int first_segment = num_segments;
     auto& combine_batch = batches[num_batches++];
     combine_batch.dst_original_rank = dst_original_rank;
+    combine_batch.dst_scaleout_rank = dst_scaleout_rank;
+    combine_batch.dst_scaleup_lane = dst_scaleup_lane;
     combine_batch.src_scaleout_rank = dispatch_batch.dst_scaleout_rank;
     combine_batch.expert_id = dispatch_batch.expert_id;
     combine_batch.first_segment = first_segment;
@@ -63,6 +67,8 @@ __global__ void v2_efa_combine_descriptor_kernel(
           dispatch_segments[dispatch_batch.first_segment + i];
       auto& segment = segments[num_segments++];
       segment.dst_original_rank = dst_original_rank;
+      segment.dst_scaleout_rank = dst_scaleout_rank;
+      segment.dst_scaleup_lane = dst_scaleup_lane;
       segment.src_scaleout_rank = dispatch_batch.dst_scaleout_rank;
       segment.expert_id = dispatch_batch.expert_id;
       segment.count = dispatch_segment.count;
@@ -72,7 +78,6 @@ __global__ void v2_efa_combine_descriptor_kernel(
       segment.reduced_token_slot = dispatch_segment.src_token_begin;
       segment.payload_bytes = payload_bytes;
       segment.flags = static_cast<uint32_t>(DescriptorFlags::kReduce);
-      segment.reserved = 0;
       combine_batch.total_tokens += dispatch_segment.count;
     }
 

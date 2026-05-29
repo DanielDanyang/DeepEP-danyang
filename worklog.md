@@ -1244,3 +1244,23 @@ README 风格 EP8x2 性能：
   不是本次带宽统计本身的 blocker。
 - 本轮后两台机器 `nvidia-smi --query-compute-apps` 均为空；中途失败残留在
   `p5en_1` 的 8 个本次 benchmark Python rank 已清理。
+
+## 2026-05-28 本地 native V2 command 语义推进
+
+- 未连接服务器，未运行任何 GPU/build/benchmark；本轮只在本地推进代码和轻量测试。
+- 根据最新设计纪律，继续保持 V2-only 路径，不恢复旧 V1 `TransferCmd` 兼容。
+- 修正 combine transfer command 的 rank/lane 语义：
+  - 之前 dispatch command 使用 `target_rank = dst_scaleout_rank`、
+    `target_lane = dst_scaleup_lane`，但 combine command 使用
+    `target_rank = dst_original_rank`、`target_lane = 0`。
+  - 这会让同一个 `V2TransferCmd` 字段在 dispatch/combine 两条路径上语义不一致，
+    真实 CPU proxy 不能用同一套 endpoint table drain。
+  - 现在 `CombineSegmentDescriptor` 和 `CombineExpertBatch` 都显式保存
+    `dst_scaleout_rank/dst_scaleup_lane`；combine payload/signal command 也统一按
+    scaleout rank + scaleup lane 发。
+- `V2EfaRuntime` 配置校验新增 rank 分解检查：
+  `rank == scaleout_rank * num_scaleup_ranks + scaleup_rank`。
+- `Makefile` 修正为链接 `src/v2_efa_runtime.cc`，和 `setup.py` 的 V2-only source list
+  对齐，避免 make 构建出来的 extension 缺少 runtime 符号。
+- `uccl-ep/NATIVE_V2_REWRITE_PLAN.md` 新增 rank/lane 语义差异理由：这是 V2
+  proxy endpoint table 一致性的要求，不是实现风格差异。

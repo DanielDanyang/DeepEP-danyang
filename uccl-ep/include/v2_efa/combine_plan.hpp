@@ -17,6 +17,7 @@ struct CombinePlan {
 
 struct CombinePlanConfig {
   int dst_original_rank = 0;
+  int num_scaleup_ranks = 1;
   int payload_bytes = 0;
 };
 
@@ -45,8 +46,13 @@ struct MutableCombineBatch {
 inline CombinePlan build_reference_combine_plan_from_dispatch(
     const DispatchPlan& dispatch_plan, const CombinePlanConfig& config) {
   validate_non_negative("dst_original_rank", config.dst_original_rank);
+  validate_positive("num_scaleup_ranks", config.num_scaleup_ranks);
   validate_non_negative("payload_bytes", config.payload_bytes);
 
+  const int dst_scaleout_rank =
+      config.dst_original_rank / config.num_scaleup_ranks;
+  const int dst_scaleup_lane =
+      config.dst_original_rank % config.num_scaleup_ranks;
   std::map<detail::CombineBatchKey, detail::MutableCombineBatch> by_key;
 
   for (const auto& dispatch_segment : dispatch_plan.segments) {
@@ -82,6 +88,8 @@ inline CombinePlan build_reference_combine_plan_from_dispatch(
 
     CombineSegmentDescriptor segment;
     segment.dst_original_rank = key.dst_original_rank;
+    segment.dst_scaleout_rank = dst_scaleout_rank;
+    segment.dst_scaleup_lane = dst_scaleup_lane;
     segment.src_scaleout_rank = key.src_scaleout_rank;
     segment.expert_id = key.expert_id;
     segment.count = dispatch_segment.count;
@@ -100,6 +108,8 @@ inline CombinePlan build_reference_combine_plan_from_dispatch(
     const auto& batch = item.second;
     CombineExpertBatch public_batch;
     public_batch.dst_original_rank = batch.key.dst_original_rank;
+    public_batch.dst_scaleout_rank = dst_scaleout_rank;
+    public_batch.dst_scaleup_lane = dst_scaleup_lane;
     public_batch.src_scaleout_rank = batch.key.src_scaleout_rank;
     public_batch.expert_id = batch.key.expert_id;
     public_batch.first_segment = static_cast<int32_t>(plan.segments.size());
