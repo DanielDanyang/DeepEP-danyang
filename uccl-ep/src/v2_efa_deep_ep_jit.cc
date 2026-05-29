@@ -78,6 +78,13 @@ T* checked_ptr(std::uintptr_t ptr, const char* name) {
   return reinterpret_cast<T*>(ptr);
 }
 
+template <typename Result>
+void check_jit_launch_result(Result result) {
+  using deep_ep::lazy_cuGetErrorName;
+  using deep_ep::lazy_cuGetErrorString;
+  EP_CUDA_UNIFIED_CHECK(result);
+}
+
 void compile_v2_efa_jit_plan(const V2EfaJitLaunchPlan& plan) {
   (void)build_v2_efa_jit_runtime(plan);
 }
@@ -95,7 +102,7 @@ void launch_v2_efa_dispatch_descriptor_plan(
   const auto runtime = build_v2_efa_jit_runtime(plan);
   auto config =
       make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
-  EP_CUDA_UNIFIED_CHECK(deep_ep::jit::launch_kernel(
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
       runtime->kernel, config, checked_ptr<const int64_t>(topk_idx_ptr, "topk_idx"),
       checked_ptr<DispatchSegmentDescriptor>(segments_ptr, "segments"),
       checked_ptr<DispatchExpertBatch>(batches_ptr, "batches"),
@@ -118,7 +125,7 @@ void launch_v2_efa_combine_descriptor_plan(
   const auto runtime = build_v2_efa_jit_runtime(plan);
   auto config =
       make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
-  EP_CUDA_UNIFIED_CHECK(deep_ep::jit::launch_kernel(
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
       runtime->kernel, config,
       checked_ptr<const DispatchSegmentDescriptor>(dispatch_segments_ptr,
                                                   "dispatch_segments"),

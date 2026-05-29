@@ -1319,3 +1319,8 @@ README 风格 EP8x2 性能：
     `v2_efa_deep_ep_jit.cc`，`v2_efa_runtime.cc` 仍保持可单独编译测试。
   - `uccl-ep/setup.py` / `Makefile` 补上 `third-party/fmt/include`，因为接入
     DeepEP JIT compiler headers 后会用到 `csrc/utils/format.hpp`。
+  - 服务器 `p5en_0` 上 `make -j$(nproc)` 与 `make install` 已通过，安装到
+    `/home/ubuntu/.venvs/deepep-danyang-cu13/lib/python3.12/site-packages/uccl/`。
+  - 准备跑单 GPU descriptor JIT smoke 前复查 GPU 进程，发现已有 `xingyu`
+    的 8 个 Python 进程占用 GPU；按 `agents.md` 纪律立即停止后续服务器操作，
+    没有启动 smoke、benchmark 或 profiling。

@@ -240,8 +240,9 @@ nb::list transfer_cmds_to_list(const v2::V2TransferCmdPlan& plan) {
 
 std::vector<int64_t> sequence_to_i64_vector(const nb::sequence& values) {
   std::vector<int64_t> out;
-  out.reserve(static_cast<size_t>(values.size()));
-  for (size_t i = 0; i < values.size(); ++i) {
+  const auto num_values = static_cast<size_t>(nb::len(values));
+  out.reserve(num_values);
+  for (size_t i = 0; i < num_values; ++i) {
     out.push_back(nb::cast<int64_t>(values[i]));
   }
   return out;
@@ -310,7 +311,7 @@ NB_MODULE(ep, m) {
            [](const v2::V2EfaRuntime& self, nb::sequence topk_idx_flat,
               int num_tokens, int payload_bytes, int scale_bytes,
               bool has_topk_weight) {
-             if (topk_idx_flat.size() !=
+             if (static_cast<size_t>(nb::len(topk_idx_flat)) !=
                  static_cast<size_t>(num_tokens * self.config().num_topk)) {
                throw std::invalid_argument(
                    "topk_idx_flat length must equal num_tokens * num_topk");
@@ -324,7 +325,7 @@ NB_MODULE(ep, m) {
            [](const v2::V2EfaRuntime& self, nb::sequence topk_idx_flat,
               int num_tokens, int dispatch_payload_bytes, int scale_bytes,
               int combine_payload_bytes, bool has_topk_weight) {
-             if (topk_idx_flat.size() !=
+             if (static_cast<size_t>(nb::len(topk_idx_flat)) !=
                  static_cast<size_t>(num_tokens * self.config().num_topk)) {
                throw std::invalid_argument(
                    "topk_idx_flat length must equal num_tokens * num_topk");
@@ -345,7 +346,7 @@ NB_MODULE(ep, m) {
            [](const v2::V2EfaRuntime& self, nb::sequence topk_idx_flat,
               int num_tokens, int dispatch_payload_bytes, int scale_bytes,
               int combine_payload_bytes, bool has_topk_weight) {
-             if (topk_idx_flat.size() !=
+             if (static_cast<size_t>(nb::len(topk_idx_flat)) !=
                  static_cast<size_t>(num_tokens * self.config().num_topk)) {
                throw std::invalid_argument(
                    "topk_idx_flat length must equal num_tokens * num_topk");
