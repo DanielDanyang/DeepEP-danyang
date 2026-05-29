@@ -78,6 +78,38 @@ AWS EFA proxy transport
 新的 `uccl-ep` 不再拥有一套独立的 V1 EP layout。它只做一件事：替换 DeepEP V2 里
 Gin device communication 的跨机传输实现，同时保持 V2 buffer/handle/kernel 语义。
 
+## V1/V2 差异说明原则
+
+以后 native V2 UCCL-EP 里的任何设计如果和原 UCCL EP V1 不同，都必须在本计划里写清楚
+理由。默认选择是沿用 V1 的方法：GPU 写 D2H FIFO、CPU proxy drain、EFA post、CQ poll、
+完成状态回传。只有当 DeepEP V2 的语义、buffer layout、JIT 机制或 AWS EFA 的约束使 V1
+方法无法正确表达，才允许改动。
+
+判断标准：
+
+- 如果差异只是实现风格不同，但 V1 方法能表达 V2 语义，应改回 V1 风格。
+- 如果差异来自 V2 expanded dispatch / reduced combine / JIT handle / cache 语义，必须说明
+  V1 对应结构为什么不能复用。
+- 如果差异来自 AWS EFA transport 限制，必须说明它解决的是哪一个 EFA 问题，例如小消息、
+  ordering、CPU proxy posting、MR/window 管理或 completion 可见性。
+- 如果新增 queue、command 字段、buffer、metadata 或 proxy 状态，必须说明它对应的 V2
+  语义来源，不能只因为“实现方便”而新增。
+- 如果删除 V1 代码，必须说明被删除代码绑定的是 V1 语义还是可复用 transport；只有前者
+  可以删除，后者应尽量复用或以同构方式重写。
+
+当前允许和 V1 不同的点如下，后续新增差异必须继续补进这张表：
+
+| 差异点 | V1 做法 | V2 目标做法 | 必须不同的理由 |
+| --- | --- | --- | --- |
+| kernel 形态 | `internode.cu` / `intranode.cu` 静态 CUDA kernel | 跟随 DeepEP V2 `.cuh` JIT kernel 形态 | V2 kernel 依赖 hidden/topk/expert/rank/layout 等运行时参数生成特化代码。继续用 V1 静态 kernel 会把 V2 tensor 投影回 packed staging，无法保持官方 V2 handle/cache 语义。 |
+| 数据布局 | `SourceMeta`、prefix matrix、packed/staged token buffer | `BufferLayout` / `TokenLayout`、expanded dispatch、reduced combine | V1 layout 描述的是 packed token staging；V2 layout 描述的是 expanded slot 和 reduced combine slot。两者不是字段改名关系，receiver 目标地址和 combine 反向路径都不同。 |
+| command 格式 | 旧 16B `TransferCmd`，字段编码 V1 low-latency/staging offset/expert counter | 新 16B `V2TransferCmd`，字段编码 V2 layout 解析后的 EFA write/signal | slot 宽度和 FIFO 方法应尽量保持 V1，但旧 bitfield 语义来自 V1 staging，不能表达 V2 expanded/reduced offset、lane、rank 和 signal 语义。 |
+| D2H queue 语义 | 单个 FIFO 可混排不同 V1 command kind | 单个 V2 FIFO 混排 dispatch/combine/signal command，多 FIFO 只表示 channel/proxy thread 并行 | V1 没有按 dispatch/combine 分队列，V2 也不应该按语义分队列。分队列只能用于并行度和 NIC/channel 映射，否则会凭空改变 proxy ordering 和 backpressure 行为。 |
+| descriptor 层 | V1 kernel 直接从 prefix/staging 生成 transfer command | V2 JIT 中先形成 semantic descriptor，再压缩成 `V2TransferCmd` | V2 的 dispatch/combine 是两套不同 layout 语义。descriptor 是为了把 V2 handle 中的 rank/lane/expert/range/slot/count 显式化，避免重新引入 V1 packed token staging。 |
+| receiver 落点 | 写入 V1 staging / low-latency buffer，再由 V1 combine/epilogue 消费 | 直接写入 V2 expanded layout 或 V2 reduced-combine 目标区域 | 性能目标来自避免 V1 staging 往返；正确性目标来自保持官方 DeepEP V2 epilogue 所期待的 layout。 |
+| Python handle | V1 prepare/dispatch/combine binding，包装成类似 V2 接口 | 直接暴露 `V2EfaRuntime`，返回官方 V2 handle/cache 语义 | 兼容包装会让 Python 看起来是 V2，native 实际仍跑 V1 layout，导致 cached dispatch/combine 与官方 V2 语义不一致。 |
+| proxy 框架 | CPU proxy/FIFO/EFA post 可复用 | 继续复用同一类 proxy 方法，但只 decode `V2TransferCmd` | transport substrate 和 V1 语义耦合较弱，应保持同构；唯一必须变化的是 command decode 后的 offset/signal 解释。 |
+
 ## 必须删除的 V1 内容
 
 这些文件和接口不应该继续作为 native V2 的组成部分：
