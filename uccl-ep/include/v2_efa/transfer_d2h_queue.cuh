@@ -12,6 +12,13 @@ namespace uccl::v2_efa {
 
 constexpr uint32_t kV2TransferD2HQueueSize = 2048;
 
+struct V2TransferD2HQueueView {
+  V2TransferCmd* commands = nullptr;
+  uint64_t* head = nullptr;
+  uint64_t* tail = nullptr;
+  uint32_t capacity = 0;
+};
+
 template <uint32_t Capacity = kV2TransferD2HQueueSize>
 struct alignas(128) V2TransferD2HQueue {
   static_assert((Capacity & (Capacity - 1)) == 0,
@@ -32,6 +39,10 @@ struct alignas(128) V2TransferD2HQueue {
   }
 
   static constexpr uint32_t mask() { return Capacity - 1; }
+
+  V2TransferD2HQueueView view() {
+    return V2TransferD2HQueueView{commands, &head, &tail, Capacity};
+  }
 
   uint64_t volatile_head() const {
     return __atomic_load_n(&head, __ATOMIC_ACQUIRE);
@@ -146,6 +157,38 @@ struct alignas(128) V2TransferD2HQueue {
     return true;
   }
 };
+
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+__device__ __forceinline__ bool enqueue_v2_transfer_d2h(
+    V2TransferD2HQueueView queue, V2TransferCmd command,
+    uint64_t* out_slot = nullptr) {
+  while (true) {
+    const auto h = *reinterpret_cast<volatile uint64_t*>(queue.head);
+    const auto t = *reinterpret_cast<volatile uint64_t*>(queue.tail);
+    if (h - t == queue.capacity) {
+      __nanosleep(64);
+      continue;
+    }
+    const auto slot = atomicAdd(
+        reinterpret_cast<unsigned long long*>(queue.head),
+        static_cast<unsigned long long>(1));
+    if (slot - t >= queue.capacity) {
+      continue;
+    }
+
+    const auto idx = static_cast<uint32_t>(slot) & (queue.capacity - 1);
+    const auto saved_kind = command.kind;
+    command.kind = 0;
+    queue.commands[idx] = command;
+    __threadfence_system();
+    queue.commands[idx].kind = saved_kind;
+    if (out_slot != nullptr) {
+      *out_slot = slot;
+    }
+    return true;
+  }
+}
+#endif
 
 using DefaultV2TransferD2HQueue =
     V2TransferD2HQueue<kV2TransferD2HQueueSize>;

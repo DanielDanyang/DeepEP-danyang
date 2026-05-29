@@ -113,6 +113,8 @@
     ready byte，不依赖旧 `TransferCmd.cmd_type`。
   - 本地测试新增 V2 D2H ring roundtrip：submit -> poll ready -> `EfaPostOp` ->
     ack -> tail 追上 head。
+  - `transfer_d2h_queue.cuh` 暴露 `V2TransferD2HQueueView`；`dispatch_jit.cuh` 和
+    `combine_jit.cuh` 新增直接 enqueue 到 V2 D2H ring 的 kernel scaffold。
   - 本地没有 nanobind header，`uccl_ep.cc` 只能等服务器/构建环境做 extension 编译；
     当前已完成 Python `py_compile` 和 C++ header/runtime 单测。
 - 服务器当前未执行任何 build/test/profiling/benchmark。

@@ -219,6 +219,11 @@ int main() {
   assert(packed_v2_sink.ops[1].signal_value == 2);
 
   HostV2TransferD2HQueue<16> d2h_queue;
+  const auto d2h_view = d2h_queue.queue().view();
+  assert(d2h_view.commands != nullptr);
+  assert(d2h_view.head != nullptr);
+  assert(d2h_view.tail != nullptr);
+  assert(d2h_view.capacity == 16);
   const auto d2h_stats = d2h_queue.submit(dispatch_commands.commands);
   assert(d2h_stats.submitted == dispatch_commands.commands.size());
   assert(d2h_stats.overflow == 0);

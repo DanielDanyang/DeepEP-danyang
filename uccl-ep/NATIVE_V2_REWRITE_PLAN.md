@@ -381,6 +381,9 @@ device enqueue EFA proxy descriptors
   head/tail/ack 思路和 128-bit slot 宽度，但 readiness byte 是 `V2TransferCmd.kind`，
   不依赖旧 `TransferCmd.cmd_type`。host reference 已覆盖 submit -> poll -> EFA post
   -> ack -> advance tail。
+- `dispatch_jit.cuh` / `combine_jit.cuh` 已新增直接写 `V2TransferD2HQueueView` 的
+  enqueue kernel scaffold。下一步是把这个 view 映射到 retained CPU proxy 的真实
+  pinned D2H queue，并让 proxy poll loop 分流 V2 command。
 - JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。旧
   `ProxyCommand` enqueue/reference 路径已删除，host transfer queue 和 EFA adapter
   都直接消费 `V2TransferCmd`。
