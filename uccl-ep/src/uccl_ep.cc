@@ -460,6 +460,67 @@ NB_MODULE(ep, m) {
            nb::arg("allow_multiple_reduction") = true,
            nb::arg("smem_bytes") = 228 * 1024,
            nb::arg("uccl_include_path") = "")
+      .def("launch_dispatch_descriptors",
+           [](const v2::V2EfaRuntime& self, std::uintptr_t topk_idx_ptr,
+              std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+              std::uintptr_t counters_ptr, int num_tokens,
+              int num_max_tokens_per_rank, int num_channels_per_sm,
+              int scale_bytes, bool has_topk_weight, bool cached_mode,
+              bool deterministic, bool do_cpu_sync, int smem_bytes,
+              const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             self.launch_dispatch_descriptors(
+                 topk_idx_ptr, segments_ptr, batches_ptr, counters_ptr,
+                 num_tokens, num_max_tokens_per_rank, num_channels_per_sm,
+                 scale_bytes, has_topk_weight, cached_mode, deterministic,
+                 do_cpu_sync, smem_bytes, uccl_include_path, cuda_stream_ptr);
+           },
+           nb::arg("topk_idx_ptr"),
+           nb::arg("segments_ptr"),
+           nb::arg("batches_ptr"),
+           nb::arg("counters_ptr"),
+           nb::arg("num_tokens"),
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm") = 1,
+           nb::arg("scale_bytes") = 0,
+           nb::arg("has_topk_weight") = true,
+           nb::arg("cached_mode") = false,
+           nb::arg("deterministic") = false,
+           nb::arg("do_cpu_sync") = false,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("uccl_include_path") = "",
+           nb::arg("cuda_stream_ptr") = 0)
+      .def("launch_combine_descriptors",
+           [](const v2::V2EfaRuntime& self,
+              std::uintptr_t dispatch_segments_ptr,
+              std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
+              std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+              std::uintptr_t counters_ptr, int num_max_tokens_per_rank,
+              int num_channels, int payload_bytes, bool use_expanded_layout,
+              bool allow_multiple_reduction, int smem_bytes,
+              const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             self.launch_combine_descriptors(
+                 dispatch_segments_ptr, dispatch_batches_ptr,
+                 num_dispatch_batches, segments_ptr, batches_ptr, counters_ptr,
+                 num_max_tokens_per_rank, num_channels, payload_bytes,
+                 use_expanded_layout, allow_multiple_reduction, smem_bytes,
+                 uccl_include_path, cuda_stream_ptr);
+           },
+           nb::arg("dispatch_segments_ptr"),
+           nb::arg("dispatch_batches_ptr"),
+           nb::arg("num_dispatch_batches"),
+           nb::arg("segments_ptr"),
+           nb::arg("batches_ptr"),
+           nb::arg("counters_ptr"),
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels") = 1,
+           nb::arg("payload_bytes") = 0,
+           nb::arg("use_expanded_layout") = true,
+           nb::arg("allow_multiple_reduction") = true,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("uccl_include_path") = "",
+           nb::arg("cuda_stream_ptr") = 0)
       .def("launch_dispatch", &v2::V2EfaRuntime::launch_dispatch)
       .def("launch_combine", &v2::V2EfaRuntime::launch_combine);
 

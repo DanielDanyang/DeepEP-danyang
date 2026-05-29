@@ -300,6 +300,63 @@ class ElasticBuffer:
             str(uccl_include_path),
         )
 
+    def launch_dispatch_descriptors(
+        self,
+        topk_idx: torch.Tensor,
+        segments: torch.Tensor,
+        batches: torch.Tensor,
+        counters: torch.Tensor,
+        num_tokens: Optional[int] = None,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels_per_sm: int = 1,
+        scale_bytes: int = 0,
+        has_topk_weight: bool = True,
+        cached_mode: bool = False,
+        deterministic: bool = False,
+        do_cpu_sync: bool = False,
+        smem_bytes: int = 228 * 1024,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Launch the native V2 dispatch descriptor JIT kernel.
+
+        This is the first real DeepEP-JIT launch bridge. It intentionally
+        operates on caller-owned descriptor workspaces; the public dispatch API
+        will allocate and thread these through the V2 handle once the EFA proxy
+        enqueue path is wired behind the same descriptors.
+        """
+
+        _require_cuda_contiguous(topk_idx, "topk_idx")
+        _require_cuda_contiguous(segments, "segments")
+        _require_cuda_contiguous(batches, "batches")
+        _require_cuda_contiguous(counters, "counters")
+        if topk_idx.dtype != torch.int64:
+            raise TypeError("topk_idx must be torch.int64")
+        if counters.dtype not in (torch.int32, torch.uint32):
+            raise TypeError("counters must be torch.int32/torch.uint32")
+
+        tokens = int(topk_idx.shape[0] if num_tokens is None else num_tokens)
+        max_tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_dispatch_descriptors(
+            int(topk_idx.data_ptr()),
+            int(segments.data_ptr()),
+            int(batches.data_ptr()),
+            int(counters.data_ptr()),
+            tokens,
+            max_tokens,
+            int(num_channels_per_sm),
+            int(scale_bytes),
+            bool(has_topk_weight),
+            bool(cached_mode),
+            bool(deterministic),
+            bool(do_cpu_sync),
+            int(smem_bytes),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
     def build_combine_jit_plan(
         self,
         num_max_tokens_per_rank: Optional[int] = None,
@@ -344,6 +401,55 @@ class ElasticBuffer:
             str(uccl_include_path),
         )
 
+    def launch_combine_descriptors(
+        self,
+        dispatch_segments: torch.Tensor,
+        dispatch_batches: torch.Tensor,
+        num_dispatch_batches: int,
+        segments: torch.Tensor,
+        batches: torch.Tensor,
+        counters: torch.Tensor,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels: int = 1,
+        payload_bytes: int = 0,
+        use_expanded_layout: bool = True,
+        allow_multiple_reduction: bool = True,
+        smem_bytes: int = 228 * 1024,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Launch the native V2 combine descriptor JIT kernel."""
+
+        _require_cuda_contiguous(dispatch_segments, "dispatch_segments")
+        _require_cuda_contiguous(dispatch_batches, "dispatch_batches")
+        _require_cuda_contiguous(segments, "segments")
+        _require_cuda_contiguous(batches, "batches")
+        _require_cuda_contiguous(counters, "counters")
+        if counters.dtype not in (torch.int32, torch.uint32):
+            raise TypeError("counters must be torch.int32/torch.uint32")
+
+        max_tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if payload_bytes == 0:
+            payload_bytes = self.hidden * 2
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_combine_descriptors(
+            int(dispatch_segments.data_ptr()),
+            int(dispatch_batches.data_ptr()),
+            int(num_dispatch_batches),
+            int(segments.data_ptr()),
+            int(batches.data_ptr()),
+            int(counters.data_ptr()),
+            max_tokens,
+            int(num_channels),
+            int(payload_bytes),
+            bool(use_expanded_layout),
+            bool(allow_multiple_reduction),
+            int(smem_bytes),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
     def get_comm_stream(self) -> torch.Stream:
         raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)
 
@@ -356,3 +462,16 @@ class ElasticBuffer:
 
 def _align_2mb(x: int) -> int:
     return ((int(x) + (1 << 21) - 1) // (1 << 21)) << 21
+
+
+def _require_cuda_contiguous(tensor: torch.Tensor, name: str) -> None:
+    if not tensor.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+def _cuda_stream_ptr(stream: Optional[torch.cuda.Stream]) -> int:
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    return int(stream.cuda_stream)

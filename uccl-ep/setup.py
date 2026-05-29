@@ -153,6 +153,7 @@ if __name__ == "__main__":
         PROJECT_ROOT / "include",
         PROJECT_ROOT / ".." / "deep_ep" / "include",
         PROJECT_ROOT / ".." / "include",
+        PROJECT_ROOT / ".." / "third-party" / "fmt" / "include",
     ]
     # Nanobind stable-ABI bindings
     nb_dir = Path(nanobind.__file__).parent

@@ -1307,3 +1307,15 @@ README 风格 EP8x2 性能：
     `deep_ep::jit::compiler->build()` 编译到 cubin cache。
   - 当前还没有保存 `KernelRuntime` handle 或 launch kernel；下一步要把 compile
     结果接到 `jit::LaunchRuntime`/`launch_kernel`。
+- 继续把 compile-only 推到真实 JIT launch：
+  - `src/v2_efa_deep_ep_jit.cc` 现在复用 DeepEP 的
+    `compiler->build()`、`KernelRuntime`、`construct_launch_config()` 和
+    `launch_kernel()`。
+  - 新增 `launch_dispatch_descriptors` / `launch_combine_descriptors`，从 Python
+    tensor `data_ptr()` 发射 V2 descriptor JIT kernel。
+  - 这一步仍是 descriptor kernel，不冒充完整 `dispatch()` / `combine()`；下一步要把
+    这些 descriptors 接到 V2TransferCmd D2H enqueue 和 EFA proxy drain。
+  - 为了不让纯 C++ planner 测试依赖 CUDA/Torch，launch 方法实现放在
+    `v2_efa_deep_ep_jit.cc`，`v2_efa_runtime.cc` 仍保持可单独编译测试。
+  - `uccl-ep/setup.py` / `Makefile` 补上 `third-party/fmt/include`，因为接入
+    DeepEP JIT compiler headers 后会用到 `csrc/utils/format.hpp`。

@@ -31,6 +31,18 @@ void init_deep_ep_jit_bridge(const std::string& library_root_path,
                              const std::string& nccl_root_path);
 bool is_deep_ep_jit_bridge_initialized();
 void compile_v2_efa_jit_plan(const V2EfaJitLaunchPlan& plan);
+void launch_v2_efa_dispatch_descriptor_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t topk_idx_ptr,
+    std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+    std::uintptr_t counters_ptr, int num_tokens, int scaleout_rank,
+    int scaleup_rank, int scale_bytes, bool has_topk_weight, int max_segments,
+    int max_batches, std::uintptr_t cuda_stream_ptr = 0);
+void launch_v2_efa_combine_descriptor_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t dispatch_segments_ptr,
+    std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
+    std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+    std::uintptr_t counters_ptr, int dst_original_rank, int payload_bytes,
+    int max_segments, int max_batches, std::uintptr_t cuda_stream_ptr = 0);
 
 class V2EfaRuntime {
  public:
@@ -59,6 +71,23 @@ class V2EfaRuntime {
       int num_max_tokens_per_rank, int num_channels, int payload_bytes,
       bool use_expanded_layout, bool allow_multiple_reduction, int smem_bytes,
       const std::string& uccl_include_path = "") const;
+  void launch_dispatch_descriptors(
+      std::uintptr_t topk_idx_ptr, std::uintptr_t segments_ptr,
+      std::uintptr_t batches_ptr, std::uintptr_t counters_ptr, int num_tokens,
+      int num_max_tokens_per_rank, int num_channels_per_sm, int scale_bytes,
+      bool has_topk_weight, bool cached_mode, bool deterministic,
+      bool do_cpu_sync, int smem_bytes,
+      const std::string& uccl_include_path = "",
+      std::uintptr_t cuda_stream_ptr = 0) const;
+  void launch_combine_descriptors(
+      std::uintptr_t dispatch_segments_ptr,
+      std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
+      std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+      std::uintptr_t counters_ptr, int num_max_tokens_per_rank,
+      int num_channels, int payload_bytes, bool use_expanded_layout,
+      bool allow_multiple_reduction, int smem_bytes,
+      const std::string& uccl_include_path = "",
+      std::uintptr_t cuda_stream_ptr = 0) const;
 
   [[noreturn]] void launch_dispatch() const;
   [[noreturn]] void launch_combine() const;
