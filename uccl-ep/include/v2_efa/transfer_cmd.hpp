@@ -116,6 +116,42 @@ inline V2TransferCmd make_v2_transfer_cmd(const ProxyCommand& command,
   return out;
 }
 
+inline V2TransferCmd make_v2_dispatch_payload_cmd(
+    const DispatchSegmentDescriptor& segment, uint32_t segment_idx,
+    uint32_t batch_idx, const DispatchProxyLayout& layout) {
+  return make_v2_transfer_cmd(
+      make_dispatch_payload_command(segment, segment_idx, batch_idx, layout),
+      static_cast<uint32_t>(segment.expert_id),
+      static_cast<uint32_t>(segment.count));
+}
+
+inline V2TransferCmd make_v2_dispatch_signal_cmd(
+    const DispatchExpertBatch& batch, uint32_t batch_idx,
+    const DispatchProxyLayout& layout) {
+  return make_v2_transfer_cmd(
+      make_dispatch_signal_command(batch, batch_idx, layout),
+      static_cast<uint32_t>(batch.expert_id),
+      static_cast<uint32_t>(batch.total_tokens));
+}
+
+inline V2TransferCmd make_v2_combine_payload_cmd(
+    const CombineSegmentDescriptor& segment, uint32_t segment_idx,
+    uint32_t batch_idx, const CombineProxyLayout& layout) {
+  return make_v2_transfer_cmd(
+      make_combine_payload_command(segment, segment_idx, batch_idx, layout),
+      static_cast<uint32_t>(segment.expert_id),
+      static_cast<uint32_t>(segment.count));
+}
+
+inline V2TransferCmd make_v2_combine_signal_cmd(
+    const CombineExpertBatch& batch, uint32_t batch_idx,
+    const CombineProxyLayout& layout) {
+  return make_v2_transfer_cmd(
+      make_combine_signal_command(batch, batch_idx, layout),
+      static_cast<uint32_t>(batch.expert_id),
+      static_cast<uint32_t>(batch.total_tokens));
+}
+
 inline ProxyCommand v2_transfer_cmd_to_proxy_command(
     const V2TransferCmd& command) {
   if (!is_v2_transfer_cmd(command)) {
@@ -147,5 +183,26 @@ inline ProxyCommand v2_transfer_cmd_to_proxy_command(
   out.remote_offset = command.remote_offset;
   return out;
 }
+
+struct V2TransferQueueView {
+  V2TransferCmd* commands = nullptr;
+  uint32_t* tail = nullptr;
+  uint32_t capacity = 0;
+};
+
+#if defined(__CUDA_ARCH__)
+__device__ __forceinline__ uint32_t reserve_v2_transfer_cmd(
+    V2TransferQueueView queue) {
+  return atomicAdd(queue.tail, 1u);
+}
+
+__device__ __forceinline__ void enqueue_v2_transfer_cmd(
+    V2TransferQueueView queue, V2TransferCmd command) {
+  const auto slot = reserve_v2_transfer_cmd(queue);
+  if (slot < queue.capacity) {
+    queue.commands[slot] = command;
+  }
+}
+#endif
 
 }  // namespace uccl::v2_efa

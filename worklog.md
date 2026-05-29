@@ -76,6 +76,11 @@
     token count、bytes、signal value、64-bit local/remote offset。
   - 新增 `HostV2TransferQueue`，可以直接承载 V2 transfer command ring；adapter 支持
     `V2TransferCmd -> EfaPostOp`。
+  - `dispatch_jit.cuh` / `combine_jit.cuh` 新增直接写 `V2TransferCmd` 的 device enqueue
+    kernel：`v2_efa_dispatch_enqueue_transfer_kernel` 和
+    `v2_efa_combine_enqueue_transfer_kernel`。
+  - `V2TransferCmd` helper 现在可直接从 dispatch/combine descriptor 生成 command，
+    保留 expert id 和 token count。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

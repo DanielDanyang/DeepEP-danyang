@@ -83,6 +83,10 @@ class HostV2TransferQueue {
   explicit HostV2TransferQueue(uint32_t capacity)
       : commands_(capacity), capacity_(capacity) {}
 
+  V2TransferQueueView view() {
+    return V2TransferQueueView{commands_.data(), &tail_, capacity_};
+  }
+
   uint32_t capacity() const { return capacity_; }
   uint32_t tail() const { return tail_; }
   const HostProxyQueueStats& stats() const { return stats_; }

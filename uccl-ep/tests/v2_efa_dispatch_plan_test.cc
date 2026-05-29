@@ -123,15 +123,18 @@ int main() {
          dispatch_commands.commands[1].remote_offset);
 
   const auto v2_dispatch_cmd =
-      make_v2_transfer_cmd(dispatch_commands.commands[0],
-                           /*expert_id=*/plan.batches[0].expert_id,
-                           /*count=*/plan.segments[0].count);
+      make_v2_dispatch_payload_cmd(plan.segments[0], 0, 0, dispatch_layout);
   assert(sizeof(V2TransferCmd) == 64);
   assert(is_v2_transfer_cmd(v2_dispatch_cmd));
   assert(v2_dispatch_cmd.kind ==
          static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload));
   assert(v2_dispatch_cmd.expert_id == 0);
   assert(v2_dispatch_cmd.count == 2);
+  const auto v2_dispatch_signal_cmd =
+      make_v2_dispatch_signal_cmd(plan.batches[0], 0, dispatch_layout);
+  assert(v2_dispatch_signal_cmd.signal_value == 2);
+  assert(v2_dispatch_signal_cmd.expert_id == 0);
+  assert(v2_dispatch_signal_cmd.count == 2);
   const auto proxy_roundtrip =
       v2_transfer_cmd_to_proxy_command(v2_dispatch_cmd);
   assert(proxy_roundtrip.kind == dispatch_commands.commands[0].kind);
@@ -202,6 +205,8 @@ int main() {
   assert(transfer_cmds[1].kind ==
          static_cast<uint8_t>(V2TransferCmdKind::kDispatchSignal));
   HostV2TransferQueue v2_queue(static_cast<uint32_t>(transfer_cmds.size()));
+  auto v2_view = v2_queue.view();
+  assert(v2_view.capacity == transfer_cmds.size());
   const auto v2_queue_stats = submit_v2_transfer_cmds(v2_queue, transfer_cmds);
   assert(v2_queue_stats.submitted == transfer_cmds.size());
   RecordingEfaPostSink v2_sink;

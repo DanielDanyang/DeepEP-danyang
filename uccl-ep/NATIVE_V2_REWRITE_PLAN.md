@@ -363,6 +363,9 @@ device enqueue EFA proxy descriptors
   应实现这个接口，避免把 native V2 command 再编码回旧协议。
 - 已新增 native V2 `V2TransferCmd`，替代旧 `TransferCmd` 作为后续 command ring wire
   format。它保留 V2 expert/batch/descriptor 语义和 64-bit offsets。
+- JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。`ProxyCommand`
+  保留为 reference/adapter 层，真实 native V2 command ring 应逐步切到
+  `V2TransferCmd`。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 
