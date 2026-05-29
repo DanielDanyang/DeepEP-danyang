@@ -249,4 +249,54 @@ inline V2EfaJitLaunchPlan build_v2_efa_combine_jit_plan(
   return plan;
 }
 
+inline V2EfaJitLaunchPlan build_v2_efa_dispatch_enqueue_d2h_jit_plan(
+    const std::string& uccl_include_path = "") {
+  V2EfaJitLaunchPlan plan;
+  plan.name = "v2_efa_dispatch_enqueue_d2h";
+  plan.grid_dim_x = 1;
+  plan.grid_dim_y = 1;
+  plan.num_threads = 32;
+  plan.smem_bytes = 0;
+  plan.cluster_dim = 1;
+  plan.cooperative = false;
+  plan.pdl_enabled = false;
+
+  std::ostringstream source;
+  source << "#include "
+         << quote_include(uccl_include_path, "v2_efa/dispatch_jit.cuh")
+         << "\n\n"
+         << "using namespace uccl::v2_efa;\n\n"
+         << "static void __instantiate_kernel() {\n"
+         << "    auto ptr = reinterpret_cast<void*>(&"
+         << "v2_efa_dispatch_enqueue_d2h_kernel<0>);\n"
+         << "}\n";
+  plan.source = source.str();
+  return plan;
+}
+
+inline V2EfaJitLaunchPlan build_v2_efa_combine_enqueue_d2h_jit_plan(
+    const std::string& uccl_include_path = "") {
+  V2EfaJitLaunchPlan plan;
+  plan.name = "v2_efa_combine_enqueue_d2h";
+  plan.grid_dim_x = 1;
+  plan.grid_dim_y = 1;
+  plan.num_threads = 32;
+  plan.smem_bytes = 0;
+  plan.cluster_dim = 1;
+  plan.cooperative = false;
+  plan.pdl_enabled = false;
+
+  std::ostringstream source;
+  source << "#include "
+         << quote_include(uccl_include_path, "v2_efa/combine_jit.cuh")
+         << "\n\n"
+         << "using namespace uccl::v2_efa;\n\n"
+         << "static void __instantiate_kernel() {\n"
+         << "    auto ptr = reinterpret_cast<void*>(&"
+         << "v2_efa_combine_enqueue_d2h_kernel<0>);\n"
+         << "}\n";
+  plan.source = source.str();
+  return plan;
+}
+
 }  // namespace uccl::v2_efa

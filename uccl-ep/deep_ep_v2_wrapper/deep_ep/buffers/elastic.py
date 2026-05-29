@@ -401,6 +401,22 @@ class ElasticBuffer:
             str(uccl_include_path),
         )
 
+    def build_dispatch_enqueue_d2h_jit_plan(self, uccl_include_path: str = ""):
+        return self.runtime.build_dispatch_enqueue_d2h_jit_plan(str(uccl_include_path))
+
+    def compile_dispatch_enqueue_d2h_jit(self, uccl_include_path: str = ""):
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        return self.runtime.compile_dispatch_enqueue_d2h_jit(str(uccl_include_path))
+
+    def build_combine_enqueue_d2h_jit_plan(self, uccl_include_path: str = ""):
+        return self.runtime.build_combine_enqueue_d2h_jit_plan(str(uccl_include_path))
+
+    def compile_combine_enqueue_d2h_jit(self, uccl_include_path: str = ""):
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        return self.runtime.compile_combine_enqueue_d2h_jit(str(uccl_include_path))
+
     def launch_combine_descriptors(
         self,
         dispatch_segments: torch.Tensor,
@@ -450,6 +466,88 @@ class ElasticBuffer:
             _cuda_stream_ptr(stream),
         )
 
+    def launch_dispatch_enqueue_d2h(
+        self,
+        segments: torch.Tensor,
+        batches: torch.Tensor,
+        num_batches: int,
+        commands: torch.Tensor,
+        head: torch.Tensor,
+        tail: torch.Tensor,
+        layout: dict,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Launch descriptor-to-D2H-command enqueue for dispatch."""
+
+        _require_cuda_contiguous(segments, "segments")
+        _require_cuda_contiguous(batches, "batches")
+        _require_cuda_contiguous(commands, "commands")
+        _require_cuda_contiguous(head, "head")
+        _require_cuda_contiguous(tail, "tail")
+        queue_capacity = _queue_capacity(commands)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_dispatch_enqueue_d2h(
+            int(segments.data_ptr()),
+            int(batches.data_ptr()),
+            int(num_batches),
+            int(commands.data_ptr()),
+            int(head.data_ptr()),
+            int(tail.data_ptr()),
+            queue_capacity,
+            int(layout.get("local_payload_base", 0)),
+            int(layout.get("remote_payload_base", 0)),
+            int(layout.get("remote_signal_base", 0)),
+            int(layout["src_token_stride"]),
+            int(layout["expanded_slot_stride"]),
+            int(layout["batch_payload_stride"]),
+            int(layout.get("signal_stride", 4)),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
+    def launch_combine_enqueue_d2h(
+        self,
+        segments: torch.Tensor,
+        batches: torch.Tensor,
+        num_batches: int,
+        commands: torch.Tensor,
+        head: torch.Tensor,
+        tail: torch.Tensor,
+        layout: dict,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Launch descriptor-to-D2H-command enqueue for combine."""
+
+        _require_cuda_contiguous(segments, "segments")
+        _require_cuda_contiguous(batches, "batches")
+        _require_cuda_contiguous(commands, "commands")
+        _require_cuda_contiguous(head, "head")
+        _require_cuda_contiguous(tail, "tail")
+        queue_capacity = _queue_capacity(commands)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_combine_enqueue_d2h(
+            int(segments.data_ptr()),
+            int(batches.data_ptr()),
+            int(num_batches),
+            int(commands.data_ptr()),
+            int(head.data_ptr()),
+            int(tail.data_ptr()),
+            queue_capacity,
+            int(layout.get("local_payload_base", 0)),
+            int(layout.get("remote_payload_base", 0)),
+            int(layout.get("remote_signal_base", 0)),
+            int(layout["expanded_slot_stride"]),
+            int(layout["reduced_token_stride"]),
+            int(layout["batch_payload_stride"]),
+            int(layout.get("signal_stride", 4)),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
     def get_comm_stream(self) -> torch.Stream:
         raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)
 
@@ -475,3 +573,14 @@ def _cuda_stream_ptr(stream: Optional[torch.cuda.Stream]) -> int:
     if stream is None:
         stream = torch.cuda.current_stream()
     return int(stream.cuda_stream)
+
+
+def _queue_capacity(commands: torch.Tensor) -> int:
+    if commands.element_size() != 1:
+        raise TypeError("commands queue storage must use one-byte elements")
+    if commands.numel() % 16 != 0:
+        raise ValueError("commands queue storage must be a multiple of 16 bytes")
+    capacity = commands.numel() // 16
+    if capacity <= 0 or capacity & (capacity - 1):
+        raise ValueError("commands queue capacity must be a positive power of two")
+    return int(capacity)

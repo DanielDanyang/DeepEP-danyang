@@ -89,6 +89,7 @@ __global__ void v2_efa_combine_descriptor_kernel(
   counters[kDescriptorCounterOverflow] = 0;
 }
 
+template <int kInstance>
 __global__ void v2_efa_combine_enqueue_transfer_kernel(
     const CombineSegmentDescriptor* segments, const CombineExpertBatch* batches,
     int num_batches, V2TransferQueueView queue, CombineTransferLayout layout) {
@@ -97,6 +98,7 @@ __global__ void v2_efa_combine_enqueue_transfer_kernel(
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
+  (void)kInstance;
 
   for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
     const auto& batch = batches[batch_idx];
@@ -114,6 +116,7 @@ __global__ void v2_efa_combine_enqueue_transfer_kernel(
   }
 }
 
+template <int kInstance>
 __global__ void v2_efa_combine_enqueue_d2h_kernel(
     const CombineSegmentDescriptor* segments, const CombineExpertBatch* batches,
     int num_batches, V2TransferD2HQueueView queue,
@@ -123,6 +126,7 @@ __global__ void v2_efa_combine_enqueue_d2h_kernel(
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
+  (void)kInstance;
 
   for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
     const auto& batch = batches[batch_idx];

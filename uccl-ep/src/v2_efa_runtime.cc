@@ -162,6 +162,16 @@ V2EfaJitLaunchPlan V2EfaRuntime::build_combine_jit_plan(
   return build_v2_efa_combine_jit_plan(jit_config);
 }
 
+V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_enqueue_d2h_jit_plan(
+    const std::string& uccl_include_path) const {
+  return build_v2_efa_dispatch_enqueue_d2h_jit_plan(uccl_include_path);
+}
+
+V2EfaJitLaunchPlan V2EfaRuntime::build_combine_enqueue_d2h_jit_plan(
+    const std::string& uccl_include_path) const {
+  return build_v2_efa_combine_enqueue_d2h_jit_plan(uccl_include_path);
+}
+
 void V2EfaRuntime::launch_dispatch() const { fail_not_ready(); }
 
 void V2EfaRuntime::launch_combine() const { fail_not_ready(); }

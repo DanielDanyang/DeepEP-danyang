@@ -158,6 +158,32 @@ int main() {
              "v2_efa_combine_descriptor_kernel<2, 2, 8, 2, 16>") !=
          std::string::npos);
 
+  const auto dispatch_enqueue_jit_plan =
+      runtime.build_dispatch_enqueue_d2h_jit_plan("/tmp/uccl-ep/include");
+  assert(dispatch_enqueue_jit_plan.name == "v2_efa_dispatch_enqueue_d2h");
+  assert(dispatch_enqueue_jit_plan.grid_dim_x == 1);
+  assert(dispatch_enqueue_jit_plan.num_threads == 32);
+  assert(!dispatch_enqueue_jit_plan.cooperative);
+  assert(dispatch_enqueue_jit_plan.source.find(
+             "\"/tmp/uccl-ep/include/v2_efa/dispatch_jit.cuh\"") !=
+         std::string::npos);
+  assert(dispatch_enqueue_jit_plan.source.find(
+             "v2_efa_dispatch_enqueue_d2h_kernel<0>") !=
+         std::string::npos);
+
+  const auto combine_enqueue_jit_plan =
+      runtime.build_combine_enqueue_d2h_jit_plan("/tmp/uccl-ep/include");
+  assert(combine_enqueue_jit_plan.name == "v2_efa_combine_enqueue_d2h");
+  assert(combine_enqueue_jit_plan.grid_dim_x == 1);
+  assert(combine_enqueue_jit_plan.num_threads == 32);
+  assert(!combine_enqueue_jit_plan.cooperative);
+  assert(combine_enqueue_jit_plan.source.find(
+             "\"/tmp/uccl-ep/include/v2_efa/combine_jit.cuh\"") !=
+         std::string::npos);
+  assert(combine_enqueue_jit_plan.source.find(
+             "v2_efa_combine_enqueue_d2h_kernel<0>") !=
+         std::string::npos);
+
   const auto dispatch_layout = make_contiguous_dispatch_transfer_layout(
       plan, /*src_token_stride=*/32, /*expanded_slot_stride=*/32,
       /*local_payload_base=*/1000, /*remote_payload_base=*/2000);

@@ -10,6 +10,7 @@
 #include "../../csrc/jit/handle.hpp"
 #include "../../csrc/jit/include_parser.hpp"
 #include "../../csrc/jit/kernel_runtime.hpp"
+#include "v2_efa/transfer_d2h_queue.cuh"
 
 namespace uccl::v2_efa {
 
@@ -78,6 +79,14 @@ T* checked_ptr(std::uintptr_t ptr, const char* name) {
   return reinterpret_cast<T*>(ptr);
 }
 
+int checked_queue_capacity(int capacity) {
+  if (capacity <= 0 || (capacity & (capacity - 1)) != 0) {
+    throw std::invalid_argument(
+        "V2 EFA D2H queue capacity must be a positive power of two");
+  }
+  return capacity;
+}
+
 template <typename Result>
 void check_jit_launch_result(Result result) {
   using deep_ep::lazy_cuGetErrorName;
@@ -138,6 +147,52 @@ void launch_v2_efa_combine_descriptor_plan(
       payload_bytes, max_segments, max_batches));
 }
 
+void launch_v2_efa_dispatch_enqueue_d2h_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t segments_ptr,
+    std::uintptr_t batches_ptr, int num_batches, std::uintptr_t commands_ptr,
+    std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
+    DispatchTransferLayout layout, std::uintptr_t cuda_stream_ptr) {
+  if (num_batches < 0) {
+    throw std::invalid_argument("invalid V2 EFA dispatch enqueue launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  V2TransferD2HQueueView queue{
+      checked_ptr<V2TransferCmd>(commands_ptr, "commands"),
+      checked_ptr<uint64_t>(head_ptr, "head"),
+      checked_ptr<uint64_t>(tail_ptr, "tail"),
+      static_cast<uint32_t>(checked_queue_capacity(queue_capacity))};
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config,
+      checked_ptr<const DispatchSegmentDescriptor>(segments_ptr, "segments"),
+      checked_ptr<const DispatchExpertBatch>(batches_ptr, "batches"),
+      num_batches, queue, layout));
+}
+
+void launch_v2_efa_combine_enqueue_d2h_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t segments_ptr,
+    std::uintptr_t batches_ptr, int num_batches, std::uintptr_t commands_ptr,
+    std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
+    CombineTransferLayout layout, std::uintptr_t cuda_stream_ptr) {
+  if (num_batches < 0) {
+    throw std::invalid_argument("invalid V2 EFA combine enqueue launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  V2TransferD2HQueueView queue{
+      checked_ptr<V2TransferCmd>(commands_ptr, "commands"),
+      checked_ptr<uint64_t>(head_ptr, "head"),
+      checked_ptr<uint64_t>(tail_ptr, "tail"),
+      static_cast<uint32_t>(checked_queue_capacity(queue_capacity))};
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config,
+      checked_ptr<const CombineSegmentDescriptor>(segments_ptr, "segments"),
+      checked_ptr<const CombineExpertBatch>(batches_ptr, "batches"),
+      num_batches, queue, layout));
+}
+
 void V2EfaRuntime::launch_dispatch_descriptors(
     std::uintptr_t topk_idx_ptr, std::uintptr_t segments_ptr,
     std::uintptr_t batches_ptr, std::uintptr_t counters_ptr, int num_tokens,
@@ -183,6 +238,30 @@ void V2EfaRuntime::launch_combine_descriptors(
                                           cfg.num_scaleout_ranks,
                                           cfg.num_scaleup_ranks)),
       cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_dispatch_enqueue_d2h(
+    std::uintptr_t segments_ptr, std::uintptr_t batches_ptr, int num_batches,
+    std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+    std::uintptr_t tail_ptr, int queue_capacity, DispatchTransferLayout layout,
+    const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto plan = build_dispatch_enqueue_d2h_jit_plan(uccl_include_path);
+  launch_v2_efa_dispatch_enqueue_d2h_plan(
+      plan, segments_ptr, batches_ptr, num_batches, commands_ptr, head_ptr,
+      tail_ptr, queue_capacity, layout, cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_combine_enqueue_d2h(
+    std::uintptr_t segments_ptr, std::uintptr_t batches_ptr, int num_batches,
+    std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+    std::uintptr_t tail_ptr, int queue_capacity, CombineTransferLayout layout,
+    const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto plan = build_combine_enqueue_d2h_jit_plan(uccl_include_path);
+  launch_v2_efa_combine_enqueue_d2h_plan(
+      plan, segments_ptr, batches_ptr, num_batches, commands_ptr, head_ptr,
+      tail_ptr, queue_capacity, layout, cuda_stream_ptr);
 }
 
 }  // namespace uccl::v2_efa

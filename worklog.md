@@ -1324,3 +1324,15 @@ README 风格 EP8x2 性能：
   - 准备跑单 GPU descriptor JIT smoke 前复查 GPU 进程，发现已有 `xingyu`
     的 8 个 Python 进程占用 GPU；按 `agents.md` 纪律立即停止后续服务器操作，
     没有启动 smoke、benchmark 或 profiling。
+- 继续写代码，不做服务器验证：
+  - 将 dispatch/combine enqueue kernel 改成模板 kernel，避免 JIT source include
+    时产生多个 `__global__` symbol，符合 DeepEP `KernelRuntime` 的单 kernel symbol
+    假设。
+  - 新增 dispatch/combine `enqueue_d2h` JIT plan：
+    `v2_efa_dispatch_enqueue_d2h` / `v2_efa_combine_enqueue_d2h`。
+  - C++ / nanobind / Python wrapper 新增 `launch_dispatch_enqueue_d2h` 和
+    `launch_combine_enqueue_d2h`，从 descriptor arrays 直接生成 16B
+    `V2TransferCmd` 到 D2H queue。
+  - Python wrapper 使用 caller-owned queue storage：`commands` 为一字节元素且
+    总字节数必须是 `16 * power_of_two_capacity`，`head/tail` 由调用方提供。
+  - 本地只跑轻量检查，未连接服务器验证。

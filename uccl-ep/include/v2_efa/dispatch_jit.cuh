@@ -133,6 +133,7 @@ __global__ void v2_efa_dispatch_descriptor_kernel(
   counters[kDescriptorCounterOverflow] = 0;
 }
 
+template <int kInstance>
 __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
     const DispatchSegmentDescriptor* segments,
     const DispatchExpertBatch* batches, int num_batches,
@@ -142,6 +143,7 @@ __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
+  (void)kInstance;
 
   for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
     const auto& batch = batches[batch_idx];
@@ -159,6 +161,7 @@ __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
   }
 }
 
+template <int kInstance>
 __global__ void v2_efa_dispatch_enqueue_d2h_kernel(
     const DispatchSegmentDescriptor* segments,
     const DispatchExpertBatch* batches, int num_batches,
@@ -168,6 +171,7 @@ __global__ void v2_efa_dispatch_enqueue_d2h_kernel(
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
+  (void)kInstance;
 
   for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
     const auto& batch = batches[batch_idx];
