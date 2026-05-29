@@ -12,6 +12,14 @@
   - `setup.py` 仍然 glob 编译 `src/*.cu`，会把旧 static kernel 全部带入 build。
 - 已新增 `uccl-ep/NATIVE_V2_REWRITE_PLAN.md`，明确后续要删除 V1 数据面，并按 DeepEP V2
   JIT `.cuh` 路径重写 AWS EFA backend。
+- Phase 0 已开始：
+  - 删除 V1 static EP kernel 文件 `src/internode.cu`、`src/intranode.cu`、`src/layout.cu`。
+  - 删除对应 public header `include/internode.cuh`、`include/intranode.cuh`、
+    `include/layout.hpp`、`include/ep_config.hpp`。
+  - 将 `src/uccl_ep.cc` 替换成 native V2 skeleton，只保留 `Config`、`EventHandle` 和
+    fail-fast `V2EfaRuntime`。
+  - `setup.py` 改成显式编译 `src/uccl_ep.cc`，不再 glob 编译旧 `.cu`。
+  - `ProxyTransport` 替换成 fail-fast placeholder，避免继续误跑 V1 transport。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

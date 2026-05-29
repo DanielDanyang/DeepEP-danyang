@@ -2461,10 +2461,10 @@ void remote_process_completions_fast_mode(
       uint32_t offset = static_cast<uint32_t>(aimm.GetOff()) << 3;
       size_t index = offset / sizeof(int64_t);
 #ifdef USE_RECEIVER_BARRIER
-      // ep_config.hpp
+      // Legacy signaling layout used by the retained proxy substrate.
       bool is_combine = aimm.IsCombine();
       int low_latency_buffer_idx = aimm.GetBufferIdx();
-      // Double-buffer stride must match ep_config.hpp:
+      // Double-buffer stride must match the legacy signaling workspace:
       // signaling_buffer_bytes_internode_aligned =
       //   align(max(dispatch_bytes, combine_bytes), 128)
 #ifdef PER_EXPERT_BATCHING

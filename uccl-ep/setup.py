@@ -3,7 +3,6 @@ import sys
 import subprocess
 import sysconfig
 import setuptools
-from glob import glob
 import shutil
 import site
 from pathlib import Path
@@ -141,7 +140,10 @@ if __name__ == "__main__":
         "-DNB_DOMAIN=uccl_ep",
     ]
     nvcc_flags = ["-O3", "-Xcompiler", "-O3"]
-    sources = glob("./src/*.cu") + glob("./src/*.cpp") + glob("./src/*.cc")
+    # Native V2 rewrite: do not glob ./src/*.cu. The removed V1 implementation
+    # used static internode/intranode/layout kernels, and globbing would
+    # silently pull those paths back into the extension if they reappeared.
+    sources = ["./src/uccl_ep.cc"]
     libraries = ["ibverbs", "nl-3", "nl-route-3"]
     include_dirs = [PROJECT_ROOT / "include", PROJECT_ROOT / ".." / "include"]
     # Nanobind stable-ABI bindings
@@ -156,9 +158,9 @@ if __name__ == "__main__":
     # Collect header files for dependency tracking
     header_files = []
     for inc_dir in include_dirs:
-        header_files.extend(glob(str(inc_dir / "**" / "*.h"), recursive=True))
-        header_files.extend(glob(str(inc_dir / "**" / "*.hpp"), recursive=True))
-        header_files.extend(glob(str(inc_dir / "**" / "*.cuh"), recursive=True))
+        header_files.extend(str(path) for path in inc_dir.glob("**/*.h"))
+        header_files.extend(str(path) for path in inc_dir.glob("**/*.hpp"))
+        header_files.extend(str(path) for path in inc_dir.glob("**/*.cuh"))
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = []
@@ -374,7 +376,8 @@ if __name__ == "__main__":
         os.environ["PYTORCH_ROCM_ARCH"] = device_arch
 
         if int(os.getenv("DISABLE_BUILTIN_SHLF_SYNC", 1)):
-            # Disable built-in warp shuffle sync will have better performance in internode_combine kernel
+            # Retained for compatibility with old build environments; native
+            # V2 kernels will define their own JIT compile flags.
             cxx_flags.append("-DDISABLE_BUILTIN_SHLF_SYNC")
             nvcc_flags.append("-DDISABLE_BUILTIN_SHLF_SYNC")
 

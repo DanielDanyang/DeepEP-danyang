@@ -49,7 +49,8 @@ class UcclProxy {
   // parameters
   void calculate_and_set_dispatch_recv_data_offset(int num_tokens, int hidden,
                                                    int num_experts) {
-    // Calculate layout parameters (same logic as ep_config.hpp and test)
+    // Legacy helper retained only with the proxy substrate; native V2 will
+    // replace this offset math with descriptor-defined workspace layout.
     int num_scales = hidden / 128;
     size_t num_bytes_per_dispatch_msg =
         4 + std::max(hidden * 2, hidden + num_scales * 4);

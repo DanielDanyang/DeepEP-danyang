@@ -9,14 +9,11 @@
 
 - Python 入口在 `deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`。
 - 内部 transport 在 `deep_ep_v2_wrapper/deep_ep/proxy_transport.py`。
-- Native 扩展在 `src/uccl_ep.cc`，但其中仍暴露 V1 风格的
-  `internode_prepare/dispatch/combine` 和 `intranode_prepare/dispatch/combine`。
-- CUDA kernel 仍在 `src/internode.cu`、`src/intranode.cu`、`src/layout.cu`，这些不是
-  DeepEP V2 的 JIT `.cuh` kernel。
-- `ProxyTransport` 仍然包含 V1 handle 字段，例如 `rank_prefix_matrix`、
-  `rdma_channel_prefix_matrix`、`gbl_channel_prefix_matrix`。
-- 下一步不是继续调这些 kernel，而是删除旧数据面，新增 `V2EfaRuntime` 和 V2 JIT
-  descriptor/proxy backend。
+- V1 风格的 `internode_prepare/dispatch/combine` 和
+  `intranode_prepare/dispatch/combine` binding 已从 native 扩展中移除。
+- `src/internode.cu`、`src/intranode.cu`、`src/layout.cu` 以及对应 header 已删除。
+- `ProxyTransport` 现在只保留 fail-fast placeholder，避免旧 transport 被误用。
+- 下一步是实现 `V2EfaRuntime` 和 V2 JIT descriptor/proxy backend。
 
 ## 构建
 
