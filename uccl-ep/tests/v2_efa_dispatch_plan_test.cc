@@ -3,6 +3,7 @@
 #include "v2_efa/runtime.hpp"
 #include "v2_efa/transfer_cmd.hpp"
 #include "v2_efa/transfer_cmd_plan.hpp"
+#include "v2_efa/transfer_d2h_queue.cuh"
 #include "v2_efa/transfer_layout.hpp"
 #include "v2_efa/transfer_loopback.hpp"
 #include "v2_efa/transfer_queue_host.hpp"
@@ -216,6 +217,23 @@ int main() {
   assert(packed_v2_sink.ops[0].local_offset == v2_sink.ops[0].local_offset);
   assert(packed_v2_sink.ops[1].kind == EfaPostOpKind::kSignalWrite);
   assert(packed_v2_sink.ops[1].signal_value == 2);
+
+  HostV2TransferD2HQueue<16> d2h_queue;
+  const auto d2h_stats = d2h_queue.submit(dispatch_commands.commands);
+  assert(d2h_stats.submitted == dispatch_commands.commands.size());
+  assert(d2h_stats.overflow == 0);
+  const auto d2h_ready = d2h_queue.poll_ready();
+  assert(d2h_ready.size() == dispatch_commands.commands.size());
+  assert(d2h_ready[0].kind ==
+         static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload));
+  assert(v2_transfer_local_offset(d2h_ready[0]) == 1000);
+  RecordingEfaPostSink d2h_sink;
+  drain_v2_transfer_cmds_to_efa_posts(d2h_ready, d2h_sink);
+  assert(d2h_sink.ops.size() == v2_sink.ops.size());
+  assert(d2h_sink.ops[0].remote_offset == v2_sink.ops[0].remote_offset);
+  d2h_queue.ack_ready();
+  assert(d2h_queue.queue().volatile_tail() == d2h_queue.queue().volatile_head());
+
   const auto queued_dispatch_stats = dispatch_queue.drain_loopback(
       LoopbackMemoryView{dispatch_local.data(), dispatch_local.size(),
                          queued_dispatch_remote.data(),

@@ -154,6 +154,7 @@ uccl-ep/
     runtime.hpp
     transfer_cmd.hpp
     transfer_cmd_plan.hpp
+    transfer_d2h_queue.cuh
     transfer_layout.hpp
     transfer_queue_host.hpp
     dispatch_jit.cuh
@@ -376,6 +377,10 @@ device enqueue EFA proxy descriptors
   分流 V2 command，而不是进入旧 `TransferCmd` decode 逻辑。
 - command helper 已改为 CUDA/HIP host-device inline；device enqueue kernel 和 host
   reference planner 共用同一套 builder/codec。
+- 已新增 V2 专用 D2H ring scaffold：`transfer_d2h_queue.cuh`。它复用 UCCL EP 的
+  head/tail/ack 思路和 128-bit slot 宽度，但 readiness byte 是 `V2TransferCmd.kind`，
+  不依赖旧 `TransferCmd.cmd_type`。host reference 已覆盖 submit -> poll -> EFA post
+  -> ack -> advance tail。
 - JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。旧
   `ProxyCommand` enqueue/reference 路径已删除，host transfer queue 和 EFA adapter
   都直接消费 `V2TransferCmd`。

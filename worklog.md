@@ -108,6 +108,11 @@
   - `V2TransferCmd` helper 已改为 CUDA/HIP host-device inline；device path 不抛异常，
     使 `dispatch_jit.cuh` / `combine_jit.cuh` 的 enqueue kernel 可以直接调用同一套
     command builder。
+  - 新增 `include/v2_efa/transfer_d2h_queue.cuh`，提供 V2 专用 128-bit D2H ring
+    scaffold。它保留 UCCL EP 的 head/tail/ack 模型，但用 `V2TransferCmd.kind` 做
+    ready byte，不依赖旧 `TransferCmd.cmd_type`。
+  - 本地测试新增 V2 D2H ring roundtrip：submit -> poll ready -> `EfaPostOp` ->
+    ack -> tail 追上 head。
   - 本地没有 nanobind header，`uccl_ep.cc` 只能等服务器/构建环境做 extension 编译；
     当前已完成 Python `py_compile` 和 C++ header/runtime 单测。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
