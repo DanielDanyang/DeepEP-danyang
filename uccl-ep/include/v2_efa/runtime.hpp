@@ -4,6 +4,7 @@
 #include <string>
 
 #include "v2_efa/descriptor.hpp"
+#include "v2_efa/topology.hpp"
 #include "v2_efa/workspace.hpp"
 
 namespace uccl::v2_efa {
@@ -32,6 +33,7 @@ class V2EfaRuntime {
 
   WorkspacePlan workspace_plan(int num_max_tokens_per_rank) const;
   DescriptorPlanStats worst_case_stats(int num_max_tokens_per_rank) const;
+  ExpertRoute route_expert(int expert_id) const;
 
   [[noreturn]] void launch_dispatch() const;
   [[noreturn]] void launch_combine() const;

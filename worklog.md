@@ -31,6 +31,9 @@
     作为后续 JIT kernel 接入点；目前只放 scaffold，不再引入 V1 static kernel。
   - Python `ElasticBuffer` 现在可以构造 runtime 并查询 status/workspace plan，但
     dispatch/combine 仍明确 fail-fast。
+  - 新增 `include/v2_efa/topology.hpp`，把 global expert 映射到
+    `(owner_rank, dst_scaleout_rank, dst_scaleup_lane)`，作为后续 per-expert
+    semantic batching 的基础。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

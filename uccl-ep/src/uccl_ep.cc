@@ -70,6 +70,16 @@ nb::dict stats_to_dict(const v2::DescriptorPlanStats& stats) {
   return out;
 }
 
+nb::dict route_to_dict(const v2::ExpertRoute& route) {
+  nb::dict out;
+  out["expert_id"] = route.expert_id;
+  out["owner_rank"] = route.owner_rank;
+  out["dst_scaleout_rank"] = route.dst_scaleout_rank;
+  out["dst_scaleup_lane"] = route.dst_scaleup_lane;
+  out["is_remote_scaleout"] = static_cast<bool>(route.is_remote_scaleout);
+  return out;
+}
+
 }  // namespace
 
 NB_MODULE(ep, m) {
@@ -124,6 +134,10 @@ NB_MODULE(ep, m) {
            [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank) {
              return stats_to_dict(
                  self.worst_case_stats(num_max_tokens_per_rank));
+           })
+      .def("route_expert",
+           [](const v2::V2EfaRuntime& self, int expert_id) {
+             return route_to_dict(self.route_expert(expert_id));
            })
       .def("launch_dispatch", &v2::V2EfaRuntime::launch_dispatch)
       .def("launch_combine", &v2::V2EfaRuntime::launch_combine);

@@ -92,7 +92,7 @@ class ElasticBuffer:
         config.scaleup_rank = self.scaleup_rank_idx
         config.num_scaleout_ranks = self.num_scaleout_ranks
         config.num_scaleup_ranks = self.num_scaleup_ranks
-        config.num_experts = 1
+        config.num_experts = max(1, self.num_ranks)
         config.num_topk = max(1, self.num_topk)
         config.hidden = self.hidden
         config.elem_bytes = 1 if use_fp8_dispatch else 2
@@ -145,6 +145,9 @@ class ElasticBuffer:
     def get_native_v2_workspace_plan(self, num_max_tokens_per_rank: Optional[int] = None):
         tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
         return self.runtime.workspace_plan(tokens)
+
+    def route_expert(self, expert_id: int):
+        return self.runtime.route_expert(int(expert_id))
 
     def get_comm_stream(self) -> torch.Stream:
         raise NotImplementedError(_NATIVE_V2_REWRITE_MESSAGE)

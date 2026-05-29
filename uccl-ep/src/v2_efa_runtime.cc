@@ -24,6 +24,12 @@ void validate_config(const RuntimeConfig& config) {
       config.num_topk == 0 || config.elem_bytes == 0) {
     throw std::invalid_argument("V2EfaRuntimeConfig contains a zero dimension");
   }
+  if (config.num_scaleout_ranks * config.num_scaleup_ranks !=
+      config.world_size) {
+    throw std::invalid_argument(
+        "num_scaleout_ranks * num_scaleup_ranks must equal world_size");
+  }
+  (void)experts_per_rank(config.num_experts, config.world_size);
 }
 
 [[noreturn]] void fail_not_ready() {
@@ -67,6 +73,13 @@ WorkspacePlan V2EfaRuntime::workspace_plan(
                               stats.num_dispatch_batches,
                               stats.num_combine_segments,
                               stats.num_combine_batches);
+}
+
+ExpertRoute V2EfaRuntime::route_expert(int expert_id) const {
+  return uccl::v2_efa::route_expert(expert_id, config_.num_experts,
+                                    config_.world_size,
+                                    config_.num_scaleup_ranks,
+                                    config_.scaleout_rank);
 }
 
 void V2EfaRuntime::launch_dispatch() const { fail_not_ready(); }
