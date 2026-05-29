@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -112,6 +113,50 @@ int main() {
          sizeof(uint32_t) * kDescriptorCounterWords);
   assert(workspace.combine_counters.bytes ==
          sizeof(uint32_t) * kDescriptorCounterWords);
+
+  const auto dispatch_jit_plan = runtime.build_dispatch_jit_plan(
+      /*num_max_tokens_per_rank=*/4, /*num_channels_per_sm=*/2,
+      /*scale_bytes=*/0, /*has_topk_weight=*/true,
+      /*cached_mode=*/false, /*deterministic=*/false,
+      /*do_cpu_sync=*/false, /*smem_bytes=*/228 * 1024,
+      /*uccl_include_path=*/"/tmp/uccl-ep/include");
+  assert(dispatch_jit_plan.name == "v2_efa_dispatch");
+  assert(dispatch_jit_plan.grid_dim_x == 1);
+  assert(dispatch_jit_plan.num_notify_warps == 4);
+  assert(dispatch_jit_plan.num_scaleout_warps == 2);
+  assert(dispatch_jit_plan.num_forward_warps == 2);
+  assert(dispatch_jit_plan.num_threads == (4 + 2 + 2) * 32);
+  assert(dispatch_jit_plan.cooperative);
+  assert(dispatch_jit_plan.source.find(
+             "#include <deep_ep/impls/hybrid_dispatch.cuh>") !=
+         std::string::npos);
+  assert(dispatch_jit_plan.source.find(
+             "\"/tmp/uccl-ep/include/v2_efa/dispatch_jit.cuh\"") !=
+         std::string::npos);
+  assert(dispatch_jit_plan.source.find(
+             "v2_efa_dispatch_descriptor_kernel<2, 2, 8, 2, 32>") !=
+         std::string::npos);
+
+  const auto combine_jit_plan = runtime.build_combine_jit_plan(
+      /*num_max_tokens_per_rank=*/4, /*num_channels=*/2,
+      /*payload_bytes=*/32, /*use_expanded_layout=*/true,
+      /*allow_multiple_reduction=*/true, /*smem_bytes=*/228 * 1024,
+      /*uccl_include_path=*/"/tmp/uccl-ep/include");
+  assert(combine_jit_plan.name == "v2_efa_combine");
+  assert(combine_jit_plan.grid_dim_x == 1);
+  assert(combine_jit_plan.num_scaleout_warps == 2);
+  assert(combine_jit_plan.num_forward_warps == 2);
+  assert(combine_jit_plan.num_threads == (2 + 2) * 32);
+  assert(combine_jit_plan.cooperative);
+  assert(combine_jit_plan.source.find(
+             "#include <deep_ep/impls/hybrid_combine.cuh>") !=
+         std::string::npos);
+  assert(combine_jit_plan.source.find(
+             "\"/tmp/uccl-ep/include/v2_efa/combine_jit.cuh\"") !=
+         std::string::npos);
+  assert(combine_jit_plan.source.find(
+             "v2_efa_combine_descriptor_kernel<2, 2, 8, 2, 16>") !=
+         std::string::npos);
 
   const auto dispatch_layout = make_contiguous_dispatch_transfer_layout(
       plan, /*src_token_stride=*/32, /*expanded_slot_stride=*/32,

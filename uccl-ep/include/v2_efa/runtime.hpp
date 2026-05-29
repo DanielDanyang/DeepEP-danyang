@@ -6,6 +6,7 @@
 #include "v2_efa/combine_plan.hpp"
 #include "v2_efa/descriptor.hpp"
 #include "v2_efa/dispatch_plan.hpp"
+#include "v2_efa/jit_plan.hpp"
 #include "v2_efa/topology.hpp"
 #include "v2_efa/workspace.hpp"
 
@@ -43,6 +44,15 @@ class V2EfaRuntime {
                                              bool has_topk_weight) const;
   CombinePlan build_reference_combine_plan_from_dispatch(
       const DispatchPlan& dispatch_plan, int payload_bytes) const;
+  V2EfaJitLaunchPlan build_dispatch_jit_plan(
+      int num_max_tokens_per_rank, int num_channels_per_sm,
+      int scale_bytes, bool has_topk_weight, bool cached_mode,
+      bool deterministic, bool do_cpu_sync, int smem_bytes,
+      const std::string& uccl_include_path = "") const;
+  V2EfaJitLaunchPlan build_combine_jit_plan(
+      int num_max_tokens_per_rank, int num_channels, int payload_bytes,
+      bool use_expanded_layout, bool allow_multiple_reduction, int smem_bytes,
+      const std::string& uccl_include_path = "") const;
 
   [[noreturn]] void launch_dispatch() const;
   [[noreturn]] void launch_combine() const;

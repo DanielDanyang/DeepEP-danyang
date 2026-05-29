@@ -1289,3 +1289,13 @@ README 风格 EP8x2 性能：
     语义不变。
   - 目的：在不改变 V2 descriptor/FIFO 语义的前提下，让 CPU proxy post 前减少 EFA
     小 write 数量。
+- 开始接入真实 DeepEP V2 JIT kernel 组织方式：
+  - 新增 `include/v2_efa/jit_plan.hpp`。
+  - dispatch/combine launch plan 复刻官方 V2 `DispatchRuntime` / `CombineRuntime`
+    的 warp/thread/cluster/cooperative 计算。
+  - 生成的 source include 官方 DeepEP V2
+    `deep_ep/impls/{dispatch,hybrid_dispatch,combine,hybrid_combine}.cuh`，同时
+    instantiate AWS `v2_efa/{dispatch,combine}_jit.cuh` kernel。
+  - `V2EfaRuntime` 和 Python wrapper 新增 `build_dispatch_jit_plan` /
+    `build_combine_jit_plan`。当前先验证 source/launch plan，下一步再接
+    `deep_ep::jit::compiler->build` 和真实 launch。

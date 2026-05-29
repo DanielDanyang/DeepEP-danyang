@@ -113,6 +113,55 @@ CombinePlan V2EfaRuntime::build_reference_combine_plan_from_dispatch(
       dispatch_plan, plan_config);
 }
 
+V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_jit_plan(
+    int num_max_tokens_per_rank, int num_channels_per_sm, int scale_bytes,
+    bool has_topk_weight, bool cached_mode, bool deterministic,
+    bool do_cpu_sync, int smem_bytes,
+    const std::string& uccl_include_path) const {
+  V2EfaDispatchJitConfig jit_config;
+  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
+  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
+  jit_config.num_experts = config_.num_experts;
+  jit_config.num_topk = config_.num_topk;
+  jit_config.hidden = config_.hidden;
+  jit_config.elem_bytes = config_.elem_bytes;
+  jit_config.num_sms = std::max(1, config_.num_sms);
+  jit_config.num_channels_per_sm = num_channels_per_sm;
+  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
+  jit_config.scaleout_rank = config_.scaleout_rank;
+  jit_config.scaleup_rank = config_.scaleup_rank;
+  jit_config.scale_bytes = scale_bytes;
+  jit_config.has_topk_weight = has_topk_weight;
+  jit_config.cached_mode = cached_mode;
+  jit_config.deterministic = deterministic;
+  jit_config.do_cpu_sync = do_cpu_sync;
+  jit_config.smem_bytes = smem_bytes;
+  jit_config.uccl_include_path = uccl_include_path;
+  return build_v2_efa_dispatch_jit_plan(jit_config);
+}
+
+V2EfaJitLaunchPlan V2EfaRuntime::build_combine_jit_plan(
+    int num_max_tokens_per_rank, int num_channels, int payload_bytes,
+    bool use_expanded_layout, bool allow_multiple_reduction, int smem_bytes,
+    const std::string& uccl_include_path) const {
+  V2EfaCombineJitConfig jit_config;
+  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
+  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
+  jit_config.num_experts = config_.num_experts;
+  jit_config.num_topk = config_.num_topk;
+  jit_config.hidden = config_.hidden;
+  jit_config.num_sms = std::max(1, config_.num_sms);
+  jit_config.num_channels = num_channels;
+  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
+  jit_config.dst_original_rank = config_.rank;
+  jit_config.payload_bytes = payload_bytes;
+  jit_config.use_expanded_layout = use_expanded_layout;
+  jit_config.allow_multiple_reduction = allow_multiple_reduction;
+  jit_config.smem_bytes = smem_bytes;
+  jit_config.uccl_include_path = uccl_include_path;
+  return build_v2_efa_combine_jit_plan(jit_config);
+}
+
 void V2EfaRuntime::launch_dispatch() const { fail_not_ready(); }
 
 void V2EfaRuntime::launch_combine() const { fail_not_ready(); }

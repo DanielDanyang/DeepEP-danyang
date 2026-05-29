@@ -212,6 +212,24 @@ nb::dict transfer_cmd_to_dict(const v2::V2TransferCmd& cmd) {
   return out;
 }
 
+nb::dict jit_launch_plan_to_dict(const v2::V2EfaJitLaunchPlan& plan) {
+  nb::dict out;
+  out["name"] = plan.name;
+  out["source"] = plan.source;
+  out["grid_dim_x"] = plan.grid_dim_x;
+  out["grid_dim_y"] = plan.grid_dim_y;
+  out["num_threads"] = plan.num_threads;
+  out["smem_bytes"] = plan.smem_bytes;
+  out["cluster_dim"] = plan.cluster_dim;
+  out["cooperative"] = plan.cooperative;
+  out["pdl_enabled"] = plan.pdl_enabled;
+  out["num_notify_warps"] = plan.num_notify_warps;
+  out["num_scaleout_warps"] = plan.num_scaleout_warps;
+  out["num_forward_warps"] = plan.num_forward_warps;
+  out["num_payload_warps"] = plan.num_payload_warps;
+  return out;
+}
+
 nb::list transfer_cmds_to_list(const v2::V2TransferCmdPlan& plan) {
   nb::list out;
   for (const auto& cmd : plan.commands) {
@@ -366,6 +384,42 @@ NB_MODULE(ep, m) {
              out["combine_commands"] = transfer_cmds_to_list(combine_commands);
              return out;
            })
+      .def("build_dispatch_jit_plan",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
+              bool cached_mode, bool deterministic, bool do_cpu_sync,
+              int smem_bytes, const std::string& uccl_include_path) {
+             return jit_launch_plan_to_dict(self.build_dispatch_jit_plan(
+                 num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
+                 has_topk_weight, cached_mode, deterministic, do_cpu_sync,
+                 smem_bytes, uccl_include_path));
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm") = 1,
+           nb::arg("scale_bytes") = 0,
+           nb::arg("has_topk_weight") = true,
+           nb::arg("cached_mode") = false,
+           nb::arg("deterministic") = false,
+           nb::arg("do_cpu_sync") = false,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("uccl_include_path") = "")
+      .def("build_combine_jit_plan",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              int num_channels, int payload_bytes, bool use_expanded_layout,
+              bool allow_multiple_reduction, int smem_bytes,
+              const std::string& uccl_include_path) {
+             return jit_launch_plan_to_dict(self.build_combine_jit_plan(
+                 num_max_tokens_per_rank, num_channels, payload_bytes,
+                 use_expanded_layout, allow_multiple_reduction, smem_bytes,
+                 uccl_include_path));
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels") = 1,
+           nb::arg("payload_bytes") = 0,
+           nb::arg("use_expanded_layout") = true,
+           nb::arg("allow_multiple_reduction") = true,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("uccl_include_path") = "")
       .def("launch_dispatch", &v2::V2EfaRuntime::launch_dispatch)
       .def("launch_combine", &v2::V2EfaRuntime::launch_combine);
 

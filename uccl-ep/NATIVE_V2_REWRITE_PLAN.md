@@ -360,7 +360,7 @@ device enqueue EFA proxy descriptors
 当前进度：
 
 - 已新增 `V2EfaRuntime` skeleton。
-- 已暴露 runtime config、descriptor stats、workspace plan。
+- 已暴露 runtime config、descriptor stats、workspace plan、V2 EFA JIT launch plan。
 - dispatch/combine 仍明确返回未实现错误。
 - 已清理旧 bench、dummy `ep_runtime`、legacy `ProxyTransport` / `utils_uccl`
   入口，避免 native V2 wrapper 继续暴露 V1 过渡路径。
@@ -377,7 +377,23 @@ device enqueue EFA proxy descriptors
 - 新增 `include/v2_efa/dispatch_jit.cuh` 和 `include/v2_efa/combine_jit.cuh`。
 - 第一版 kernel 可以只做 descriptor 生成和校验，不发网络。
 
-交付标准：不同 hidden/topk/expert/num_sms 配置能生成不同 JIT kernel。
+当前进度：
+
+- 已新增 `include/v2_efa/jit_plan.hpp`，开始接入真实 DeepEP V2 JIT kernel 组织方式：
+  - dispatch/combine 的 launch plan 复刻官方 V2 `DispatchRuntime` /
+    `CombineRuntime` 的 SM、warp、thread、cluster、cooperative 计算。
+  - 生成的 JIT source 会 include 官方 DeepEP V2
+    `deep_ep/impls/{dispatch,hybrid_dispatch,combine,hybrid_combine}.cuh`，
+    同时 instantiate `v2_efa/{dispatch,combine}_jit.cuh` 的 AWS V2 kernel。
+  - 这一步先打通“native V2 EFA kernel 由 DeepEP V2 JIT source 生成”的 host/runtime
+    边界；`launch_dispatch/launch_combine` 仍未接到 `deep_ep::jit::compiler->build`
+    和真实 CUDA launch。
+- `V2EfaRuntime` / Python wrapper 已暴露 `build_dispatch_jit_plan` 和
+  `build_combine_jit_plan`，可检查生成 source、launch 维度和 include 路径。
+
+交付标准：不同 hidden/topk/expert/num_sms 配置能生成不同 JIT kernel。当前已能生成
+不同 JIT source/launch plan；下一步要把 plan 交给 `deep_ep::jit::compiler->build`
+并 launch。
 
 ### 4. 设计 V2 EFA command queue
 
