@@ -451,3 +451,240 @@ commit H: benchmark/profiling counters and tuning
 
 这之后 `uccl-ep` 才能被称为 native V2。此前所有从 V1 `internode.cu` 改出来的性能结果都只能
 作为反例和诊断材料，不能作为最终实现基础。
+
+## 设计图与流程图
+
+### 原 UCCL EP / DeepEP V1 设计图
+
+```text
+                 Python / DeepEP V1 wrapper
+                              |
+                              v
+        +----------------------------------------------+
+        |          UCCL EP V1 native extension          |
+        | internode_prepare / dispatch / combine        |
+        | intranode_prepare / dispatch / combine        |
+        +----------------------+-----------------------+
+                               |
+                               v
+        +----------------------------------------------+
+        |          V1 static CUDA kernels (.cu)         |
+        | SourceMeta                                   |
+        | rank_prefix_matrix                           |
+        | rdma_channel_prefix_matrix                   |
+        | gbl_channel_prefix_matrix                    |
+        | recv_rdma_rank_prefix_sum                    |
+        +----------------------+-----------------------+
+                               |
+                               v
+        +----------------------------------------------+
+        |        V1 packed/staged token buffers         |
+        | payload offset = V1 staging offset            |
+        | signal/atomic = expert + LL buffer bitfield   |
+        +----------------------+-----------------------+
+                               |
+                               v
+        +----------------------------------------------+
+        |  GPU -> CPU command path                      |
+        |  16B TransferCmd in D2H ring / FIFO           |
+        |  fields encode V1 semantics:                  |
+        |    cmd_type, dst_rank, bytes, req_lptr/rptr   |
+        |    is_combine, low_latency_buffer_idx, expert |
+        +----------------------+-----------------------+
+                               |
+                               v
+        +----------------------------------------------+
+        |        CPU proxy / RDMA transport             |
+        | poll D2H queue                                |
+        | decode old TransferCmd                        |
+        | post EFA/verbs write, write-with-imm, atomic  |
+        | poll CQ, publish completion / counters        |
+        +----------------------+-----------------------+
+                               |
+                               v
+        +----------------------------------------------+
+        |          receiver V1 staging buffers          |
+        | later consumed by V1 combine/epilogue path    |
+        +----------------------------------------------+
+```
+
+这个设计里，CPU proxy / FIFO / RDMA transport 是可以继续复用的基础设施；真正必须替换的是
+上层 V1 语义：static kernel、prefix matrix、SourceMeta、packed staging layout，以及旧
+`TransferCmd` 里的 `low_latency/is_combine/expert` bitfield。
+
+### 原 UCCL EP / DeepEP V1 流程图
+
+```text
+GPU sender kernel                         CPU proxy                         GPU receiver
+-----------------                         ---------                         ------------
+
+1. read V1 prefix matrices
+   and SourceMeta
+        |
+        v
+2. pack tokens into V1
+   staged RDMA buffer
+        |
+        v
+3. build old 16B TransferCmd
+   - dst_rank
+   - bytes
+   - req_lptr / req_rptr
+   - expert_idx
+   - low_latency_buffer_idx
+   - is_combine
+        |
+        v
+4. push TransferCmd to D2H FIFO  ------->  5. poll FIFO
+                                             |
+                                             v
+                                          6. decode V1 TransferCmd
+                                             |
+                                             v
+                                          7. post RDMA write /
+                                             write-with-imm / atomic
+                                             |
+                                             v
+                                                                                8. payload lands in
+                                                                                   V1 staging buffer
+                                             |
+                                             v
+                                          9. poll CQ and update
+                                             V1 counters/tails
+                                                                                |
+                                                                                v
+                                                                               10. V1 combine /
+                                                                                   epilogue consumes
+                                                                                   staged layout
+```
+
+### 目标 native V2 UCCL-EP 设计图
+
+```text
+                 Python / DeepEP V2 ElasticBuffer
+                              |
+                              v
+        +----------------------------------------------+
+        |            V2EfaRuntime / native AWS path     |
+        | follows DeepEP V2 handle/buffer semantics     |
+        | no V1 rank_prefix_matrix / SourceMeta         |
+        +----------------------+-----------------------+
+                               |
+                               v
+        +----------------------------------------------+
+        |          DeepEP V2-style JIT .cuh kernels     |
+        | dispatch_jit.cuh / combine_jit.cuh            |
+        | params follow hidden/topk/expert/num_sms      |
+        +----------------------+-----------------------+
+                               |
+                               v
+        +----------------------------------------------+
+        |              V2 semantic descriptors          |
+        | DispatchSegment / DispatchBatch               |
+        |   dst_rank/lane, expert, src token range      |
+        |   expanded slot range, count, payload bytes   |
+        | CombineSegment / CombineBatch                 |
+        |   dst original rank, expanded slot            |
+        |   reduced token slot, reduce payload bytes    |
+        +----------------------+-----------------------+
+                               |
+                               v
+        +----------------------------------------------+
+        |        native V2 transfer command layer       |
+        | descriptor/layout -> 16B V2TransferCmd        |
+        | fields encode EFA post needs only:            |
+        |   kind, target rank/lane, bytes               |
+        |   shifted local/remote offset or signal value |
+        +----------------------+-----------------------+
+                               |
+                               v
+        +----------------------------------------------+
+        |       retained UCCL CPU proxy / FIFO / RDMA   |
+        | poll D2H FIFO                                 |
+        | decode V2TransferCmd, not old TransferCmd     |
+        | post EFA write / signal                       |
+        | poll CQ, publish V2 completion state          |
+        +----------------------+-----------------------+
+                               |
+                               v
+        +----------------------------------------------+
+        |          receiver DeepEP V2 layout            |
+        | dispatch lands directly in expanded layout    |
+        | combine lands directly in reduced layout      |
+        | official V2 epilogue semantics preserved      |
+        +----------------------------------------------+
+```
+
+这里的核心思想是“transport 方法像 UCCL EP V1，数据语义像 DeepEP V2”。FIFO 和 CPU proxy
+继续存在，但 GPU 发出的 command 不再描述 V1 packed staging，而是由 V2 descriptor/layout
+压缩成 EFA post 所需的最小字段。
+
+### 目标 native V2 UCCL-EP 流程图
+
+```text
+V2 JIT sender kernel                      CPU proxy                         V2 receiver layout
+--------------------                      ---------                         ------------------
+
+1. read V2 routing metadata
+   topk / token layout /
+   token_metadata_at_forward
+        |
+        v
+2. build or reuse V2 descriptors
+   grouped by (dst_rank, lane, expert)
+        |
+        v
+3. map descriptor + layout to
+   V2 expanded/reduced offsets
+        |
+        v
+4. build compact 16B V2TransferCmd
+   - kind: dispatch/combine payload/signal
+   - target_rank / target_lane
+   - bytes
+   - shifted local_offset
+   - shifted remote_offset or signal_value
+        |
+        v
+5. push V2TransferCmd to D2H FIFO ------>  6. poll FIFO
+                                             |
+                                             v
+                                          7. decode packed V2TransferCmd
+                                             |
+                                             v
+                                          8. post EFA write / signal
+                                             using EfaPostOp
+                                             |
+                                             v
+                                                                                9. dispatch payload
+                                                                                   lands directly in
+                                                                                   V2 expanded slots
+
+                                                                                or
+
+                                                                                   combine payload
+                                                                                   lands directly in
+                                                                                   V2 reduced slots
+                                             |
+                                             v
+                                         10. poll CQ and publish
+                                             V2-visible completion/
+                                             count state
+                                                                                |
+                                                                                v
+                                                                               11. V2 epilogue /
+                                                                                   cached path consumes
+                                                                                   native V2 layout
+```
+
+这个流程避免两件事：
+
+- 不把 V2 dispatch/combine tensor 重新打包进 V1 staging layout。
+- 不让 CPU proxy 继续从旧 `TransferCmd` 的 `low_latency_buffer_idx`、`expert_idx`、
+  `is_combine` bitfield 推断语义。
+
+它保留两件事：
+
+- 保留 UCCL EP 在 AWS EFA 上有效的 CPU proxy + FIFO + RDMA posting 模型。
+- 保留 DeepEP V2 的 expanded dispatch、reduced combine、JIT kernel 参数化和 handle/cache
+  语义。
