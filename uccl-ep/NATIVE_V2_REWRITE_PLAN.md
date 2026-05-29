@@ -361,6 +361,8 @@ device enqueue EFA proxy descriptors
   commands；下一步可以把这个 queue adapter 接到 retained EFA posting path。
 - 已新增 transport-neutral `EfaPostOp` / `EfaPostSink` adapter。真实 EFA verbs sink
   应实现这个接口，避免把 native V2 command 再编码回旧协议。
+- 已新增 native V2 `V2TransferCmd`，替代旧 `TransferCmd` 作为后续 command ring wire
+  format。它保留 V2 expert/batch/descriptor 语义和 64-bit offsets。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 

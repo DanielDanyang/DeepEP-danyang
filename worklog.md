@@ -71,6 +71,11 @@
   - 新增 `include/v2_efa/efa_adapter.hpp`，把 native V2 `ProxyCommand` 转成
     transport-neutral `EfaPostOp`，并提供 `RecordingEfaPostSink` 和 endpoint table
     scaffold。真实 EFA verbs sink 后续实现这个接口，不回退到旧 `TransferCmd` 协议。
+  - 新增 `include/v2_efa/transfer_cmd.hpp`，定义 64-byte native V2 `V2TransferCmd`：
+    带 magic/version、dispatch/combine payload/signal kind、target rank/lane、expert、
+    token count、bytes、signal value、64-bit local/remote offset。
+  - 新增 `HostV2TransferQueue`，可以直接承载 V2 transfer command ring；adapter 支持
+    `V2TransferCmd -> EfaPostOp`。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

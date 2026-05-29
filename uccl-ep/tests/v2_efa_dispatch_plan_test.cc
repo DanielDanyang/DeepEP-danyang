@@ -4,6 +4,7 @@
 #include "v2_efa/proxy_loopback.hpp"
 #include "v2_efa/proxy_queue_host.hpp"
 #include "v2_efa/runtime.hpp"
+#include "v2_efa/transfer_cmd.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -121,6 +122,24 @@ int main() {
   assert(direct_dispatch_signal.remote_offset ==
          dispatch_commands.commands[1].remote_offset);
 
+  const auto v2_dispatch_cmd =
+      make_v2_transfer_cmd(dispatch_commands.commands[0],
+                           /*expert_id=*/plan.batches[0].expert_id,
+                           /*count=*/plan.segments[0].count);
+  assert(sizeof(V2TransferCmd) == 64);
+  assert(is_v2_transfer_cmd(v2_dispatch_cmd));
+  assert(v2_dispatch_cmd.kind ==
+         static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload));
+  assert(v2_dispatch_cmd.expert_id == 0);
+  assert(v2_dispatch_cmd.count == 2);
+  const auto proxy_roundtrip =
+      v2_transfer_cmd_to_proxy_command(v2_dispatch_cmd);
+  assert(proxy_roundtrip.kind == dispatch_commands.commands[0].kind);
+  assert(proxy_roundtrip.local_offset ==
+         dispatch_commands.commands[0].local_offset);
+  assert(proxy_roundtrip.remote_offset ==
+         dispatch_commands.commands[0].remote_offset);
+
   CombineProxyLayout combine_layout;
   combine_layout.local_payload_base = 4000;
   combine_layout.remote_payload_base = 5000;
@@ -177,6 +196,19 @@ int main() {
   assert(queue_stats.submitted == dispatch_commands.commands.size());
   assert(queue_stats.overflow == 0);
   assert(dispatch_queue.tail() == dispatch_commands.commands.size());
+  const auto transfer_cmds = dispatch_queue.snapshot_v2_transfer_cmds();
+  assert(transfer_cmds.size() == dispatch_commands.commands.size());
+  assert(transfer_cmds[0].magic == kV2TransferCmdMagic);
+  assert(transfer_cmds[1].kind ==
+         static_cast<uint8_t>(V2TransferCmdKind::kDispatchSignal));
+  HostV2TransferQueue v2_queue(static_cast<uint32_t>(transfer_cmds.size()));
+  const auto v2_queue_stats = submit_v2_transfer_cmds(v2_queue, transfer_cmds);
+  assert(v2_queue_stats.submitted == transfer_cmds.size());
+  RecordingEfaPostSink v2_sink;
+  drain_v2_transfer_cmds_to_efa_posts(v2_queue.snapshot(), v2_sink);
+  assert(v2_sink.ops.size() == transfer_cmds.size());
+  assert(v2_sink.ops[0].kind == EfaPostOpKind::kWrite);
+  assert(v2_sink.ops[1].kind == EfaPostOpKind::kSignalWrite);
   const auto queued_dispatch_stats = dispatch_queue.drain_loopback(
       LoopbackMemoryView{dispatch_local.data(), dispatch_local.size(),
                          queued_dispatch_remote.data(),

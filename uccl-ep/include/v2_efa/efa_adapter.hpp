@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "v2_efa/proxy_queue_host.hpp"
+#include "v2_efa/transfer_cmd.hpp"
 
 namespace uccl::v2_efa {
 
@@ -98,9 +99,20 @@ inline EfaPostOp make_efa_post_op(const ProxyCommand& command) {
   throw std::invalid_argument("unknown proxy command kind");
 }
 
+inline EfaPostOp make_efa_post_op(const V2TransferCmd& command) {
+  return make_efa_post_op(v2_transfer_cmd_to_proxy_command(command));
+}
+
 inline void drain_host_queue_to_efa_posts(const HostProxyQueue& queue,
                                           EfaPostSink& sink) {
   const auto commands = queue.snapshot();
+  for (const auto& command : commands) {
+    sink.post(make_efa_post_op(make_v2_transfer_cmd(command)));
+  }
+}
+
+inline void drain_v2_transfer_cmds_to_efa_posts(
+    const std::vector<V2TransferCmd>& commands, EfaPostSink& sink) {
   for (const auto& command : commands) {
     sink.post(make_efa_post_op(command));
   }
