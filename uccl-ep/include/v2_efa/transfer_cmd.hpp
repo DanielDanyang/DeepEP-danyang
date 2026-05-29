@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-#include "v2_efa/descriptor.hpp"
+#include "descriptor.hpp"
 
 namespace uccl::v2_efa {
 

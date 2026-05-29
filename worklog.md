@@ -1352,3 +1352,37 @@ README 风格 EP8x2 性能：
     enqueue 16B `V2TransferCmd` 到 mapped D2H queue，避免 CPU 先读 counters 再启动
     enqueue kernel。
   - C++ / nanobind / Python wrapper 新增对应 compile 和 launch queue API。
+
+## 2026-05-29 native V2 JIT / D2H queue 验证
+
+- 验证前确认 `p5en_0` / `p5en_1` 没有 GPU compute 进程；只在 `p5en_0`
+  的 GPU0 跑单卡 smoke。
+- 同步 `uccl-ep` 到服务器后，`make -j$(nproc)` 和 `make install` 通过。
+- JIT 初始化必须传 DeepEP package root：
+  `/home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/deep_ep`，不是仓库根；
+  否则 NVCC 找不到 `deep_ep/impls/dispatch.cuh`。
+- JIT-facing `v2_efa` headers 改为同目录相对 include；否则通过绝对路径 include
+  `dispatch_jit.cuh` 时，内部 `#include "v2_efa/..."` 没有 `-I uccl-ep/include`
+  会失败。
+- descriptor-only JIT plan 的 dynamic smem 改为 0；当前 descriptor scaffold 不使用
+  dynamic smem，继续设置 228 KiB 会在 launch 时触发
+  `CUDA_ERROR_INVALID_VALUE`。
+- dispatch two-stage smoke 通过：
+  - dispatch counters: `[4, 4, 0]`
+  - mapped D2H queue: `head=8, tail=0`
+  - CPU `poll_ready()` 读到 8 条 command，payload/signal 交替，`ack_ready()` 后
+    `head=8, tail=8`。
+- combine two-stage smoke 通过：
+  - dispatch counters: `[4, 4, 0]`
+  - combine counters: `[4, 4, 0]`
+  - mapped D2H queue: `head=8, tail=0`
+  - CPU 读到 8 条 combine command。
+- fused dispatch descriptor+enqueue smoke 通过：
+  - counters: `[4, 4, 0]`
+  - mapped D2H queue: `head=8, tail=0`
+  - CPU 读到 8 条 dispatch command。
+- fused combine descriptor+enqueue smoke 通过：
+  - dispatch counters: `[4, 4, 0]`
+  - combine counters: `[4, 4, 0]`
+  - mapped D2H queue: `head=8, tail=0`
+  - CPU 读到 8 条 combine command。

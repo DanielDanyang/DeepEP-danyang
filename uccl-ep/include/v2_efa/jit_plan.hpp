@@ -145,7 +145,10 @@ inline V2EfaJitLaunchPlan build_v2_efa_dispatch_jit_plan(
   plan.name = "v2_efa_dispatch";
   plan.grid_dim_x = config.num_sms;
   plan.grid_dim_y = 1;
-  plan.smem_bytes = config.smem_bytes;
+  // The current native V2 EFA descriptor scaffold does not use dynamic shared
+  // memory. Keep this at zero so the reference descriptor kernel can launch on
+  // all devices while the production V2 payload path is still being wired in.
+  plan.smem_bytes = 0;
   plan.cluster_dim = 2 - (config.num_sms % 2);
   plan.cooperative = true;
   plan.pdl_enabled = false;
@@ -205,7 +208,7 @@ inline V2EfaJitLaunchPlan build_v2_efa_combine_jit_plan(
   plan.name = "v2_efa_combine";
   plan.grid_dim_x = config.num_sms;
   plan.grid_dim_y = 1;
-  plan.smem_bytes = config.smem_bytes;
+  plan.smem_bytes = 0;
   plan.cluster_dim = 2 - (config.num_sms % 2);
   plan.cooperative = true;
   plan.pdl_enabled = false;

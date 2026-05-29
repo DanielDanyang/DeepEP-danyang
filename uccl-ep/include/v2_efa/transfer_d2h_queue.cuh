@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "v2_efa/transfer_cmd.hpp"
+#include "transfer_cmd.hpp"
 
 namespace uccl::v2_efa {
 

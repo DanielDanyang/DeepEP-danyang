@@ -1,14 +1,20 @@
 #pragma once
 
-#include "v2_efa/descriptor.hpp"
-#include "v2_efa/transfer_cmd.hpp"
-#include "v2_efa/transfer_d2h_queue.cuh"
+#include "descriptor.hpp"
+#include "transfer_cmd.hpp"
+#include "transfer_d2h_queue.cuh"
 
 namespace uccl::v2_efa {
 
 namespace detail {
 
 #if defined(__CUDA_ARCH__)
+struct DispatchDescriptorBuildResult {
+  int num_segments = 0;
+  int num_batches = 0;
+  int overflow = 0;
+};
+
 __device__ __forceinline__ uint32_t make_dispatch_flags(int scale_bytes,
                                                         bool has_topk_weight) {
   uint32_t flags = 0;
@@ -23,7 +29,7 @@ __device__ __forceinline__ uint32_t make_dispatch_flags(int scale_bytes,
 
 template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
           int kNumTopk, int kHiddenBytes>
-__device__ __forceinline__ void build_dispatch_descriptors(
+__device__ __forceinline__ DispatchDescriptorBuildResult build_dispatch_descriptors(
     const int64_t* topk_idx, DispatchSegmentDescriptor* segments,
     DispatchExpertBatch* batches, uint32_t* counters, int num_tokens,
     int scale_bytes, bool has_topk_weight, int max_segments,
@@ -37,6 +43,11 @@ __device__ __forceinline__ void build_dispatch_descriptors(
   const auto flags = make_dispatch_flags(scale_bytes, has_topk_weight);
   int num_segments = 0;
   int num_batches = 0;
+  DispatchDescriptorBuildResult result;
+
+  for (int i = 0; i < max_batches; ++i) {
+    batches[i] = DispatchExpertBatch{};
+  }
 
   for (int expert = 0; expert < kNumExperts; ++expert) {
     const int owner_rank = expert / kExpertsPerRank;
@@ -76,7 +87,10 @@ __device__ __forceinline__ void build_dispatch_descriptors(
           counters[kDescriptorCounterSegments] = num_segments;
           counters[kDescriptorCounterBatches] = num_batches;
           counters[kDescriptorCounterOverflow] = 1;
-          return;
+          result.num_segments = num_segments;
+          result.num_batches = num_batches;
+          result.overflow = 1;
+          return result;
         }
 
         current_segment = num_segments++;
@@ -102,7 +116,10 @@ __device__ __forceinline__ void build_dispatch_descriptors(
       counters[kDescriptorCounterSegments] = num_segments;
       counters[kDescriptorCounterBatches] = num_batches;
       counters[kDescriptorCounterOverflow] = 1;
-      return;
+      result.num_segments = num_segments;
+      result.num_batches = num_batches;
+      result.overflow = 1;
+      return result;
     }
 
     auto& batch = batches[num_batches++];
@@ -118,13 +135,33 @@ __device__ __forceinline__ void build_dispatch_descriptors(
   counters[kDescriptorCounterSegments] = num_segments;
   counters[kDescriptorCounterBatches] = num_batches;
   counters[kDescriptorCounterOverflow] = 0;
+  result.num_segments = num_segments;
+  result.num_batches = num_batches;
+  result.overflow = 0;
+  return result;
 }
 
 __device__ __forceinline__ void enqueue_dispatch_d2h(
     const DispatchSegmentDescriptor* segments,
     const DispatchExpertBatch* batches, int num_batches,
     V2TransferD2HQueueView queue, DispatchTransferLayout layout) {
-  detail::enqueue_dispatch_d2h(segments, batches, num_batches, queue, layout);
+  for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+    const auto& batch = batches[batch_idx];
+    if (batch.num_segments <= 0 || batch.total_tokens <= 0) {
+      continue;
+    }
+    for (int i = 0; i < batch.num_segments; ++i) {
+      const auto segment_idx =
+          static_cast<uint32_t>(batch.first_segment + i);
+      enqueue_v2_transfer_d2h(
+          queue, make_v2_dispatch_payload_cmd(
+                     segments[segment_idx], segment_idx,
+                     static_cast<uint32_t>(batch_idx), layout));
+    }
+    enqueue_v2_transfer_d2h(
+        queue, make_v2_dispatch_signal_cmd(
+                   batch, static_cast<uint32_t>(batch_idx), layout));
+  }
 }
 
 #endif
@@ -147,8 +184,8 @@ __global__ void v2_efa_dispatch_descriptor_kernel(
   (void)scaleout_rank;
   (void)scaleup_rank;
 
-  detail::build_dispatch_descriptors<kNumScaleoutRanks, kNumScaleupRanks,
-                                     kNumExperts, kNumTopk, kHiddenBytes>(
+  (void)detail::build_dispatch_descriptors<kNumScaleoutRanks, kNumScaleupRanks,
+                                           kNumExperts, kNumTopk, kHiddenBytes>(
       topk_idx, segments, batches, counters, num_tokens, scale_bytes,
       has_topk_weight, max_segments, max_batches);
 }
@@ -167,16 +204,14 @@ __global__ void v2_efa_dispatch_descriptor_enqueue_d2h_kernel(
   (void)scaleout_rank;
   (void)scaleup_rank;
 
-  detail::build_dispatch_descriptors<kNumScaleoutRanks, kNumScaleupRanks,
-                                     kNumExperts, kNumTopk, kHiddenBytes>(
+  const auto result = detail::build_dispatch_descriptors<
+      kNumScaleoutRanks, kNumScaleupRanks, kNumExperts, kNumTopk, kHiddenBytes>(
       topk_idx, segments, batches, counters, num_tokens, scale_bytes,
       has_topk_weight, max_segments, max_batches);
-  if (counters[kDescriptorCounterOverflow] != 0) {
+  if (result.overflow != 0) {
     return;
   }
-  detail::enqueue_dispatch_d2h(
-      segments, batches, static_cast<int>(counters[kDescriptorCounterBatches]),
-      queue, layout);
+  detail::enqueue_dispatch_d2h(segments, batches, max_batches, queue, layout);
 }
 
 template <int kInstance>
