@@ -1,9 +1,11 @@
 #include "v2_efa/dispatch_plan.hpp"
 #include "v2_efa/proxy_command_plan.hpp"
+#include "v2_efa/proxy_loopback.hpp"
 #include "v2_efa/runtime.hpp"
 
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 using namespace uccl::v2_efa;
@@ -90,6 +92,7 @@ int main() {
   dispatch_layout.remote_signal_base = 3000;
   dispatch_layout.src_token_stride = 32;
   dispatch_layout.expanded_slot_stride = 32;
+  dispatch_layout.batch_payload_stride = 256;
   const auto dispatch_commands =
       build_dispatch_proxy_command_plan(plan, dispatch_layout);
   assert(dispatch_commands.commands.size() == plan.segments.size() +
@@ -99,9 +102,11 @@ int main() {
   assert(dispatch_commands.commands[0].bytes == 64);
   assert(dispatch_commands.commands[0].local_offset == 1000);
   assert(dispatch_commands.commands[0].remote_offset == 2000);
+  assert(dispatch_commands.commands[0].target_rank == 0);
   assert(dispatch_commands.commands[1].kind ==
          static_cast<uint32_t>(ProxyCommandKind::kDispatchSignal));
   assert(dispatch_commands.commands[1].remote_offset == 3000);
+  assert(dispatch_commands.commands[1].signal_value == 2);
   const auto direct_dispatch_payload = make_dispatch_payload_command(
       plan.segments[0], 0, 0, dispatch_layout);
   const auto direct_dispatch_signal = make_dispatch_signal_command(
@@ -120,6 +125,7 @@ int main() {
   combine_layout.remote_signal_base = 6000;
   combine_layout.expanded_slot_stride = 32;
   combine_layout.reduced_token_stride = 32;
+  combine_layout.batch_payload_stride = 256;
   const auto combine_commands =
       build_combine_proxy_command_plan(combine_plan, combine_layout);
   assert(combine_commands.commands.size() == combine_plan.segments.size() +
@@ -129,6 +135,7 @@ int main() {
   assert(combine_commands.commands[0].bytes == 64);
   assert(combine_commands.commands[0].local_offset == 4000);
   assert(combine_commands.commands[0].remote_offset == 5000);
+  assert(combine_commands.commands[0].target_rank == 0);
   const auto direct_combine_payload = make_combine_payload_command(
       combine_plan.segments[0], 0, 0, combine_layout);
   const auto direct_combine_signal =
@@ -140,6 +147,44 @@ int main() {
          combine_commands.commands[0].remote_offset);
   assert(direct_combine_signal.remote_offset ==
          combine_commands.commands[1].remote_offset);
+
+  std::vector<uint8_t> dispatch_local(4096, 0);
+  std::vector<uint8_t> dispatch_remote(4096, 0);
+  for (int i = 0; i < 64; ++i) {
+    dispatch_local[1000 + i] = static_cast<uint8_t>(i + 1);
+  }
+  const auto dispatch_stats = execute_loopback_proxy_commands(
+      dispatch_commands.commands,
+      LoopbackMemoryView{dispatch_local.data(), dispatch_local.size(),
+                         dispatch_remote.data(), dispatch_remote.size()});
+  assert(dispatch_stats.payload_commands == 4);
+  assert(dispatch_stats.signal_commands == 4);
+  assert(dispatch_stats.payload_bytes == 256);
+  assert(std::memcmp(dispatch_remote.data() + 2000,
+                     dispatch_local.data() + 1000, 64) == 0);
+  uint32_t dispatch_signal = 0;
+  std::memcpy(&dispatch_signal, dispatch_remote.data() + 3000,
+              sizeof(uint32_t));
+  assert(dispatch_signal == 2);
+
+  std::vector<uint8_t> combine_local(8192, 0);
+  std::vector<uint8_t> combine_remote(8192, 0);
+  for (int i = 0; i < 64; ++i) {
+    combine_local[4000 + i] = static_cast<uint8_t>(255 - i);
+  }
+  const auto combine_stats = execute_loopback_proxy_commands(
+      combine_commands.commands,
+      LoopbackMemoryView{combine_local.data(), combine_local.size(),
+                         combine_remote.data(), combine_remote.size()});
+  assert(combine_stats.payload_commands == 4);
+  assert(combine_stats.signal_commands == 4);
+  assert(combine_stats.payload_bytes == 256);
+  assert(std::memcmp(combine_remote.data() + 5000,
+                     combine_local.data() + 4000, 64) == 0);
+  uint32_t combine_signal = 0;
+  std::memcpy(&combine_signal, combine_remote.data() + 6000,
+              sizeof(uint32_t));
+  assert(combine_signal == 2);
 
   return 0;
 }

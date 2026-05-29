@@ -60,6 +60,11 @@
     planner 和 device enqueue kernel 共用同一套 offset 规则。
   - 新增 `v2_efa_dispatch_enqueue_proxy_kernel` 和 `v2_efa_combine_enqueue_proxy_kernel`，
     现在 CUDA/JIT 侧已经具备 descriptor -> proxy queue 的 reference enqueue 路径。
+  - 新增 `include/v2_efa/proxy_loopback.hpp`，host loopback executor 可以按 proxy command
+    在本地 byte buffers 上执行 payload copy 和 signal write。
+  - `ProxyCommand` 增加 `signal_value`、`target_rank`、`target_lane`；layout 增加
+    `batch_payload_stride`，避免不同 expert/batch 的 expanded slot 0 写到同一 remote
+    offset。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查
