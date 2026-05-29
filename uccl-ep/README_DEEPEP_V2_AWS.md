@@ -20,8 +20,7 @@ DeepEP V2 implementation for IB/CX7, but the long-term AWS path here is:
 
 ```text
 GPU kernel writes V2 expanded/reduced payload region
-GPU kernel writes 64B V2TransferCmd into native command array
-GPU kernel submits 16B FIFO doorbell carrying command index
+GPU kernel submits 16B V2TransferCmd into the existing FIFO
 CPU proxy drains FIFO and posts EFA verbs RDMA write / write-with-imm
 receiver proxy applies ordering and publishes tail/count
 GPU forwarder consumes published control state
@@ -49,9 +48,9 @@ GPU forwarder consumes published control state
 2. Add a standalone proxy RDMA microbenchmark that does not depend on NCCL Gin.
 3. Implement `deep_ep_v2_wrapper.deep_ep.ElasticBuffer` with V2-native
    constructor, dispatch, combine, and handle objects.
-4. Replace cross-node V2 Gin operations with native `V2TransferCmd` submission
-   plus FIFO doorbell/index, without encoding V2 semantics into the old
-   DeepEP V1 `TransferCmd` bitfield.
+4. Replace cross-node V2 Gin operations with native 16B `V2TransferCmd`
+   submission, without encoding V2 semantics into the old DeepEP V1
+   `TransferCmd` bitfield.
 5. Add receiver-side ordering and host-mapped tail/count publication.
 6. Run `tests/elastic/test_ep.py` EP16 and iterate toward the UCCL-EP p5en
    reference bandwidth.

@@ -3,7 +3,6 @@
 #include "v2_efa/runtime.hpp"
 #include "v2_efa/transfer_cmd.hpp"
 #include "v2_efa/transfer_cmd_plan.hpp"
-#include "v2_efa/transfer_fifo.hpp"
 #include "v2_efa/transfer_layout.hpp"
 #include "v2_efa/transfer_loopback.hpp"
 #include "v2_efa/transfer_queue_host.hpp"
@@ -103,30 +102,26 @@ int main() {
   assert(dispatch_commands.commands[0].kind ==
          static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload));
   assert(dispatch_commands.commands[0].bytes == 64);
-  assert(dispatch_commands.commands[0].local_offset == 1000);
-  assert(dispatch_commands.commands[0].remote_offset == 2000);
+  assert(v2_transfer_local_offset(dispatch_commands.commands[0]) == 1000);
+  assert(v2_transfer_remote_offset(dispatch_commands.commands[0]) == 2000);
   assert(dispatch_commands.commands[0].target_rank == 0);
   assert(dispatch_commands.commands[1].kind ==
          static_cast<uint8_t>(V2TransferCmdKind::kDispatchSignal));
-  assert(dispatch_commands.commands[1].remote_offset == 2256);
+  assert(v2_transfer_remote_offset(dispatch_commands.commands[1]) == 2256);
   assert(dispatch_commands.commands[1].signal_value == 2);
   const auto v2_dispatch_cmd =
       make_v2_dispatch_payload_cmd(plan.segments[0], 0, 0, dispatch_layout);
-  assert(sizeof(V2TransferCmd) == 64);
+  assert(sizeof(V2TransferCmd) == 16);
   assert(is_v2_transfer_cmd(v2_dispatch_cmd));
   assert(v2_dispatch_cmd.kind ==
          static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload));
-  assert(v2_dispatch_cmd.expert_id == 0);
-  assert(v2_dispatch_cmd.count == 2);
   const auto v2_dispatch_signal_cmd =
       make_v2_dispatch_signal_cmd(plan.batches[0], 0, dispatch_layout);
   assert(v2_dispatch_signal_cmd.signal_value == 2);
-  assert(v2_dispatch_signal_cmd.expert_id == 0);
-  assert(v2_dispatch_signal_cmd.count == 2);
-  assert(v2_dispatch_cmd.local_offset ==
-         dispatch_commands.commands[0].local_offset);
-  assert(v2_dispatch_cmd.remote_offset ==
-         dispatch_commands.commands[0].remote_offset);
+  assert(v2_transfer_local_offset(v2_dispatch_cmd) ==
+         v2_transfer_local_offset(dispatch_commands.commands[0]));
+  assert(v2_transfer_remote_offset(v2_dispatch_cmd) ==
+         v2_transfer_remote_offset(dispatch_commands.commands[0]));
 
   const auto combine_layout = make_contiguous_combine_transfer_layout(
       combine_plan, /*expanded_slot_stride=*/32, /*reduced_token_stride=*/32,
@@ -140,20 +135,20 @@ int main() {
   assert(combine_commands.commands[0].kind ==
          static_cast<uint8_t>(V2TransferCmdKind::kCombinePayload));
   assert(combine_commands.commands[0].bytes == 64);
-  assert(combine_commands.commands[0].local_offset == 4000);
-  assert(combine_commands.commands[0].remote_offset == 5000);
+  assert(v2_transfer_local_offset(combine_commands.commands[0]) == 4000);
+  assert(v2_transfer_remote_offset(combine_commands.commands[0]) == 5000);
   assert(combine_commands.commands[0].target_rank == 0);
   const auto direct_combine_payload = make_v2_combine_payload_cmd(
       combine_plan.segments[0], 0, 0, combine_layout);
   const auto direct_combine_signal =
       make_v2_combine_signal_cmd(combine_plan.batches[0], 0, combine_layout);
   assert(direct_combine_payload.kind == combine_commands.commands[0].kind);
-  assert(direct_combine_payload.local_offset ==
-         combine_commands.commands[0].local_offset);
-  assert(direct_combine_payload.remote_offset ==
-         combine_commands.commands[0].remote_offset);
-  assert(direct_combine_signal.remote_offset ==
-         combine_commands.commands[1].remote_offset);
+  assert(v2_transfer_local_offset(direct_combine_payload) ==
+         v2_transfer_local_offset(combine_commands.commands[0]));
+  assert(v2_transfer_remote_offset(direct_combine_payload) ==
+         v2_transfer_remote_offset(combine_commands.commands[0]));
+  assert(v2_transfer_remote_offset(direct_combine_signal) ==
+         v2_transfer_remote_offset(combine_commands.commands[1]));
 
   std::vector<uint8_t> dispatch_local(4096, 0);
   std::vector<uint8_t> dispatch_remote(4096, 0);
@@ -184,7 +179,7 @@ int main() {
   assert(dispatch_queue.tail() == dispatch_commands.commands.size());
   const auto transfer_cmds = dispatch_queue.snapshot();
   assert(transfer_cmds.size() == dispatch_commands.commands.size());
-  assert(transfer_cmds[0].magic == kV2TransferCmdMagic);
+  assert(is_v2_transfer_cmd(transfer_cmds[0]));
   assert(transfer_cmds[1].kind ==
          static_cast<uint8_t>(V2TransferCmdKind::kDispatchSignal));
   auto v2_view = dispatch_queue.view();
@@ -202,43 +197,12 @@ int main() {
   assert(std::memcmp(queued_dispatch_remote.data() + 2000,
                      dispatch_local.data() + 1000, 64) == 0);
 
-  HostV2TransferFifo dispatch_fifo(
-      static_cast<uint32_t>(dispatch_commands.commands.size()),
-      /*queue_id=*/7);
-  const auto fifo_stats = submit_v2_transfer_fifo_commands(
-      dispatch_fifo, dispatch_commands.commands);
-  assert(fifo_stats.submitted == dispatch_commands.commands.size());
-  assert(fifo_stats.overflow == 0);
-  const auto doorbells = dispatch_fifo.doorbells();
-  assert(doorbells.size() == dispatch_commands.commands.size());
-  assert(doorbells[0].queue_id == 7);
-  assert(doorbells[0].command_index == 0);
-  uint64_t packed_first = 0;
-  uint64_t packed_second = 0;
-  pack_v2_fifo_doorbell(doorbells[0], &packed_first, &packed_second);
-  const auto unpacked_doorbell =
-      unpack_v2_fifo_doorbell(packed_first, packed_second);
-  assert(is_v2_fifo_doorbell(unpacked_doorbell));
-  assert(unpacked_doorbell.queue_id == 7);
-  assert(dispatch_fifo.command_for(unpacked_doorbell).kind ==
-         static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload));
-  const auto fifo_commands = dispatch_fifo.drain_commands();
-  assert(fifo_commands.size() == dispatch_commands.commands.size());
-  assert(fifo_commands[1].kind ==
-         static_cast<uint8_t>(V2TransferCmdKind::kDispatchSignal));
-  std::vector<uint8_t> fifo_dispatch_remote(4096, 0);
-  const auto fifo_dispatch_stats = dispatch_fifo.drain_loopback(
-      LoopbackMemoryView{dispatch_local.data(), dispatch_local.size(),
-                         fifo_dispatch_remote.data(),
-                         fifo_dispatch_remote.size()});
-  assert(fifo_dispatch_stats.payload_commands == 4);
-  assert(std::memcmp(fifo_dispatch_remote.data() + 2000,
-                     dispatch_local.data() + 1000, 64) == 0);
-
   assert(v2_sink.ops[0].target_rank == dispatch_commands.commands[0].target_rank);
   assert(v2_sink.ops[0].target_lane == dispatch_commands.commands[0].target_lane);
-  assert(v2_sink.ops[0].local_offset == dispatch_commands.commands[0].local_offset);
-  assert(v2_sink.ops[0].remote_offset == dispatch_commands.commands[0].remote_offset);
+  assert(v2_sink.ops[0].local_offset ==
+         v2_transfer_local_offset(dispatch_commands.commands[0]));
+  assert(v2_sink.ops[0].remote_offset ==
+         v2_transfer_remote_offset(dispatch_commands.commands[0]));
   assert(v2_sink.ops[1].signal_value == 2);
 
   EndpointTable endpoints(/*num_ranks=*/2, /*num_lanes=*/2);

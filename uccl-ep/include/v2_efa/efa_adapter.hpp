@@ -84,10 +84,9 @@ inline EfaPostOp make_efa_post_op(const V2TransferCmd& command) {
   op.target_lane = command.target_lane;
   op.bytes = command.bytes;
   op.signal_value = command.signal_value;
-  op.local_offset = command.local_offset;
-  op.remote_offset = command.remote_offset;
-  op.descriptor_index = command.descriptor_index;
-  op.batch_index = command.batch_index;
+  op.local_offset =
+      is_v2_transfer_payload(command) ? v2_transfer_local_offset(command) : 0;
+  op.remote_offset = v2_transfer_remote_offset(command);
 
   const auto kind = static_cast<V2TransferCmdKind>(command.kind);
   if (kind == V2TransferCmdKind::kDispatchPayload ||

@@ -7,8 +7,7 @@
 
 namespace uccl::v2_efa {
 
-constexpr uint16_t kV2TransferCmdMagic = 0xE2FA;
-constexpr uint8_t kV2TransferCmdVersion = 1;
+constexpr int kV2TransferOffsetShift = 2;
 
 enum class V2TransferCmdKind : uint8_t {
   kDispatchPayload = 1,
@@ -17,7 +16,7 @@ enum class V2TransferCmdKind : uint8_t {
   kCombineSignal = 4,
 };
 
-enum class V2TransferCmdFlags : uint32_t {
+enum class V2TransferCmdFlags : uint8_t {
   kNone = 0,
   kSignal = 1u << 0,
   kPayload = 1u << 1,
@@ -27,35 +26,27 @@ enum class V2TransferCmdFlags : uint32_t {
 
 inline constexpr V2TransferCmdFlags operator|(V2TransferCmdFlags a,
                                               V2TransferCmdFlags b) {
-  return static_cast<V2TransferCmdFlags>(static_cast<uint32_t>(a) |
-                                         static_cast<uint32_t>(b));
+  return static_cast<V2TransferCmdFlags>(static_cast<uint8_t>(a) |
+                                         static_cast<uint8_t>(b));
 }
 
 #pragma pack(push, 1)
 struct V2TransferCmd {
-  uint16_t magic = kV2TransferCmdMagic;
-  uint8_t version = kV2TransferCmdVersion;
   uint8_t kind = 0;
-  uint16_t target_rank = 0;
-  uint16_t target_lane = 0;
-
-  uint32_t flags = 0;
-  uint32_t descriptor_index = 0;
-  uint32_t batch_index = 0;
-  uint32_t expert_id = 0;
-  uint32_t count = 0;
+  uint8_t target_rank = 0;
+  uint8_t target_lane = 0;
+  uint8_t flags = 0;
   uint32_t bytes = 0;
-  uint32_t signal_value = 0;
-  uint32_t reserved32 = 0;
-
-  uint64_t local_offset = 0;
-  uint64_t remote_offset = 0;
-  uint64_t reserved0 = 0;
+  uint32_t remote_offset_shifted = 0;
+  union {
+    uint32_t local_offset_shifted;
+    uint32_t signal_value;
+  };
 };
 #pragma pack(pop)
 
-static_assert(sizeof(V2TransferCmd) == 64,
-              "V2TransferCmd must stay one 64-byte cache line");
+static_assert(sizeof(V2TransferCmd) == 16,
+              "V2TransferCmd must stay one 128-bit FIFO command");
 
 struct DispatchTransferLayout {
   uint64_t local_payload_base = 0;
@@ -78,26 +69,60 @@ struct CombineTransferLayout {
 };
 
 inline bool is_v2_transfer_cmd(const V2TransferCmd& cmd) {
-  return cmd.magic == kV2TransferCmdMagic &&
-         cmd.version == kV2TransferCmdVersion;
+  return cmd.kind >= static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload) &&
+         cmd.kind <= static_cast<uint8_t>(V2TransferCmdKind::kCombineSignal);
 }
 
-inline uint32_t v2_transfer_flags(V2TransferCmdKind kind) {
+inline uint8_t v2_transfer_flags(V2TransferCmdKind kind) {
   switch (kind) {
     case V2TransferCmdKind::kDispatchPayload:
-      return static_cast<uint32_t>(V2TransferCmdFlags::kDispatch) |
-             static_cast<uint32_t>(V2TransferCmdFlags::kPayload);
+      return static_cast<uint8_t>(V2TransferCmdFlags::kDispatch) |
+             static_cast<uint8_t>(V2TransferCmdFlags::kPayload);
     case V2TransferCmdKind::kDispatchSignal:
-      return static_cast<uint32_t>(V2TransferCmdFlags::kDispatch) |
-             static_cast<uint32_t>(V2TransferCmdFlags::kSignal);
+      return static_cast<uint8_t>(V2TransferCmdFlags::kDispatch) |
+             static_cast<uint8_t>(V2TransferCmdFlags::kSignal);
     case V2TransferCmdKind::kCombinePayload:
-      return static_cast<uint32_t>(V2TransferCmdFlags::kCombine) |
-             static_cast<uint32_t>(V2TransferCmdFlags::kPayload);
+      return static_cast<uint8_t>(V2TransferCmdFlags::kCombine) |
+             static_cast<uint8_t>(V2TransferCmdFlags::kPayload);
     case V2TransferCmdKind::kCombineSignal:
-      return static_cast<uint32_t>(V2TransferCmdFlags::kCombine) |
-             static_cast<uint32_t>(V2TransferCmdFlags::kSignal);
+      return static_cast<uint8_t>(V2TransferCmdFlags::kCombine) |
+             static_cast<uint8_t>(V2TransferCmdFlags::kSignal);
   }
   throw std::invalid_argument("unknown V2 transfer command kind");
+}
+
+inline uint32_t encode_v2_transfer_offset(uint64_t offset) {
+  const auto align = uint64_t{1} << kV2TransferOffsetShift;
+  if ((offset & (align - 1)) != 0) {
+    throw std::invalid_argument("V2 transfer offset is not aligned");
+  }
+  const auto shifted = offset >> kV2TransferOffsetShift;
+  if (shifted > UINT32_MAX) {
+    throw std::out_of_range("V2 transfer offset exceeds command range");
+  }
+  return static_cast<uint32_t>(shifted);
+}
+
+inline uint64_t decode_v2_transfer_offset(uint32_t shifted) {
+  return static_cast<uint64_t>(shifted) << kV2TransferOffsetShift;
+}
+
+inline bool is_v2_transfer_payload(const V2TransferCmd& command) {
+  return (command.flags & static_cast<uint8_t>(V2TransferCmdFlags::kPayload)) !=
+         0;
+}
+
+inline bool is_v2_transfer_signal(const V2TransferCmd& command) {
+  return (command.flags & static_cast<uint8_t>(V2TransferCmdFlags::kSignal)) !=
+         0;
+}
+
+inline uint64_t v2_transfer_remote_offset(const V2TransferCmd& command) {
+  return decode_v2_transfer_offset(command.remote_offset_shifted);
+}
+
+inline uint64_t v2_transfer_local_offset(const V2TransferCmd& command) {
+  return decode_v2_transfer_offset(command.local_offset_shifted);
 }
 
 inline V2TransferCmd make_v2_transfer_cmd(V2TransferCmdKind kind,
@@ -105,25 +130,27 @@ inline V2TransferCmd make_v2_transfer_cmd(V2TransferCmdKind kind,
                                           uint32_t target_lane,
                                           uint32_t descriptor_index,
                                           uint32_t batch_index,
-                                          uint32_t expert_id,
-                                          uint32_t count,
                                           uint32_t bytes,
                                           uint32_t signal_value,
                                           uint64_t local_offset,
                                           uint64_t remote_offset) {
+  if (target_rank > UINT8_MAX || target_lane > UINT8_MAX) {
+    throw std::out_of_range("V2 transfer target exceeds command range");
+  }
   V2TransferCmd out;
   out.kind = static_cast<uint8_t>(kind);
-  out.target_rank = static_cast<uint16_t>(target_rank);
-  out.target_lane = static_cast<uint16_t>(target_lane);
+  out.target_rank = static_cast<uint8_t>(target_rank);
+  out.target_lane = static_cast<uint8_t>(target_lane);
   out.flags = v2_transfer_flags(kind);
-  out.descriptor_index = descriptor_index;
-  out.batch_index = batch_index;
-  out.expert_id = expert_id;
-  out.count = count;
   out.bytes = bytes;
-  out.signal_value = signal_value;
-  out.local_offset = local_offset;
-  out.remote_offset = remote_offset;
+  out.remote_offset_shifted = encode_v2_transfer_offset(remote_offset);
+  if ((out.flags & static_cast<uint8_t>(V2TransferCmdFlags::kSignal)) != 0) {
+    out.signal_value = signal_value;
+  } else {
+    out.local_offset_shifted = encode_v2_transfer_offset(local_offset);
+  }
+  (void)descriptor_index;
+  (void)batch_index;
   return out;
 }
 
@@ -135,8 +162,6 @@ inline V2TransferCmd make_v2_dispatch_payload_cmd(
       static_cast<uint32_t>(segment.dst_scaleout_rank),
       static_cast<uint32_t>(segment.dst_scaleup_lane),
       segment_idx, batch_idx,
-      static_cast<uint32_t>(segment.expert_id),
-      static_cast<uint32_t>(segment.count),
       static_cast<uint32_t>(segment.count * segment.payload_bytes),
       /*signal_value=*/0,
       layout.local_payload_base +
@@ -155,8 +180,6 @@ inline V2TransferCmd make_v2_dispatch_signal_cmd(
       static_cast<uint32_t>(batch.dst_scaleout_rank),
       static_cast<uint32_t>(batch.dst_scaleup_lane),
       static_cast<uint32_t>(batch.first_segment), batch_idx,
-      static_cast<uint32_t>(batch.expert_id),
-      static_cast<uint32_t>(batch.total_tokens),
       sizeof(uint32_t),
       static_cast<uint32_t>(batch.total_tokens),
       /*local_offset=*/0,
@@ -172,8 +195,6 @@ inline V2TransferCmd make_v2_combine_payload_cmd(
       static_cast<uint32_t>(segment.dst_original_rank),
       /*target_lane=*/0,
       segment_idx, batch_idx,
-      static_cast<uint32_t>(segment.expert_id),
-      static_cast<uint32_t>(segment.count),
       static_cast<uint32_t>(segment.count * segment.payload_bytes),
       /*signal_value=*/0,
       layout.local_payload_base +
@@ -193,8 +214,6 @@ inline V2TransferCmd make_v2_combine_signal_cmd(
       static_cast<uint32_t>(batch.dst_original_rank),
       /*target_lane=*/0,
       static_cast<uint32_t>(batch.first_segment), batch_idx,
-      static_cast<uint32_t>(batch.expert_id),
-      static_cast<uint32_t>(batch.total_tokens),
       sizeof(uint32_t),
       static_cast<uint32_t>(batch.total_tokens),
       /*local_offset=*/0,

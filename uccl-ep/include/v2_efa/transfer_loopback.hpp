@@ -25,13 +25,11 @@ struct LoopbackStats {
 };
 
 inline bool is_transfer_payload_command(const V2TransferCmd& command) {
-  return command.kind == static_cast<uint8_t>(V2TransferCmdKind::kDispatchPayload) ||
-         command.kind == static_cast<uint8_t>(V2TransferCmdKind::kCombinePayload);
+  return is_v2_transfer_payload(command);
 }
 
 inline bool is_transfer_signal_command(const V2TransferCmd& command) {
-  return command.kind == static_cast<uint8_t>(V2TransferCmdKind::kDispatchSignal) ||
-         command.kind == static_cast<uint8_t>(V2TransferCmdKind::kCombineSignal);
+  return is_v2_transfer_signal(command);
 }
 
 inline void check_loopback_range(const char* name, uint64_t offset,
@@ -52,12 +50,14 @@ inline void execute_loopback_transfer_cmd(const V2TransferCmd& command,
     if (memory.local == nullptr || memory.remote == nullptr) {
       throw std::invalid_argument("loopback payload memory must not be null");
     }
-    check_loopback_range("local", command.local_offset, command.bytes,
+    const auto local_offset = v2_transfer_local_offset(command);
+    const auto remote_offset = v2_transfer_remote_offset(command);
+    check_loopback_range("local", local_offset, command.bytes,
                          memory.local_bytes);
-    check_loopback_range("remote", command.remote_offset, command.bytes,
+    check_loopback_range("remote", remote_offset, command.bytes,
                          memory.remote_bytes);
-    std::memcpy(memory.remote + command.remote_offset,
-                memory.local + command.local_offset, command.bytes);
+    std::memcpy(memory.remote + remote_offset,
+                memory.local + local_offset, command.bytes);
     if (stats != nullptr) {
       stats->payload_commands += 1;
       stats->payload_bytes += command.bytes;
@@ -69,9 +69,10 @@ inline void execute_loopback_transfer_cmd(const V2TransferCmd& command,
     if (memory.remote == nullptr) {
       throw std::invalid_argument("loopback signal memory must not be null");
     }
-    check_loopback_range("remote", command.remote_offset, sizeof(uint32_t),
+    const auto remote_offset = v2_transfer_remote_offset(command);
+    check_loopback_range("remote", remote_offset, sizeof(uint32_t),
                          memory.remote_bytes);
-    std::memcpy(memory.remote + command.remote_offset, &command.signal_value,
+    std::memcpy(memory.remote + remote_offset, &command.signal_value,
                 sizeof(uint32_t));
     if (stats != nullptr) {
       stats->signal_commands += 1;

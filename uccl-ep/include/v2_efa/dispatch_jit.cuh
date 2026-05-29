@@ -136,8 +136,8 @@ __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
     const DispatchSegmentDescriptor* segments,
     const DispatchExpertBatch* batches, int num_batches,
     V2TransferQueueView queue, DispatchTransferLayout layout) {
-  // Preferred native V2 command-ring path. It writes 64-byte V2TransferCmd
-  // entries directly.
+  // Preferred native V2 command-ring path. It writes 16-byte V2TransferCmd
+  // entries directly into the same-width FIFO slot used by the retained proxy.
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }

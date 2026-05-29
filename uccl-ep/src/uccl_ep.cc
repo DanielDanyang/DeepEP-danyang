@@ -194,20 +194,17 @@ nb::dict combine_transfer_layout_to_dict(
 
 nb::dict transfer_cmd_to_dict(const v2::V2TransferCmd& cmd) {
   nb::dict out;
-  out["magic"] = cmd.magic;
-  out["version"] = cmd.version;
   out["kind"] = cmd.kind;
   out["target_rank"] = cmd.target_rank;
   out["target_lane"] = cmd.target_lane;
   out["flags"] = cmd.flags;
-  out["descriptor_index"] = cmd.descriptor_index;
-  out["batch_index"] = cmd.batch_index;
-  out["expert_id"] = cmd.expert_id;
-  out["count"] = cmd.count;
   out["bytes"] = cmd.bytes;
-  out["signal_value"] = cmd.signal_value;
-  out["local_offset"] = cmd.local_offset;
-  out["remote_offset"] = cmd.remote_offset;
+  out["remote_offset"] = v2::v2_transfer_remote_offset(cmd);
+  if (v2::is_v2_transfer_signal(cmd)) {
+    out["signal_value"] = cmd.signal_value;
+  } else {
+    out["local_offset"] = v2::v2_transfer_local_offset(cmd);
+  }
   return out;
 }
 
