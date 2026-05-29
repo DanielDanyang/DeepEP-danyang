@@ -417,6 +417,10 @@ class ElasticBuffer:
             uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
         return self.runtime.compile_combine_enqueue_d2h_jit(str(uccl_include_path))
 
+    @staticmethod
+    def allocate_d2h_queue(capacity: int = 2048):
+        return ep.V2MappedD2HQueue(int(capacity))
+
     def launch_combine_descriptors(
         self,
         dispatch_segments: torch.Tensor,
@@ -507,6 +511,39 @@ class ElasticBuffer:
             _cuda_stream_ptr(stream),
         )
 
+    def launch_dispatch_enqueue_d2h_queue(
+        self,
+        segments: torch.Tensor,
+        batches: torch.Tensor,
+        num_batches: int,
+        queue,
+        layout: dict,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        _require_cuda_contiguous(segments, "segments")
+        _require_cuda_contiguous(batches, "batches")
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_dispatch_enqueue_d2h(
+            int(segments.data_ptr()),
+            int(batches.data_ptr()),
+            int(num_batches),
+            int(queue.commands_ptr()),
+            int(queue.head_ptr()),
+            int(queue.tail_ptr()),
+            int(queue.capacity()),
+            int(layout.get("local_payload_base", 0)),
+            int(layout.get("remote_payload_base", 0)),
+            int(layout.get("remote_signal_base", 0)),
+            int(layout["src_token_stride"]),
+            int(layout["expanded_slot_stride"]),
+            int(layout["batch_payload_stride"]),
+            int(layout.get("signal_stride", 4)),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
     def launch_combine_enqueue_d2h(
         self,
         segments: torch.Tensor,
@@ -537,6 +574,39 @@ class ElasticBuffer:
             int(head.data_ptr()),
             int(tail.data_ptr()),
             queue_capacity,
+            int(layout.get("local_payload_base", 0)),
+            int(layout.get("remote_payload_base", 0)),
+            int(layout.get("remote_signal_base", 0)),
+            int(layout["expanded_slot_stride"]),
+            int(layout["reduced_token_stride"]),
+            int(layout["batch_payload_stride"]),
+            int(layout.get("signal_stride", 4)),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
+    def launch_combine_enqueue_d2h_queue(
+        self,
+        segments: torch.Tensor,
+        batches: torch.Tensor,
+        num_batches: int,
+        queue,
+        layout: dict,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        _require_cuda_contiguous(segments, "segments")
+        _require_cuda_contiguous(batches, "batches")
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_combine_enqueue_d2h(
+            int(segments.data_ptr()),
+            int(batches.data_ptr()),
+            int(num_batches),
+            int(queue.commands_ptr()),
+            int(queue.head_ptr()),
+            int(queue.tail_ptr()),
+            int(queue.capacity()),
             int(layout.get("local_payload_base", 0)),
             int(layout.get("remote_payload_base", 0)),
             int(layout.get("remote_signal_base", 0)),

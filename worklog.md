@@ -1336,3 +1336,10 @@ README 风格 EP8x2 性能：
   - Python wrapper 使用 caller-owned queue storage：`commands` 为一字节元素且
     总字节数必须是 `16 * power_of_two_capacity`，`head/tail` 由调用方提供。
   - 本地只跑轻量检查，未连接服务器验证。
+- 继续补齐 D2H queue 的生产形态：
+  - 新增 `V2MappedD2HQueue` nanobind 类，用 `cudaHostAllocMapped` 分配 host-visible /
+    device-visible command ring。
+  - queue 暴露 `commands_ptr/head_ptr/tail_ptr/capacity` 供 enqueue kernel 使用，并暴露
+    `poll_ready/ack_ready/reset/head/tail` 给 CPU proxy 或 smoke test 使用。
+  - Python wrapper 新增 `allocate_d2h_queue`、`launch_dispatch_enqueue_d2h_queue`、
+    `launch_combine_enqueue_d2h_queue`，避免最终路径依赖临时 CUDA tensor queue。

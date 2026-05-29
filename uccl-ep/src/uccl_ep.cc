@@ -1,13 +1,17 @@
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include <cuda_runtime_api.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
+#include "ep_util.hpp"
 #include "v2_efa/runtime.hpp"
 #include "v2_efa/transfer_cmd.hpp"
 #include "v2_efa/transfer_cmd_plan.hpp"
+#include "v2_efa/transfer_d2h_queue.cuh"
 #include "v2_efa/transfer_layout.hpp"
 
 namespace nb = nanobind;
@@ -248,6 +252,117 @@ std::vector<int64_t> sequence_to_i64_vector(const nb::sequence& values) {
   return out;
 }
 
+class MappedD2HQueueHandle {
+ public:
+  explicit MappedD2HQueueHandle(uint32_t capacity)
+      : capacity_(capacity), commands_bytes_(capacity * sizeof(v2::V2TransferCmd)) {
+    if (capacity_ == 0 || (capacity_ & (capacity_ - 1)) != 0) {
+      throw std::invalid_argument(
+          "V2 mapped D2H queue capacity must be a positive power of two");
+    }
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&commands_host_),
+                             commands_bytes_, cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&head_host_),
+                             sizeof(uint64_t), cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&tail_host_),
+                             sizeof(uint64_t), cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostGetDevicePointer(
+        reinterpret_cast<void**>(&commands_device_), commands_host_, 0));
+    CUDA_CHECK(cudaHostGetDevicePointer(
+        reinterpret_cast<void**>(&head_device_), head_host_, 0));
+    CUDA_CHECK(cudaHostGetDevicePointer(
+        reinterpret_cast<void**>(&tail_device_), tail_host_, 0));
+    reset();
+  }
+
+  MappedD2HQueueHandle(const MappedD2HQueueHandle&) = delete;
+  MappedD2HQueueHandle& operator=(const MappedD2HQueueHandle&) = delete;
+
+  ~MappedD2HQueueHandle() {
+    if (commands_host_ != nullptr) {
+      cudaFreeHost(commands_host_);
+    }
+    if (head_host_ != nullptr) {
+      cudaFreeHost(head_host_);
+    }
+    if (tail_host_ != nullptr) {
+      cudaFreeHost(tail_host_);
+    }
+  }
+
+  uint32_t capacity() const { return capacity_; }
+
+  std::uintptr_t commands_ptr() const {
+    return reinterpret_cast<std::uintptr_t>(commands_device_);
+  }
+
+  std::uintptr_t head_ptr() const {
+    return reinterpret_cast<std::uintptr_t>(head_device_);
+  }
+
+  std::uintptr_t tail_ptr() const {
+    return reinterpret_cast<std::uintptr_t>(tail_device_);
+  }
+
+  uint64_t head() const {
+    return __atomic_load_n(head_host_, __ATOMIC_ACQUIRE);
+  }
+
+  uint64_t tail() const {
+    return __atomic_load_n(tail_host_, __ATOMIC_ACQUIRE);
+  }
+
+  void reset() {
+    std::memset(commands_host_, 0, commands_bytes_);
+    __atomic_store_n(head_host_, uint64_t{0}, __ATOMIC_RELEASE);
+    __atomic_store_n(tail_host_, uint64_t{0}, __ATOMIC_RELEASE);
+  }
+
+  std::vector<v2::V2TransferCmd> poll_ready() const {
+    std::vector<v2::V2TransferCmd> out;
+    const auto h = head();
+    const auto t = tail();
+    out.reserve(static_cast<size_t>(h - t));
+    for (uint64_t idx = t; idx < h; ++idx) {
+      const auto slot = static_cast<uint32_t>(idx) & (capacity_ - 1);
+      const auto kind = __atomic_load_n(&commands_host_[slot].kind,
+                                        __ATOMIC_ACQUIRE);
+      if (kind == 0) {
+        break;
+      }
+      out.push_back(commands_host_[slot]);
+    }
+    return out;
+  }
+
+  void ack_ready() {
+    const auto h = head();
+    auto t = tail();
+    while (t < h) {
+      const auto slot = static_cast<uint32_t>(t) & (capacity_ - 1);
+      const auto kind = __atomic_load_n(&commands_host_[slot].kind,
+                                        __ATOMIC_ACQUIRE);
+      if (kind == 0) {
+        break;
+      }
+      __atomic_store_n(&commands_host_[slot].kind, uint8_t{0},
+                       __ATOMIC_RELEASE);
+      ++t;
+    }
+    __atomic_store_n(tail_host_, t, __ATOMIC_RELEASE);
+  }
+
+ private:
+  uint32_t capacity_ = 0;
+  size_t commands_bytes_ = 0;
+  v2::V2TransferCmd* commands_host_ = nullptr;
+  v2::V2TransferCmd* commands_device_ = nullptr;
+  uint64_t* head_host_ = nullptr;
+  uint64_t* head_device_ = nullptr;
+  uint64_t* tail_host_ = nullptr;
+  uint64_t* tail_device_ = nullptr;
+};
+
 }  // namespace
 
 NB_MODULE(ep, m) {
@@ -274,6 +389,24 @@ NB_MODULE(ep, m) {
   nb::class_<EventHandle>(m, "EventHandle")
       .def(nb::init<>())
       .def("current_stream_wait", &EventHandle::current_stream_wait);
+
+  nb::class_<MappedD2HQueueHandle>(m, "V2MappedD2HQueue")
+      .def(nb::init<uint32_t>(), nb::arg("capacity") = v2::kV2TransferD2HQueueSize)
+      .def("capacity", &MappedD2HQueueHandle::capacity)
+      .def("commands_ptr", &MappedD2HQueueHandle::commands_ptr)
+      .def("head_ptr", &MappedD2HQueueHandle::head_ptr)
+      .def("tail_ptr", &MappedD2HQueueHandle::tail_ptr)
+      .def("head", &MappedD2HQueueHandle::head)
+      .def("tail", &MappedD2HQueueHandle::tail)
+      .def("reset", &MappedD2HQueueHandle::reset)
+      .def("ack_ready", &MappedD2HQueueHandle::ack_ready)
+      .def("poll_ready", [](const MappedD2HQueueHandle& queue) {
+        nb::list out;
+        for (const auto& cmd : queue.poll_ready()) {
+          out.append(transfer_cmd_to_dict(cmd));
+        }
+        return out;
+      });
 
   nb::class_<v2::RuntimeConfig>(m, "V2EfaRuntimeConfig")
       .def(nb::init<>())
