@@ -359,6 +359,8 @@ device enqueue EFA proxy descriptors
   `batch_payload_stride`，用于隔离 per-expert semantic batch 的远端 payload 区域。
 - 已新增 fixed-capacity host queue scaffold，模拟 host proxy 从 command ring drain
   commands；下一步可以把这个 queue adapter 接到 retained EFA posting path。
+- 已新增 transport-neutral `EfaPostOp` / `EfaPostSink` adapter。真实 EFA verbs sink
+  应实现这个接口，避免把 native V2 command 再编码回旧协议。
 
 交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
 

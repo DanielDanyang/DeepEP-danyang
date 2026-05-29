@@ -1,4 +1,5 @@
 #include "v2_efa/dispatch_plan.hpp"
+#include "v2_efa/efa_adapter.hpp"
 #include "v2_efa/proxy_command_plan.hpp"
 #include "v2_efa/proxy_loopback.hpp"
 #include "v2_efa/proxy_queue_host.hpp"
@@ -183,6 +184,27 @@ int main() {
   assert(queued_dispatch_stats.payload_commands == 4);
   assert(std::memcmp(queued_dispatch_remote.data() + 2000,
                      dispatch_local.data() + 1000, 64) == 0);
+
+  RecordingEfaPostSink sink;
+  drain_host_queue_to_efa_posts(dispatch_queue, sink);
+  assert(sink.ops.size() == dispatch_commands.commands.size());
+  assert(sink.ops[0].kind == EfaPostOpKind::kWrite);
+  assert(sink.ops[0].target_rank == dispatch_commands.commands[0].target_rank);
+  assert(sink.ops[0].target_lane == dispatch_commands.commands[0].target_lane);
+  assert(sink.ops[0].local_offset == dispatch_commands.commands[0].local_offset);
+  assert(sink.ops[0].remote_offset == dispatch_commands.commands[0].remote_offset);
+  assert(sink.ops[1].kind == EfaPostOpKind::kSignalWrite);
+  assert(sink.ops[1].signal_value == 2);
+
+  EndpointTable endpoints(/*num_ranks=*/2, /*num_lanes=*/2);
+  endpoints.set(EfaRemoteEndpoint{/*rank=*/0, /*lane=*/0,
+                                  /*remote_base=*/2000, /*rkey=*/123,
+                                  /*bytes=*/4096});
+  endpoints.set(EfaRemoteEndpoint{/*rank=*/1, /*lane=*/0,
+                                  /*remote_base=*/2256, /*rkey=*/456,
+                                  /*bytes=*/4096});
+  assert(endpoints.get(0, 0).rkey == 123);
+  assert(endpoints.get(1, 0).remote_base == 2256);
 
   std::vector<uint8_t> combine_local(8192, 0);
   std::vector<uint8_t> combine_remote(8192, 0);

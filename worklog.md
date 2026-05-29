@@ -68,6 +68,9 @@
   - 新增 `include/v2_efa/proxy_queue_host.hpp`，提供 fixed-capacity host queue
     scaffold，可以模拟 device 写入 `ProxyQueueView` 后由 host proxy drain 到 loopback
     executor。
+  - 新增 `include/v2_efa/efa_adapter.hpp`，把 native V2 `ProxyCommand` 转成
+    transport-neutral `EfaPostOp`，并提供 `RecordingEfaPostSink` 和 endpoint table
+    scaffold。真实 EFA verbs sink 后续实现这个接口，不回退到旧 `TransferCmd` 协议。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查
