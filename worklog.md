@@ -54,6 +54,8 @@
   - `combine_jit.cuh` 已能从 dispatch descriptor 生成 roundtrip combine descriptor，
     用于后续和 V2 forward metadata 版本对拍。
   - workspace counter 从 2 words 扩展到 3 words：segments、batches、overflow。
+  - 新增 `include/v2_efa/proxy_command_plan.hpp`，把 dispatch/combine descriptor
+    转成 reference proxy payload/signal command，并在本地 C++ 测试里校验 offset。
 - 服务器当前未执行任何 build/test/profiling/benchmark。
 
 ## 2026-05-27 设备空闲检查

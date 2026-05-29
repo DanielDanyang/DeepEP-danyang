@@ -1,4 +1,5 @@
 #include "v2_efa/dispatch_plan.hpp"
+#include "v2_efa/proxy_command_plan.hpp"
 #include "v2_efa/runtime.hpp"
 
 #include <cassert>
@@ -82,6 +83,41 @@ int main() {
          sizeof(uint32_t) * kDescriptorCounterWords);
   assert(workspace.combine_counters.bytes ==
          sizeof(uint32_t) * kDescriptorCounterWords);
+
+  DispatchProxyLayout dispatch_layout;
+  dispatch_layout.local_payload_base = 1000;
+  dispatch_layout.remote_payload_base = 2000;
+  dispatch_layout.remote_signal_base = 3000;
+  dispatch_layout.src_token_stride = 32;
+  dispatch_layout.expanded_slot_stride = 32;
+  const auto dispatch_commands =
+      build_dispatch_proxy_command_plan(plan, dispatch_layout);
+  assert(dispatch_commands.commands.size() == plan.segments.size() +
+                                               plan.batches.size());
+  assert(dispatch_commands.commands[0].kind ==
+         static_cast<uint32_t>(ProxyCommandKind::kDispatchPayload));
+  assert(dispatch_commands.commands[0].bytes == 64);
+  assert(dispatch_commands.commands[0].local_offset == 1000);
+  assert(dispatch_commands.commands[0].remote_offset == 2000);
+  assert(dispatch_commands.commands[1].kind ==
+         static_cast<uint32_t>(ProxyCommandKind::kDispatchSignal));
+  assert(dispatch_commands.commands[1].remote_offset == 3000);
+
+  CombineProxyLayout combine_layout;
+  combine_layout.local_payload_base = 4000;
+  combine_layout.remote_payload_base = 5000;
+  combine_layout.remote_signal_base = 6000;
+  combine_layout.expanded_slot_stride = 32;
+  combine_layout.reduced_token_stride = 32;
+  const auto combine_commands =
+      build_combine_proxy_command_plan(combine_plan, combine_layout);
+  assert(combine_commands.commands.size() == combine_plan.segments.size() +
+                                              combine_plan.batches.size());
+  assert(combine_commands.commands[0].kind ==
+         static_cast<uint32_t>(ProxyCommandKind::kCombinePayload));
+  assert(combine_commands.commands[0].bytes == 64);
+  assert(combine_commands.commands[0].local_offset == 4000);
+  assert(combine_commands.commands[0].remote_offset == 5000);
 
   return 0;
 }
