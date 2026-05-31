@@ -1857,8 +1857,17 @@ README 风格 EP8x2 性能：
   dispatch forward-metadata JIT kernel。
 - 验证：
   - 本地 py_compile/source hygiene/C++ dispatch plan/diff check 通过。
+  - 远端：
+    - 同步相关 `uccl-ep` 文件到 EFS；
+    - `p5en_0` / `p5en_1` 在 GPU 空闲检查通过后执行
+      `source /home/ubuntu/.venvs/deepep-danyang-cu13/bin/activate &&
+      cd /home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/uccl-ep &&
+      make -j8 install`，两台均构建并安装 `ep.abi3.so` 成功。
+    - 构建后再次检查 GPU，发现两台均出现其他用户
+      `/home/ubuntu/efs/zm/mKernel/ziming/bin/python3` 进程，每张 GPU 约 522MiB；
+      按 agents 约束停止后续 import/JIT/smoke/benchmark。
 - 仍未完成：
   - `recv_src_metadata` / `recv_topk_idx` 仍来自 semantic dispatch bridge；
   - channel assignment 仍是 round-robin scaffold，不是官方 `hybrid_dispatch.cuh`
     receiver epilogue 的 tail/linked-list 协议；
-  - 服务器未验证，需等 GPU 空闲。
+  - 服务器已完成构建验证，但 correctness smoke 需等 GPU 再次空闲。
