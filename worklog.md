@@ -1700,3 +1700,47 @@ README 风格 EP8x2 性能：
   - 这还是 transitional overlay。最终应把 recv ordering、expanded slot assignment 和
     metadata 写入都下沉到官方 V2 JIT receiver/epilogue，而不是由 Python semantic path
     兜底。
+
+## 2026-05-31 combine payload RDMA 接入
+
+- 修正 combine 方向的语义来源：
+  - 旧 scaffold 的 combine descriptor 来自本 rank 的 outgoing dispatch descriptors；
+  - 这不符合 DeepEP V2 combine，真实 combine 应该从本 rank forward 收到的 metadata
+    反向发送到原 owner rank；
+  - 新增 `_build_combine_descriptors_from_forward_metadata`，从
+    `handle.recv_src_metadata` 和 expanded slot metadata 构造
+    `CombineSegmentDescriptor` / `CombineExpertBatch`。
+- `_launch_native_combine_transport` 现在在 EFA path 下：
+  - 将 combine input staging 到 `V2EfaConnection` 注册的 window；
+  - 用 existing `launch_combine_enqueue_d2h_queue` 将 forward-metadata-derived
+    descriptors 写成 16B `V2TransferCmd`；
+  - drain queue 到 EFA verbs sink；
+  - 记录 `handle.transport_handle.combine_drain_stats`。
+- 新增 `_overlay_native_combine_payload_from_window`：
+  - 对可以唯一判定一个 remote scaleout contributor 的 token，从 V2 RDMA window 读取
+    combine payload 并覆盖 public `combine()` output；
+  - 多 contributor reduce 仍由 semantic fallback 保持正确性，等待后续下沉到 V2 reduce
+    epilogue。
+- 更新 `uccl-ep/tests/v2_efa_connection_smoke.py`：
+  - dispatch 后调用 `combine(recv_x, handle)`；
+  - 检查 owner rank 的 combine receive window；
+  - 检查 public `combined_x` output。
+- 验证：
+  - 本地：
+    - `python -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py
+      uccl-ep/tests/v2_efa_connection_smoke.py` 通过；
+    - `python uccl-ep/tests/v2_efa_source_hygiene_test.py` 通过；
+    - `c++ -std=c++17 -Iuccl-ep/include uccl-ep/tests/v2_efa_dispatch_plan_test.cc
+      uccl-ep/src/v2_efa_runtime.cc -o /tmp/v2_efa_dispatch_plan_test &&
+      /tmp/v2_efa_dispatch_plan_test` 通过；
+    - `git diff --check -- uccl-ep worklog.md` 通过。
+  - 服务器：
+    - GPU 空闲检查通过后，在 `p5en_0` / `p5en_1` 用 `LOCAL_WORLD_SIZE=1` 跑双机 EP1x2
+      smoke；
+    - rank0/rank1 均通过 dispatch + combine RDMA payload 检查；
+    - combine stats 两边均为 `drained_commands=2`、`posted_writes=1`、
+      `posted_signals=1`、`posted_bytes=20`。
+- 仍未完成：
+  - combine descriptor 构造仍在 Python bridge，不在 CUDA/JIT；
+  - `token_metadata_at_forward` / `channel_linked_list` 还没有真实填充成官方 V2 格式；
+  - 多 topk / 多 remote contributor 的 reduced-combine 还没有 native RDMA reduce path。

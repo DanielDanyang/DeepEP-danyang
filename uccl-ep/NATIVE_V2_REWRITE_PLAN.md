@@ -524,6 +524,23 @@ device enqueue EFA proxy descriptors
 - 从 V2 forward metadata 生成 combine descriptor。
 - 支持 reduced-combine，receiver 直接写回 owner rank 的 reduced layout。
 - reduce epilogue 保持 V2 语义。
+- 当前已完成一个最小 native combine payload RDMA 验证：
+  - Python bridge 从 `recv_src_metadata` / expanded slot metadata 生成
+    `CombineSegmentDescriptor` / `CombineExpertBatch`，不再从本 rank 的 outgoing
+    dispatch descriptor 反推 combine 目标；
+  - sender 将 combine input staging 到 V2 EFA window，然后用 existing
+    `v2_efa_combine_enqueue_d2h_kernel` 生成 `V2TransferCmd`；
+  - CPU/EFA sink drain 后把 payload 写回 owner rank 的 V2 RDMA window；
+  - public `combine()` 在可唯一判定一个 remote scaleout contributor 的 token 上，会用
+    RDMA window payload 覆盖 semantic reference output；
+  - EP1x2 smoke 已验证 dispatch 和 combine 两个方向都产生
+    `drained_commands=2`、`posted_writes=1`、`posted_signals=1`、`posted_bytes=20`。
+- 仍缺真正 native V2 combine：
+  - descriptor 仍由 Python bridge 构造，还没有下沉到 CUDA/JIT 解析
+    `token_metadata_at_forward` / `channel_linked_list`；
+  - 多 topk / 多 remote contributor 的 reduce 仍由 semantic fallback 兜底，RDMA overlay
+    只覆盖单 remote contributor 情况；
+  - receiver reduced layout 还不是官方 V2 reduce epilogue 的完整实现。
 
 交付标准：combine / reduced combine correctness 通过。
 

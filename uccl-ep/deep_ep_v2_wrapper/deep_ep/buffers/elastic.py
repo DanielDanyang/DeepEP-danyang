@@ -1220,6 +1220,7 @@ class ElasticBuffer:
         self._launch_native_combine_transport(x, handle)
 
         combined_x = self._semantic_combine_data(x, handle, bias)
+        self._overlay_native_combine_payload_from_window(combined_x, handle)
         combined_topk_weights = handle.topk_idx.new_zeros(handle.topk_idx.shape).to(torch.float32)
         if topk_weights is not None and not handle.do_expand:
             combined_topk_weights = self._semantic_combine_weights(topk_weights, handle)
@@ -1377,48 +1378,178 @@ class ElasticBuffer:
 
     def _launch_native_combine_transport(self, x: torch.Tensor, handle: EPHandle) -> None:
         transport = handle.transport_handle
-        if transport is None:
+        if transport is None or self._v2_efa_connection is None:
             return
-        sizes = ep.v2_descriptor_sizes()
-        max_segments = max(1, int(handle.num_max_tokens_per_rank * self.num_topk))
-        max_batches = max(1, int(self.num_experts * self.num_ranks))
-        segments = torch.empty((max_segments * int(sizes["combine_segment"]),),
-                               dtype=torch.uint8, device=x.device)
-        batches = torch.empty((max_batches * int(sizes["combine_batch"]),),
-                              dtype=torch.uint8, device=x.device)
-        counters = torch.zeros((3,), dtype=torch.int32, device=x.device)
-        queue = self.allocate_d2h_queue(_next_power_of_two(max_segments + max_batches + 1))
+        segments, batches, counters = self._build_combine_descriptors_from_forward_metadata(
+            x, handle
+        )
+        num_segments = int(counters[0].item())
+        num_batches = int(counters[1].item())
+        queue = self.allocate_d2h_queue(_next_power_of_two(num_segments + num_batches + 1))
         payload_bytes = int(x.shape[1] * x.element_size())
-        layout = {
-            "local_payload_base": 0,
-            "remote_payload_base": 0,
-            "remote_signal_base": _align(max_batches * handle.num_max_tokens_per_rank * payload_bytes, 64),
-            "expanded_slot_stride": payload_bytes,
-            "reduced_token_stride": payload_bytes,
-            "batch_payload_stride": _align(handle.num_max_tokens_per_rank * payload_bytes, 64),
-            "signal_stride": 4,
-        }
-        self.launch_combine_descriptor_enqueue_d2h_queue(
-            dispatch_segments=transport.dispatch_segments,
-            dispatch_batches=transport.dispatch_batches,
-            num_dispatch_batches=transport.num_dispatch_batches,
-            segments=segments,
-            batches=batches,
-            counters=counters,
-            queue=queue,
-            layout=layout,
+        max_layout_batches = max(1, num_batches)
+        layout = self._make_combine_window_layout(
+            num_source_tokens=int(x.shape[0]),
             num_max_tokens_per_rank=handle.num_max_tokens_per_rank,
             payload_bytes=payload_bytes,
-            smem_bytes=0,
+            max_batches=max_layout_batches,
+        )
+        self._stage_tensor_bytes_to_v2_window(x, int(layout["local_payload_base"]))
+        self.launch_combine_enqueue_d2h_queue(
+            segments=segments,
+            batches=batches,
+            num_batches=num_batches,
+            queue=queue,
+            layout=layout,
         )
         torch.cuda.current_stream().synchronize()
+        combine_drain_stats = self._v2_efa_connection.drain_queue(queue, True, True)
         transport.combine_segments = segments
         transport.combine_batches = batches
         transport.combine_counters = counters
         transport.combine_d2h_queue = queue
         transport.combine_layout = layout
-        transport.num_combine_segments = int(counters[0].item())
-        transport.num_combine_batches = int(counters[1].item())
+        transport.num_combine_segments = num_segments
+        transport.num_combine_batches = num_batches
+        transport.combine_drain_stats = combine_drain_stats
+
+    def _build_combine_descriptors_from_forward_metadata(
+        self,
+        x: torch.Tensor,
+        handle: EPHandle,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        payload_bytes = int(x.shape[1] * x.element_size())
+        segment_words = 12
+        batch_words = 10
+        segments = []
+        batches = []
+        batch_for_dst = {}
+
+        def add_segment(dst_rank: int, src_scaleout_rank: int, source_slot: int,
+                        topk_slot: int, reduced_token_slot: int) -> None:
+            dst_scaleout_rank = int(dst_rank) // self.num_scaleup_ranks
+            dst_scaleup_lane = int(dst_rank) % self.num_scaleup_ranks
+            key = (int(dst_rank), dst_scaleout_rank, dst_scaleup_lane)
+            if key not in batch_for_dst:
+                batch_for_dst[key] = len(batches)
+                batches.append([
+                    int(dst_rank), dst_scaleout_rank, dst_scaleup_lane,
+                    self.scaleout_rank_idx, 0, len(segments), 0, 0, 0, 0,
+                ])
+            batch_idx = batch_for_dst[key]
+            batches[batch_idx][6] += 1
+            batches[batch_idx][7] += 1
+            segments.append([
+                int(dst_rank), dst_scaleout_rank, dst_scaleup_lane,
+                int(src_scaleout_rank), 0, 1, int(source_slot), -1,
+                int(topk_slot), int(reduced_token_slot), payload_bytes,
+                1 << 3,
+            ])
+
+        src_metadata = handle.recv_src_metadata
+        src_global = src_metadata[:, 0].to(torch.long)
+        for row in range(int(src_metadata.shape[0])):
+            token_global = int(src_global[row].item())
+            dst_rank = token_global // int(handle.num_max_tokens_per_rank)
+            src_scaleout_rank = dst_rank // self.num_scaleup_ranks
+            if src_scaleout_rank == self.scaleout_rank_idx:
+                continue
+            reduced_token_slot = token_global % int(handle.num_max_tokens_per_rank)
+            if handle.do_expand:
+                for topk_slot in range(int(handle.topk_idx.shape[1])):
+                    source_slot = int(src_metadata[row, 2 + topk_slot].item())
+                    if source_slot >= 0:
+                        add_segment(dst_rank, src_scaleout_rank, source_slot,
+                                    topk_slot, reduced_token_slot)
+            else:
+                add_segment(dst_rank, src_scaleout_rank, row, 0, reduced_token_slot)
+
+        if not segments:
+            segments = [[0] * segment_words]
+        if not batches:
+            batches = [[0] * batch_words]
+
+        segments_tensor = torch.tensor(
+            [word for segment in segments for word in segment],
+            dtype=torch.int32,
+            device=x.device,
+        ).view(torch.uint8)
+        batches_tensor = torch.tensor(
+            [word for batch in batches for word in batch],
+            dtype=torch.int32,
+            device=x.device,
+        ).view(torch.uint8)
+        counters = torch.tensor(
+            [0 if segments == [[0] * segment_words] else len(segments),
+             0 if batches == [[0] * batch_words] else len(batches),
+             0],
+            dtype=torch.int32,
+            device=x.device,
+        )
+        return segments_tensor, batches_tensor, counters
+
+    def _make_combine_window_layout(
+        self,
+        num_source_tokens: int,
+        num_max_tokens_per_rank: int,
+        payload_bytes: int,
+        max_batches: int,
+    ) -> dict:
+        src_bytes = _align(int(num_source_tokens) * int(payload_bytes), 64)
+        reduced_bytes = _align(int(num_max_tokens_per_rank) * int(payload_bytes), 64)
+        remote_payload_base = src_bytes
+        remote_signal_base = _align(remote_payload_base + int(max_batches) * reduced_bytes, 64)
+        total_bytes = _align(remote_signal_base + int(max_batches) * 4, 64)
+        self._require_v2_efa_window(total_bytes)
+        return {
+            "local_payload_base": 0,
+            "remote_payload_base": remote_payload_base,
+            "remote_signal_base": remote_signal_base,
+            "expanded_slot_stride": int(payload_bytes),
+            "reduced_token_stride": int(payload_bytes),
+            "batch_payload_stride": reduced_bytes,
+            "signal_stride": 4,
+            "src_payload_bytes": src_bytes,
+            "remote_payload_bytes": int(max_batches) * reduced_bytes,
+            "total_window_bytes": total_bytes,
+        }
+
+    def _overlay_native_combine_payload_from_window(
+        self,
+        combined_x: torch.Tensor,
+        handle: EPHandle,
+    ) -> None:
+        transport = handle.transport_handle
+        if (
+            self._v2_efa_connection is None or self._v2_efa_window is None or
+            transport is None or transport.combine_layout is None
+        ):
+            return
+        layout = transport.combine_layout
+        remote_payload_base = int(layout.get("remote_payload_base", 0))
+        reduced_token_stride = int(layout.get("reduced_token_stride", combined_x.shape[1] * combined_x.element_size()))
+        batch_payload_stride = int(layout.get("batch_payload_stride", 0))
+        payload_bytes = int(combined_x.shape[1] * combined_x.element_size())
+        window = self._require_v2_efa_window(
+            remote_payload_base + max(1, int(transport.num_combine_batches)) * max(batch_payload_stride, payload_bytes)
+        )
+        num_experts_per_rank = max(1, handle.num_experts // self.num_ranks)
+        for token in range(int(handle.topk_idx.shape[0])):
+            remote_scaleout_routes = []
+            for topk_slot in range(int(handle.topk_idx.shape[1])):
+                expert = int(handle.topk_idx[token, topk_slot].item())
+                if expert < 0:
+                    continue
+                owner_rank = expert // num_experts_per_rank
+                owner_scaleout_rank = owner_rank // self.num_scaleup_ranks
+                if owner_scaleout_rank != self.scaleout_rank_idx:
+                    remote_scaleout_routes.append(owner_scaleout_rank)
+            if len(remote_scaleout_routes) != 1:
+                continue
+            offset = remote_payload_base + token * reduced_token_stride
+            combined_x[token].reshape(-1).view(torch.uint8).copy_(
+                window[offset: offset + payload_bytes]
+            )
 
     def _semantic_dispatch_data(
         self,

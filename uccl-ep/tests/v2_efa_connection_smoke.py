@@ -137,6 +137,34 @@ def main():
             f"stats={handle.transport_handle.dispatch_drain_stats}",
             flush=True,
         )
+        combined_x, _, _ = buf.combine(recv_x, handle)
+        for _ in range(1000):
+            if buf._v2_efa_connection.poll_completions(16):
+                break
+            time.sleep(0.001)
+        dist.barrier()
+        torch.cuda.synchronize()
+        combine_layout = handle.transport_handle.combine_layout
+        combine_offset = int(combine_layout["remote_payload_base"])
+        combine_got = window[combine_offset: combine_offset + 16].cpu().tolist()
+        combine_expected = (torch.arange(16, dtype=torch.uint8) + rank * 64).tolist()
+        assert combine_got == combine_expected, (
+            combine_got,
+            combine_expected,
+            combine_layout,
+            handle.transport_handle.combine_drain_stats,
+        )
+        combined_got = combined_x.reshape(-1).view(torch.uint8).cpu().tolist()
+        assert combined_got == combine_expected, (
+            combined_got,
+            combine_expected,
+            handle.transport_handle.combine_drain_stats,
+        )
+        print(
+            f"rank={rank} combine_rdma_recv_ok=True "
+            f"stats={handle.transport_handle.combine_drain_stats}",
+            flush=True,
+        )
 
     dist.barrier()
     if rank == 0:
