@@ -528,6 +528,10 @@ device enqueue EFA proxy descriptors
   - Python bridge 从 `recv_src_metadata` / expanded slot metadata 生成
     `CombineSegmentDescriptor` / `CombineExpertBatch`，不再从本 rank 的 outgoing
     dispatch descriptor 反推 combine 目标；
+  - dispatch handle 现在填充 compact transitional `token_metadata_at_forward` 和
+    `channel_linked_list`，combine descriptor builder 优先消费
+    `token_metadata_at_forward`；这让语义来源更接近官方 V2 handle/cache，而不是直接
+    依赖 Python-only `recv_src_metadata`；
   - sender 将 combine input staging 到 V2 EFA window，然后用 existing
     `v2_efa_combine_enqueue_d2h_kernel` 生成 `V2TransferCmd`；
   - CPU/EFA sink drain 后把 payload 写回 owner rank 的 V2 RDMA window；
@@ -536,7 +540,9 @@ device enqueue EFA proxy descriptors
   - EP1x2 smoke 已验证 dispatch 和 combine 两个方向都产生
     `drained_commands=2`、`posted_writes=1`、`posted_signals=1`、`posted_bytes=20`。
 - 仍缺真正 native V2 combine：
-  - descriptor 仍由 Python bridge 构造，还没有下沉到 CUDA/JIT 解析
+  - `token_metadata_at_forward` / `channel_linked_list` 仍是 compact transitional
+    tensor，不是官方多 channel `[channel, token, metadata_dim]` 完整格式；
+  - descriptor 仍由 Python bridge 构造，还没有下沉到 CUDA/JIT 解析完整
     `token_metadata_at_forward` / `channel_linked_list`；
   - 多 topk / 多 remote contributor 的 reduce 仍由 semantic fallback 兜底，RDMA overlay
     只覆盖单 remote contributor 情况；

@@ -1744,3 +1744,26 @@ README 风格 EP8x2 性能：
   - combine descriptor 构造仍在 Python bridge，不在 CUDA/JIT；
   - `token_metadata_at_forward` / `channel_linked_list` 还没有真实填充成官方 V2 格式；
   - 多 topk / 多 remote contributor 的 reduced-combine 还没有 native RDMA reduce path。
+
+## 2026-05-31 transitional V2 forward metadata
+
+- 为 dispatch handle 补齐了 compact transitional forward metadata：
+  - `token_metadata_at_forward`: `[num_recv + 1, 2 + 2 * num_topk]`，字段按官方 V2
+    forward metadata 的核心语义排列：
+    - source global token id；
+    - last-token flag；
+    - per-topk destination scaleup lane；
+    - per-topk destination/expanded slot；
+    - 末尾 source id 为 `-1` 的 sentinel；
+  - `channel_linked_list`: 当前为 compact 单 channel tail scaffold，用来保留 V2 handle
+    中的 channel-linked-list 入口。
+- combine descriptor builder 现在优先消费 `handle.token_metadata_at_forward`，只有缺失时
+  才回退从 `recv_src_metadata` 构造临时 metadata。
+- 验证：
+  - 本地 py_compile/source hygiene/C++ dispatch plan/diff check 全部通过。
+  - 服务器双机 EP1x2 smoke 再次通过，dispatch 和 combine RDMA payload stats 仍为
+    `drained_commands=2`、`posted_writes=1`、`posted_signals=1`、`posted_bytes=20`。
+- 仍未完成：
+  - metadata 还不是官方完整多 channel layout；
+  - 生成 metadata 的逻辑还在 Python，不在 V2 dispatch receiver JIT epilogue；
+  - combine 还没有 CUDA/JIT 端解析 `token_metadata_at_forward` / `channel_linked_list`。

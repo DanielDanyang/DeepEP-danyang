@@ -1142,6 +1142,12 @@ class ElasticBuffer:
                 do_expand,
             )
         )
+        token_metadata_at_forward, channel_linked_list = self._build_forward_metadata_tensors(
+            recv_topk_idx,
+            recv_src_metadata,
+            do_expand,
+            num_experts,
+        )
 
         if cumulative_local_expert_recv_stats is not None:
             cumulative_local_expert_recv_stats.add_(
@@ -1191,8 +1197,8 @@ class ElasticBuffer:
             psum_num_recv_tokens_per_expert=psum_expert,
             recv_src_metadata=recv_src_metadata,
             dst_buffer_slot_idx=dst_buffer_slot_idx,
-            token_metadata_at_forward=None,
-            channel_linked_list=None,
+            token_metadata_at_forward=token_metadata_at_forward,
+            channel_linked_list=channel_linked_list,
             transport_handle=transport,
         )
 
@@ -1446,10 +1452,24 @@ class ElasticBuffer:
                 1 << 3,
             ])
 
-        src_metadata = handle.recv_src_metadata
-        src_global = src_metadata[:, 0].to(torch.long)
-        for row in range(int(src_metadata.shape[0])):
-            token_global = int(src_global[row].item())
+        forward_metadata = handle.token_metadata_at_forward
+        if forward_metadata is None:
+            forward_metadata = self._build_forward_metadata_tensors(
+                torch.full(
+                    (handle.recv_src_metadata.shape[0], handle.topk_idx.shape[1]),
+                    -1,
+                    dtype=handle.topk_idx.dtype,
+                    device=handle.topk_idx.device,
+                ),
+                handle.recv_src_metadata,
+                handle.do_expand,
+                handle.num_experts,
+            )[0]
+        forward_rows = forward_metadata.reshape(-1, forward_metadata.shape[-1])
+        for row in range(int(forward_rows.shape[0])):
+            token_global = int(forward_rows[row, 0].item())
+            if token_global < 0:
+                break
             dst_rank = token_global // int(handle.num_max_tokens_per_rank)
             src_scaleout_rank = dst_rank // self.num_scaleup_ranks
             if src_scaleout_rank == self.scaleout_rank_idx:
@@ -1457,7 +1477,7 @@ class ElasticBuffer:
             reduced_token_slot = token_global % int(handle.num_max_tokens_per_rank)
             if handle.do_expand:
                 for topk_slot in range(int(handle.topk_idx.shape[1])):
-                    source_slot = int(src_metadata[row, 2 + topk_slot].item())
+                    source_slot = int(forward_rows[row, 2 + handle.topk_idx.shape[1] + topk_slot].item())
                     if source_slot >= 0:
                         add_segment(dst_rank, src_scaleout_rank, source_slot,
                                     topk_slot, reduced_token_slot)
@@ -1487,6 +1507,53 @@ class ElasticBuffer:
             device=x.device,
         )
         return segments_tensor, batches_tensor, counters
+
+    def _build_forward_metadata_tensors(
+        self,
+        recv_topk_idx: torch.Tensor,
+        recv_src_metadata: torch.Tensor,
+        do_expand: bool,
+        num_experts: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_recv = int(recv_src_metadata.shape[0])
+        num_topk = int(recv_topk_idx.shape[1]) if recv_topk_idx.numel() else int(self.num_topk)
+        dims = 2 + num_topk * 2
+        metadata = torch.full(
+            (max(1, num_recv) + 1, dims),
+            -1,
+            dtype=torch.int32,
+            device=recv_src_metadata.device,
+        )
+        if num_recv == 0:
+            channel_linked_list = torch.zeros(
+                (1, max(1, self.num_scaleup_ranks)),
+                dtype=torch.int32,
+                device=recv_src_metadata.device,
+            )
+            return metadata, channel_linked_list
+
+        metadata[:num_recv, 0] = recv_src_metadata[:num_recv, 0].to(torch.int32)
+        metadata[:num_recv, 1] = 0
+        metadata[num_recv - 1, 1] = 1
+        num_experts_per_rank = max(1, int(num_experts) // self.num_ranks)
+        for row in range(num_recv):
+            for topk_slot in range(num_topk):
+                local_expert = int(recv_topk_idx[row, topk_slot].item())
+                if local_expert < 0:
+                    continue
+                metadata[row, 2 + topk_slot] = local_expert // num_experts_per_rank
+                if do_expand:
+                    metadata[row, 2 + num_topk + topk_slot] = recv_src_metadata[row, 2 + topk_slot]
+                else:
+                    metadata[row, 2 + num_topk + topk_slot] = row
+        metadata[num_recv, 0] = -1
+        channel_linked_list = torch.zeros(
+            (1, max(1, self.num_scaleup_ranks)),
+            dtype=torch.int32,
+            device=recv_src_metadata.device,
+        )
+        channel_linked_list[0, self.scaleup_rank_idx] = num_recv
+        return metadata, channel_linked_list
 
     def _make_combine_window_layout(
         self,
