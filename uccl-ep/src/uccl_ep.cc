@@ -1219,6 +1219,26 @@ NB_MODULE(ep, m) {
            nb::arg("allow_multiple_reduction") = true,
            nb::arg("smem_bytes") = 228 * 1024,
            nb::arg("uccl_include_path") = "")
+      .def("compile_combine_forward_metadata_enqueue_d2h_jit",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              int num_channels, int payload_bytes, bool use_expanded_layout,
+              bool allow_multiple_reduction, int smem_bytes,
+              const std::string& uccl_include_path) {
+             const auto plan =
+                 self.build_combine_forward_metadata_enqueue_d2h_jit_plan(
+                     num_max_tokens_per_rank, num_channels, payload_bytes,
+                     use_expanded_layout, allow_multiple_reduction, smem_bytes,
+                     uccl_include_path);
+             v2::compile_v2_efa_jit_plan(plan);
+             return jit_launch_plan_to_dict(plan);
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels") = 1,
+           nb::arg("payload_bytes") = 0,
+           nb::arg("use_expanded_layout") = true,
+           nb::arg("allow_multiple_reduction") = true,
+           nb::arg("smem_bytes") = 0,
+           nb::arg("uccl_include_path") = "")
       .def("launch_dispatch_descriptors",
            [](const v2::V2EfaRuntime& self, std::uintptr_t topk_idx_ptr,
               std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
@@ -1523,6 +1543,63 @@ NB_MODULE(ep, m) {
            nb::arg("use_expanded_layout") = true,
            nb::arg("allow_multiple_reduction") = true,
            nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("commands_ptr") = 0,
+           nb::arg("head_ptr") = 0,
+           nb::arg("tail_ptr") = 0,
+           nb::arg("queue_capacity") = 0,
+           nb::arg("local_payload_base") = 0,
+           nb::arg("remote_payload_base") = 0,
+           nb::arg("remote_signal_base") = 0,
+           nb::arg("expanded_slot_stride") = 0,
+           nb::arg("reduced_token_stride") = 0,
+           nb::arg("batch_payload_stride") = 0,
+           nb::arg("signal_stride") = sizeof(std::uint32_t),
+           nb::arg("uccl_include_path") = "",
+           nb::arg("cuda_stream_ptr") = 0)
+      .def("launch_combine_forward_metadata_enqueue_d2h",
+           [](const v2::V2EfaRuntime& self,
+              std::uintptr_t forward_metadata_ptr,
+              std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+              std::uintptr_t counters_ptr, int num_forward_rows,
+              int num_max_tokens_per_rank, int num_channels, int payload_bytes,
+              bool use_expanded_layout, bool allow_multiple_reduction,
+              int smem_bytes, std::uintptr_t commands_ptr,
+              std::uintptr_t head_ptr, std::uintptr_t tail_ptr,
+              int queue_capacity, std::uint64_t local_payload_base,
+              std::uint64_t remote_payload_base,
+              std::uint64_t remote_signal_base,
+              std::uint32_t expanded_slot_stride,
+              std::uint32_t reduced_token_stride,
+              std::uint32_t batch_payload_stride,
+              std::uint32_t signal_stride,
+              const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             v2::CombineTransferLayout layout;
+             layout.local_payload_base = local_payload_base;
+             layout.remote_payload_base = remote_payload_base;
+             layout.remote_signal_base = remote_signal_base;
+             layout.expanded_slot_stride = expanded_slot_stride;
+             layout.reduced_token_stride = reduced_token_stride;
+             layout.batch_payload_stride = batch_payload_stride;
+             layout.signal_stride = signal_stride;
+             self.launch_combine_forward_metadata_enqueue_d2h(
+                 forward_metadata_ptr, segments_ptr, batches_ptr, counters_ptr,
+                 num_forward_rows, num_max_tokens_per_rank, num_channels,
+                 payload_bytes, use_expanded_layout, allow_multiple_reduction,
+                 smem_bytes, commands_ptr, head_ptr, tail_ptr, queue_capacity,
+                 layout, uccl_include_path, cuda_stream_ptr);
+           },
+           nb::arg("forward_metadata_ptr"),
+           nb::arg("segments_ptr"),
+           nb::arg("batches_ptr"),
+           nb::arg("counters_ptr"),
+           nb::arg("num_forward_rows"),
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels") = 1,
+           nb::arg("payload_bytes") = 0,
+           nb::arg("use_expanded_layout") = true,
+           nb::arg("allow_multiple_reduction") = true,
+           nb::arg("smem_bytes") = 0,
            nb::arg("commands_ptr") = 0,
            nb::arg("head_ptr") = 0,
            nb::arg("tail_ptr") = 0,

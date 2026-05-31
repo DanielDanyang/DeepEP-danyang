@@ -1767,3 +1767,39 @@ README 风格 EP8x2 性能：
   - metadata 还不是官方完整多 channel layout；
   - 生成 metadata 的逻辑还在 Python，不在 V2 dispatch receiver JIT epilogue；
   - combine 还没有 CUDA/JIT 端解析 `token_metadata_at_forward` / `channel_linked_list`。
+
+## 2026-05-31 combine descriptor 生成下沉到 JIT
+
+- 新增 `v2_efa_combine_forward_metadata_enqueue_d2h_kernel`：
+  - 输入 compact `token_metadata_at_forward`；
+  - 在 CUDA/JIT 端解析 source global token id、destination slot 和 topk slot；
+  - 生成 `CombineSegmentDescriptor` / `CombineExpertBatch`；
+  - 直接 enqueue `V2TransferCmd` 到 D2H queue。
+- 新增 runtime/JIT/binding/Python wrapper：
+  - `build_v2_efa_combine_forward_metadata_enqueue_d2h_jit_plan`
+  - `V2EfaRuntime::build_combine_forward_metadata_enqueue_d2h_jit_plan`
+  - `V2EfaRuntime::launch_combine_forward_metadata_enqueue_d2h`
+  - `ElasticBuffer.launch_combine_forward_metadata_enqueue_d2h_queue`
+- `_launch_native_combine_transport` 改为主路径调用新的 JIT kernel，不再由 Python loop
+  生成 combine descriptors。旧 Python `_build_combine_descriptors_from_forward_metadata`
+  仍保留作调试/对拍入口。
+- 验证：
+  - 本地：
+    - `python -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py
+      uccl-ep/tests/v2_efa_connection_smoke.py` 通过；
+    - `python uccl-ep/tests/v2_efa_source_hygiene_test.py` 通过；
+    - `c++ -std=c++17 -Iuccl-ep/include uccl-ep/tests/v2_efa_dispatch_plan_test.cc
+      uccl-ep/src/v2_efa_runtime.cc -o /tmp/v2_efa_dispatch_plan_test &&
+      /tmp/v2_efa_dispatch_plan_test` 通过；
+    - `git diff --check -- uccl-ep worklog.md` 通过。
+  - 服务器：
+    - `p5en_0` / `p5en_1` GPU 空闲检查通过；
+    - 两台 `make -j8 install` 均通过；
+    - 双机 EP1x2 smoke 通过，dispatch 和 combine RDMA payload 均正确；
+    - combine stats 两边均为 `drained_commands=2`、`posted_writes=1`、
+      `posted_signals=1`、`posted_bytes=20`。
+- 仍未完成：
+  - combine JIT 解析的是 compact transitional metadata，不是官方完整多 channel
+    layout；
+  - dispatch receiver 端 metadata 生成仍在 Python bridge；
+  - 多 remote contributor 的 reduced-combine native reduce 尚未实现。

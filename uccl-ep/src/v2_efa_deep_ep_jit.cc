@@ -274,8 +274,39 @@ void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
       num_dispatch_batches,
       checked_ptr<CombineSegmentDescriptor>(segments_ptr, "segments"),
       checked_ptr<CombineExpertBatch>(batches_ptr, "batches"),
-      checked_ptr<uint32_t>(counters_ptr, "counters"), dst_original_rank,
-      payload_bytes, max_segments, max_batches, queue, layout));
+	      checked_ptr<uint32_t>(counters_ptr, "counters"), dst_original_rank,
+	      payload_bytes, max_segments, max_batches, queue, layout));
+}
+
+void launch_v2_efa_combine_forward_metadata_enqueue_d2h_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t forward_metadata_ptr,
+    std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+    std::uintptr_t counters_ptr, int num_forward_rows, int scaleout_rank,
+    int num_max_tokens_per_rank, int payload_bytes, int max_segments,
+    int max_batches, std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+    std::uintptr_t tail_ptr, int queue_capacity, CombineTransferLayout layout,
+    std::uintptr_t cuda_stream_ptr) {
+  if (num_forward_rows < 0 || num_max_tokens_per_rank <= 0 ||
+      payload_bytes <= 0 || max_segments <= 0 || max_batches <= 0) {
+    throw std::invalid_argument(
+        "invalid V2 EFA combine forward metadata/enqueue launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  V2TransferD2HQueueView queue{
+      checked_ptr<V2TransferCmd>(commands_ptr, "commands"),
+      checked_ptr<uint64_t>(head_ptr, "head"),
+      checked_ptr<uint64_t>(tail_ptr, "tail"),
+      static_cast<uint32_t>(checked_queue_capacity(queue_capacity))};
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config,
+      checked_ptr<const int32_t>(forward_metadata_ptr, "forward_metadata"),
+      checked_ptr<CombineSegmentDescriptor>(segments_ptr, "segments"),
+      checked_ptr<CombineExpertBatch>(batches_ptr, "batches"),
+      checked_ptr<uint32_t>(counters_ptr, "counters"), num_forward_rows,
+      scaleout_rank, num_max_tokens_per_rank, payload_bytes, max_segments,
+      max_batches, queue, layout));
 }
 
 void V2EfaRuntime::launch_dispatch_descriptors(
@@ -417,6 +448,33 @@ void V2EfaRuntime::launch_combine_descriptor_enqueue_d2h(
       static_cast<int>(max_expert_batches(cfg.num_experts,
                                           cfg.num_scaleout_ranks,
                                           cfg.num_scaleup_ranks)),
+	      commands_ptr, head_ptr, tail_ptr, queue_capacity, layout,
+	      cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_combine_forward_metadata_enqueue_d2h(
+    std::uintptr_t forward_metadata_ptr, std::uintptr_t segments_ptr,
+    std::uintptr_t batches_ptr, std::uintptr_t counters_ptr,
+    int num_forward_rows, int num_max_tokens_per_rank, int num_channels,
+    int payload_bytes, bool use_expanded_layout,
+    bool allow_multiple_reduction, int smem_bytes,
+    std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+    std::uintptr_t tail_ptr, int queue_capacity, CombineTransferLayout layout,
+    const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto& cfg = config();
+  const auto plan = build_combine_forward_metadata_enqueue_d2h_jit_plan(
+      num_max_tokens_per_rank, num_channels, payload_bytes,
+      use_expanded_layout, allow_multiple_reduction, smem_bytes,
+      uccl_include_path);
+  launch_v2_efa_combine_forward_metadata_enqueue_d2h_plan(
+      plan, forward_metadata_ptr, segments_ptr, batches_ptr, counters_ptr,
+      num_forward_rows, cfg.scaleout_rank, num_max_tokens_per_rank,
+      payload_bytes,
+      static_cast<int>(max_dispatch_segments(num_max_tokens_per_rank,
+                                             cfg.num_topk)),
+      static_cast<int>(max_dispatch_segments(num_max_tokens_per_rank,
+                                             cfg.num_topk)),
       commands_ptr, head_ptr, tail_ptr, queue_capacity, layout,
       cuda_stream_ptr);
 }

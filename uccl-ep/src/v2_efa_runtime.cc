@@ -250,6 +250,29 @@ V2EfaRuntime::build_combine_descriptor_enqueue_d2h_jit_plan(
   return build_v2_efa_combine_descriptor_enqueue_d2h_jit_plan(jit_config);
 }
 
+V2EfaJitLaunchPlan
+V2EfaRuntime::build_combine_forward_metadata_enqueue_d2h_jit_plan(
+    int num_max_tokens_per_rank, int num_channels, int payload_bytes,
+    bool use_expanded_layout, bool allow_multiple_reduction, int smem_bytes,
+    const std::string& uccl_include_path) const {
+  V2EfaCombineJitConfig jit_config;
+  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
+  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
+  jit_config.num_experts = config_.num_experts;
+  jit_config.num_topk = config_.num_topk;
+  jit_config.hidden = config_.hidden;
+  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
+  jit_config.num_channels = num_channels;
+  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
+  jit_config.dst_original_rank = config_.rank;
+  jit_config.payload_bytes = payload_bytes;
+  jit_config.use_expanded_layout = use_expanded_layout;
+  jit_config.allow_multiple_reduction = allow_multiple_reduction;
+  jit_config.smem_bytes = smem_bytes;
+  jit_config.uccl_include_path = uccl_include_path;
+  return build_v2_efa_combine_forward_metadata_enqueue_d2h_jit_plan(jit_config);
+}
+
 void V2EfaRuntime::launch_dispatch() const { fail_not_ready(); }
 
 void V2EfaRuntime::launch_combine() const { fail_not_ready(); }

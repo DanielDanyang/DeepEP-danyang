@@ -184,6 +184,104 @@ __global__ void v2_efa_combine_descriptor_enqueue_d2h_kernel(
   detail::enqueue_combine_d2h(segments, batches, max_batches, queue, layout);
 }
 
+template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
+          int kNumTopk, int kHidden>
+__global__ void v2_efa_combine_forward_metadata_enqueue_d2h_kernel(
+    const int32_t* token_metadata_at_forward,
+    CombineSegmentDescriptor* segments, CombineExpertBatch* batches,
+    uint32_t* counters, int num_forward_rows, int scaleout_rank,
+    int num_max_tokens_per_rank, int payload_bytes, int max_segments,
+    int max_batches, V2TransferD2HQueueView queue,
+    CombineTransferLayout layout) {
+  // Transitional native V2 combine path: parse the compact forward metadata
+  // carried in the V2 handle and generate V2TransferCmd directly on device.
+  // The final version should parse the official multi-channel V2 metadata and
+  // linked lists, but this already removes the Python descriptor loop.
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  (void)kNumScaleoutRanks;
+  (void)kNumExperts;
+  (void)kHidden;
+
+  constexpr int kMetadataDims = 2 + kNumTopk * 2;
+  int num_segments = 0;
+  int num_batches = 0;
+
+  for (int i = 0; i < max_batches; ++i) {
+    batches[i] = CombineExpertBatch{};
+  }
+
+  for (int row = 0; row < num_forward_rows; ++row) {
+    const auto metadata = token_metadata_at_forward + row * kMetadataDims;
+    const int src_global = metadata[0];
+    if (src_global < 0) {
+      break;
+    }
+    const int dst_original_rank = src_global / num_max_tokens_per_rank;
+    const int dst_scaleout_rank = dst_original_rank / kNumScaleupRanks;
+    const int dst_scaleup_lane = dst_original_rank % kNumScaleupRanks;
+    if (dst_scaleout_rank == scaleout_rank) {
+      continue;
+    }
+
+    const int first_segment = num_segments;
+    if (num_batches >= max_batches) {
+      counters[kDescriptorCounterSegments] = num_segments;
+      counters[kDescriptorCounterBatches] = num_batches;
+      counters[kDescriptorCounterOverflow] = 1;
+      return;
+    }
+    auto& batch = batches[num_batches];
+    batch.dst_original_rank = dst_original_rank;
+    batch.dst_scaleout_rank = dst_scaleout_rank;
+    batch.dst_scaleup_lane = dst_scaleup_lane;
+    batch.src_scaleout_rank = scaleout_rank;
+    batch.expert_id = 0;
+    batch.first_segment = first_segment;
+    batch.num_segments = 0;
+    batch.total_tokens = 0;
+    batch.reserved = 0;
+
+    for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
+      const int source_slot = metadata[2 + kNumTopk + topk_slot];
+      if (source_slot < 0) {
+        continue;
+      }
+      if (num_segments >= max_segments) {
+        counters[kDescriptorCounterSegments] = num_segments;
+        counters[kDescriptorCounterBatches] = num_batches;
+        counters[kDescriptorCounterOverflow] = 1;
+        return;
+      }
+      auto& segment = segments[num_segments++];
+      segment.dst_original_rank = dst_original_rank;
+      segment.dst_scaleout_rank = dst_scaleout_rank;
+      segment.dst_scaleup_lane = dst_scaleup_lane;
+      segment.src_scaleout_rank = scaleout_rank;
+      segment.expert_id = 0;
+      segment.count = 1;
+      segment.expanded_slot_begin = source_slot;
+      segment.expanded_slot_index_offset = -1;
+      segment.topk_slot = topk_slot;
+      segment.reduced_token_slot = src_global % num_max_tokens_per_rank;
+      segment.payload_bytes = payload_bytes;
+      segment.flags = static_cast<uint32_t>(DescriptorFlags::kReduce);
+      batch.num_segments += 1;
+      batch.total_tokens += 1;
+    }
+
+    if (batch.num_segments > 0) {
+      num_batches += 1;
+    }
+  }
+
+  counters[kDescriptorCounterSegments] = num_segments;
+  counters[kDescriptorCounterBatches] = num_batches;
+  counters[kDescriptorCounterOverflow] = 0;
+  detail::enqueue_combine_d2h(segments, batches, num_batches, queue, layout);
+}
+
 template <int kInstance>
 __global__ void v2_efa_combine_enqueue_transfer_kernel(
     const CombineSegmentDescriptor* segments, const CombineExpertBatch* batches,

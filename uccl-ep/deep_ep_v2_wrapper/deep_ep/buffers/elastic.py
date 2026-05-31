@@ -559,6 +559,29 @@ class ElasticBuffer:
             str(uccl_include_path),
         )
 
+    def compile_combine_forward_metadata_enqueue_d2h_jit(
+        self,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels: int = 1,
+        payload_bytes: int = 0,
+        use_expanded_layout: bool = True,
+        allow_multiple_reduction: bool = True,
+        smem_bytes: int = 0,
+        uccl_include_path: str = "",
+    ):
+        tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        return self.runtime.compile_combine_forward_metadata_enqueue_d2h_jit(
+            tokens,
+            int(num_channels),
+            int(payload_bytes),
+            bool(use_expanded_layout),
+            bool(allow_multiple_reduction),
+            int(smem_bytes),
+            str(uccl_include_path),
+        )
+
     @staticmethod
     def allocate_d2h_queue(capacity: int = 2048):
         return ep.V2MappedD2HQueue(int(capacity))
@@ -1045,6 +1068,63 @@ class ElasticBuffer:
             _cuda_stream_ptr(stream),
         )
 
+    def launch_combine_forward_metadata_enqueue_d2h_queue(
+        self,
+        forward_metadata: torch.Tensor,
+        segments: torch.Tensor,
+        batches: torch.Tensor,
+        counters: torch.Tensor,
+        queue,
+        layout: dict,
+        num_forward_rows: Optional[int] = None,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels: int = 1,
+        payload_bytes: int = 0,
+        use_expanded_layout: bool = True,
+        allow_multiple_reduction: bool = True,
+        smem_bytes: int = 0,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        _require_cuda_contiguous(forward_metadata, "forward_metadata")
+        _require_cuda_contiguous(segments, "segments")
+        _require_cuda_contiguous(batches, "batches")
+        _require_cuda_contiguous(counters, "counters")
+        if forward_metadata.dtype != torch.int32:
+            raise TypeError("forward_metadata must be torch.int32")
+        rows = int(forward_metadata.shape[0] if num_forward_rows is None else num_forward_rows)
+        max_tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if payload_bytes == 0:
+            payload_bytes = self.hidden * self.elem_bytes
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_combine_forward_metadata_enqueue_d2h(
+            int(forward_metadata.data_ptr()),
+            int(segments.data_ptr()),
+            int(batches.data_ptr()),
+            int(counters.data_ptr()),
+            rows,
+            max_tokens,
+            int(num_channels),
+            int(payload_bytes),
+            bool(use_expanded_layout),
+            bool(allow_multiple_reduction),
+            int(smem_bytes),
+            int(queue.commands_ptr()),
+            int(queue.head_ptr()),
+            int(queue.tail_ptr()),
+            int(queue.capacity()),
+            int(layout.get("local_payload_base", 0)),
+            int(layout.get("remote_payload_base", 0)),
+            int(layout.get("remote_signal_base", 0)),
+            int(layout["expanded_slot_stride"]),
+            int(layout["reduced_token_stride"]),
+            int(layout["batch_payload_stride"]),
+            int(layout.get("signal_stride", 4)),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
     def get_comm_stream(self) -> torch.Stream:
         return torch.cuda.current_stream()
 
@@ -1386,29 +1466,51 @@ class ElasticBuffer:
         transport = handle.transport_handle
         if transport is None or self._v2_efa_connection is None:
             return
-        segments, batches, counters = self._build_combine_descriptors_from_forward_metadata(
-            x, handle
-        )
-        num_segments = int(counters[0].item())
-        num_batches = int(counters[1].item())
-        queue = self.allocate_d2h_queue(_next_power_of_two(num_segments + num_batches + 1))
+        sizes = ep.v2_descriptor_sizes()
+        forward_metadata = handle.token_metadata_at_forward
+        if forward_metadata is None:
+            forward_metadata = self._build_forward_metadata_tensors(
+                torch.full(
+                    (handle.recv_src_metadata.shape[0], handle.topk_idx.shape[1]),
+                    -1,
+                    dtype=handle.topk_idx.dtype,
+                    device=handle.topk_idx.device,
+                ),
+                handle.recv_src_metadata,
+                handle.do_expand,
+                handle.num_experts,
+            )[0]
+        max_segments = max(1, int(forward_metadata.shape[0] * handle.topk_idx.shape[1]))
+        max_batches = max(1, max_segments)
+        segments = torch.empty((max_segments * int(sizes["combine_segment"]),),
+                               dtype=torch.uint8, device=x.device)
+        batches = torch.empty((max_batches * int(sizes["combine_batch"]),),
+                              dtype=torch.uint8, device=x.device)
+        counters = torch.zeros((3,), dtype=torch.int32, device=x.device)
+        queue = self.allocate_d2h_queue(_next_power_of_two(max_segments + max_batches + 1))
         payload_bytes = int(x.shape[1] * x.element_size())
-        max_layout_batches = max(1, num_batches)
         layout = self._make_combine_window_layout(
             num_source_tokens=int(x.shape[0]),
             num_max_tokens_per_rank=handle.num_max_tokens_per_rank,
             payload_bytes=payload_bytes,
-            max_batches=max_layout_batches,
+            max_batches=max_batches,
         )
         self._stage_tensor_bytes_to_v2_window(x, int(layout["local_payload_base"]))
-        self.launch_combine_enqueue_d2h_queue(
+        self.launch_combine_forward_metadata_enqueue_d2h_queue(
+            forward_metadata=forward_metadata,
             segments=segments,
             batches=batches,
-            num_batches=num_batches,
+            counters=counters,
             queue=queue,
             layout=layout,
+            num_forward_rows=int(forward_metadata.shape[0]),
+            num_max_tokens_per_rank=handle.num_max_tokens_per_rank,
+            payload_bytes=payload_bytes,
+            use_expanded_layout=handle.do_expand,
         )
         torch.cuda.current_stream().synchronize()
+        num_segments = int(counters[0].item())
+        num_batches = int(counters[1].item())
         combine_drain_stats = self._v2_efa_connection.drain_queue(queue, True, True)
         transport.combine_segments = segments
         transport.combine_batches = batches

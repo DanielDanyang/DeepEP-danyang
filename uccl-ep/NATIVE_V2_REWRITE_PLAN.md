@@ -525,9 +525,12 @@ device enqueue EFA proxy descriptors
 - 支持 reduced-combine，receiver 直接写回 owner rank 的 reduced layout。
 - reduce epilogue 保持 V2 语义。
 - 当前已完成一个最小 native combine payload RDMA 验证：
-  - Python bridge 从 `recv_src_metadata` / expanded slot metadata 生成
-    `CombineSegmentDescriptor` / `CombineExpertBatch`，不再从本 rank 的 outgoing
-    dispatch descriptor 反推 combine 目标；
+  - `v2_efa_combine_forward_metadata_enqueue_d2h_kernel` 已在 CUDA/JIT 端解析
+    compact `token_metadata_at_forward`，生成 `CombineSegmentDescriptor` /
+    `CombineExpertBatch` 并直接 enqueue `V2TransferCmd`，不再由 Python loop 构造
+    combine descriptors；
+  - combine 目标不再从本 rank 的 outgoing dispatch descriptor 反推，而来自 forward
+    metadata 中的 source global token id / expanded slot；
   - dispatch handle 现在填充 compact transitional `token_metadata_at_forward` 和
     `channel_linked_list`，combine descriptor builder 优先消费
     `token_metadata_at_forward`；这让语义来源更接近官方 V2 handle/cache，而不是直接
@@ -542,7 +545,7 @@ device enqueue EFA proxy descriptors
 - 仍缺真正 native V2 combine：
   - `token_metadata_at_forward` / `channel_linked_list` 仍是 compact transitional
     tensor，不是官方多 channel `[channel, token, metadata_dim]` 完整格式；
-  - descriptor 仍由 Python bridge 构造，还没有下沉到 CUDA/JIT 解析完整
+  - descriptor 构造已下沉到 CUDA/JIT，但还没有解析完整官方
     `token_metadata_at_forward` / `channel_linked_list`；
   - 多 topk / 多 remote contributor 的 reduce 仍由 semantic fallback 兜底，RDMA overlay
     只覆盖单 remote contributor 情况；

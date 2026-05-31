@@ -75,6 +75,14 @@ void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
     int max_segments, int max_batches, std::uintptr_t commands_ptr,
     std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
     CombineTransferLayout layout, std::uintptr_t cuda_stream_ptr = 0);
+void launch_v2_efa_combine_forward_metadata_enqueue_d2h_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t forward_metadata_ptr,
+    std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+    std::uintptr_t counters_ptr, int num_forward_rows, int scaleout_rank,
+    int num_max_tokens_per_rank, int payload_bytes, int max_segments,
+    int max_batches, std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+    std::uintptr_t tail_ptr, int queue_capacity, CombineTransferLayout layout,
+    std::uintptr_t cuda_stream_ptr = 0);
 
 class V2EfaRuntime {
  public:
@@ -118,6 +126,11 @@ class V2EfaRuntime {
       bool deterministic, bool do_cpu_sync, int smem_bytes,
       const std::string& uccl_include_path = "") const;
   V2EfaJitLaunchPlan build_combine_descriptor_enqueue_d2h_jit_plan(
+      int num_max_tokens_per_rank, int num_channels, int payload_bytes,
+      bool use_expanded_layout, bool allow_multiple_reduction, int smem_bytes,
+      const std::string& uccl_include_path = "") const;
+  V2EfaJitLaunchPlan
+  build_combine_forward_metadata_enqueue_d2h_jit_plan(
       int num_max_tokens_per_rank, int num_channels, int payload_bytes,
       bool use_expanded_layout, bool allow_multiple_reduction, int smem_bytes,
       const std::string& uccl_include_path = "") const;
@@ -176,6 +189,16 @@ class V2EfaRuntime {
       std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
       std::uintptr_t counters_ptr, int num_max_tokens_per_rank,
       int num_channels, int payload_bytes, bool use_expanded_layout,
+      bool allow_multiple_reduction, int smem_bytes,
+      std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+      std::uintptr_t tail_ptr, int queue_capacity, CombineTransferLayout layout,
+      const std::string& uccl_include_path = "",
+      std::uintptr_t cuda_stream_ptr = 0) const;
+  void launch_combine_forward_metadata_enqueue_d2h(
+      std::uintptr_t forward_metadata_ptr, std::uintptr_t segments_ptr,
+      std::uintptr_t batches_ptr, std::uintptr_t counters_ptr,
+      int num_forward_rows, int num_max_tokens_per_rank, int num_channels,
+      int payload_bytes, bool use_expanded_layout,
       bool allow_multiple_reduction, int smem_bytes,
       std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
       std::uintptr_t tail_ptr, int queue_capacity, CombineTransferLayout layout,
