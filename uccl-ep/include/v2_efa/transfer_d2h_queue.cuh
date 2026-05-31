@@ -182,7 +182,8 @@ __device__ __forceinline__ bool enqueue_v2_transfer_d2h(
     const auto saved_kind = command.kind;
     command.kind = 0;
     queue.commands[idx] = command;
-    __atomic_store_n(&queue.commands[idx].kind, saved_kind, __ATOMIC_RELEASE);
+    __threadfence_system();
+    *reinterpret_cast<volatile uint8_t*>(&queue.commands[idx].kind) = saved_kind;
     if (out_slot != nullptr) {
       *out_slot = h;
     }

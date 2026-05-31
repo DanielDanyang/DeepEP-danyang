@@ -1625,3 +1625,52 @@ README 风格 EP8x2 性能：
     - rank0/rank1 dispatch payload RDMA 均通过；
     - 两边 dispatch stats 仍为 `drained_commands=2`、`posted_writes=1`、
       `posted_signals=1`、`posted_bytes=20`。
+
+## 2026-05-31 direct V2 dispatch enqueue 接入
+
+- 继续把 dispatch 发送路径从 serial descriptor scaffold 往真实 V2 JIT 主路径收敛：
+  - 新增 `v2_efa_dispatch_direct_enqueue_d2h_kernel`，按 `num_tokens * topk`
+    并行切分，每个 remote topk 直接生成 payload + signal 两条 16B `V2TransferCmd`。
+  - 新增 runtime/JIT/binding/Python wrapper：
+    - `build/compile_dispatch_direct_enqueue_d2h_jit_plan`
+    - `launch_dispatch_direct_enqueue_d2h`
+    - `ElasticBuffer.launch_dispatch_direct_enqueue_d2h_queue`
+  - `ElasticBuffer._launch_native_dispatch_transport` 在已有 `V2EfaConnection` 时：
+    1. 先运行 descriptor kernel，只生成 handle metadata/counters；
+    2. 再运行 direct enqueue kernel，真实写 D2H queue；
+    3. drain queue 到 EFA verbs sink。
+  - 无 EFA connection 的 reference path 保持 fused descriptor enqueue，方便本地对拍。
+- 修复两个验证中暴露的问题：
+  - device D2H publish 不能调用 host-only `__atomic_store_n`；改为
+    `__threadfence_system()` 后 volatile store `kind` byte，保持 GPU 写 command 后再让
+    host poll 可见。
+  - `ElasticBuffer` topology 推断改为优先读 `LOCAL_WORLD_SIZE` / `LOCAL_SIZE`。EP1x2
+    smoke 每台只起 1 个进程，不能用物理 8 GPU 推断 scaleup=2；否则 direct kernel 会把
+    peer 误判成本地 scaleout traffic 并跳过。
+- 本地验证：
+  - `python -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py
+    uccl-ep/tests/v2_efa_connection_smoke.py` 通过。
+  - `python uccl-ep/tests/v2_efa_source_hygiene_test.py` 通过。
+  - `c++ -std=c++17 -Iuccl-ep/include uccl-ep/tests/v2_efa_dispatch_plan_test.cc
+    uccl-ep/src/v2_efa_runtime.cc -o /tmp/v2_efa_dispatch_plan_test &&
+    /tmp/v2_efa_dispatch_plan_test` 通过。
+  - `git diff --check -- uccl-ep worklog.md` 通过。
+- 服务器验证：
+  - `p5en_0` / `p5en_1` 同步代码后，`make -j8 install` 均通过。
+  - 首次 smoke 失败于 `deep_ep` wrapper 未安装；执行
+    `pip install -e uccl-ep/deep_ep_v2_wrapper` 后重新 `make install` 覆盖本地
+    `uccl.ep` extension。
+  - 第二次 smoke 失败于 device JIT 编译 `__atomic_store_n`，已按上面修复。
+  - 第三次 smoke 队列为空，定位为 EP1x2 topology 推断错误，已按上面修复并使用
+    `LOCAL_WORLD_SIZE=1` 验证。
+  - 最终双机 EP1x2 `uccl-ep/tests/v2_efa_connection_smoke.py` 通过：
+    - rank0: `dispatch_rdma_recv_ok=True stats={'drained_commands': 2,
+      'posted_writes': 1, 'posted_signals': 1, 'posted_bytes': 20, 'head': 2,
+      'tail': 2}`
+    - rank1: `dispatch_rdma_recv_ok=True stats={'drained_commands': 2,
+      'posted_writes': 1, 'posted_signals': 1, 'posted_bytes': 20, 'head': 2,
+      'tail': 2}`
+- 仍未完成：
+  - direct kernel 还不是 official `hybrid_dispatch.cuh` fork；expanded slot assignment、
+    per-expert batching、metadata 写入和 cached dispatch 仍需下沉到真实 V2 JIT。
+  - public dispatch 输出仍由 semantic fallback 产生，不是直接消费 RDMA-expanded layout。

@@ -214,6 +214,66 @@ __global__ void v2_efa_dispatch_descriptor_enqueue_d2h_kernel(
   detail::enqueue_dispatch_d2h(segments, batches, max_batches, queue, layout);
 }
 
+template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
+          int kNumTopk, int kHiddenBytes>
+__global__ void v2_efa_dispatch_direct_enqueue_d2h_kernel(
+    const int64_t* topk_idx, int num_tokens, int scaleout_rank,
+    V2TransferD2HQueueView queue, DispatchTransferLayout layout) {
+  constexpr int kWorldSize = kNumScaleoutRanks * kNumScaleupRanks;
+  static_assert(kWorldSize > 0, "invalid V2 EFA topology");
+  static_assert(kNumExperts % kWorldSize == 0,
+                "num experts must be divisible by world size");
+  constexpr int kExpertsPerRank = kNumExperts / kWorldSize;
+  const int linear_count = num_tokens * kNumTopk;
+  const int global_thread = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const int global_stride = static_cast<int>(gridDim.x * blockDim.x);
+
+  for (int linear = global_thread; linear < linear_count; linear += global_stride) {
+    const int token = linear / kNumTopk;
+    const int topk_slot = linear - token * kNumTopk;
+    const int expert = static_cast<int>(__ldg(topk_idx + linear));
+    if (expert < 0 || expert >= kNumExperts) {
+      continue;
+    }
+
+    const int owner_rank = expert / kExpertsPerRank;
+    const int dst_scaleout_rank = owner_rank / kNumScaleupRanks;
+    const int dst_scaleup_lane = owner_rank % kNumScaleupRanks;
+    if (dst_scaleout_rank == scaleout_rank) {
+      continue;
+    }
+
+    const auto local_offset =
+        layout.local_payload_base +
+        static_cast<uint64_t>(token) * layout.src_token_stride;
+    const auto remote_offset =
+        layout.remote_payload_base +
+        static_cast<uint64_t>(token) * layout.expanded_slot_stride;
+    enqueue_v2_transfer_d2h(
+        queue, make_v2_transfer_cmd(
+                   V2TransferCmdKind::kDispatchPayload,
+                   static_cast<uint32_t>(dst_scaleout_rank),
+                   static_cast<uint32_t>(dst_scaleup_lane),
+                   static_cast<uint32_t>(linear),
+                   static_cast<uint32_t>(linear),
+                   static_cast<uint32_t>(kHiddenBytes),
+                   /*signal_value=*/0, local_offset, remote_offset));
+    enqueue_v2_transfer_d2h(
+        queue, make_v2_transfer_cmd(
+                   V2TransferCmdKind::kDispatchSignal,
+                   static_cast<uint32_t>(dst_scaleout_rank),
+                   static_cast<uint32_t>(dst_scaleup_lane),
+                   static_cast<uint32_t>(linear),
+                   static_cast<uint32_t>(linear),
+                   sizeof(uint32_t),
+                   /*signal_value=*/1,
+                   /*local_offset=*/0,
+                   layout.remote_signal_base +
+                       static_cast<uint64_t>(linear) * layout.signal_stride));
+    (void)topk_slot;
+  }
+}
+
 template <int kInstance>
 __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
     const DispatchSegmentDescriptor* segments,

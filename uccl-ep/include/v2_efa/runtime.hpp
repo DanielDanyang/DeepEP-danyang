@@ -62,6 +62,11 @@ void launch_v2_efa_dispatch_descriptor_enqueue_d2h_plan(
     int max_batches, std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
     std::uintptr_t tail_ptr, int queue_capacity, DispatchTransferLayout layout,
     std::uintptr_t cuda_stream_ptr = 0);
+void launch_v2_efa_dispatch_direct_enqueue_d2h_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t topk_idx_ptr,
+    int num_tokens, int scaleout_rank, std::uintptr_t commands_ptr,
+    std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
+    DispatchTransferLayout layout, std::uintptr_t cuda_stream_ptr = 0);
 void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t dispatch_segments_ptr,
     std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
@@ -107,6 +112,11 @@ class V2EfaRuntime {
       int scale_bytes, bool has_topk_weight, bool cached_mode,
       bool deterministic, bool do_cpu_sync, int smem_bytes,
       const std::string& uccl_include_path = "") const;
+  V2EfaJitLaunchPlan build_dispatch_direct_enqueue_d2h_jit_plan(
+      int num_max_tokens_per_rank, int num_channels_per_sm,
+      int scale_bytes, bool has_topk_weight, bool cached_mode,
+      bool deterministic, bool do_cpu_sync, int smem_bytes,
+      const std::string& uccl_include_path = "") const;
   V2EfaJitLaunchPlan build_combine_descriptor_enqueue_d2h_jit_plan(
       int num_max_tokens_per_rank, int num_channels, int payload_bytes,
       bool use_expanded_layout, bool allow_multiple_reduction, int smem_bytes,
@@ -144,6 +154,15 @@ class V2EfaRuntime {
   void launch_dispatch_descriptor_enqueue_d2h(
       std::uintptr_t topk_idx_ptr, std::uintptr_t segments_ptr,
       std::uintptr_t batches_ptr, std::uintptr_t counters_ptr, int num_tokens,
+      int num_max_tokens_per_rank, int num_channels_per_sm, int scale_bytes,
+      bool has_topk_weight, bool cached_mode, bool deterministic,
+      bool do_cpu_sync, int smem_bytes, std::uintptr_t commands_ptr,
+      std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
+      DispatchTransferLayout layout,
+      const std::string& uccl_include_path = "",
+      std::uintptr_t cuda_stream_ptr = 0) const;
+  void launch_dispatch_direct_enqueue_d2h(
+      std::uintptr_t topk_idx_ptr, int num_tokens,
       int num_max_tokens_per_rank, int num_channels_per_sm, int scale_bytes,
       bool has_topk_weight, bool cached_mode, bool deterministic,
       bool do_cpu_sync, int smem_bytes, std::uintptr_t commands_ptr,

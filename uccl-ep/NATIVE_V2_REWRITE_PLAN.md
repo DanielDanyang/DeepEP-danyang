@@ -464,6 +464,23 @@ device enqueue EFA proxy descriptors
 - JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。旧
   `ProxyCommand` enqueue/reference 路径已删除，host transfer queue 和 EFA adapter
   都直接消费 `V2TransferCmd`。
+- 已新增 parallel-ish direct dispatch enqueue JIT scaffold：
+  `v2_efa_dispatch_direct_enqueue_d2h_kernel` 按 `num_tokens * topk` 在线程间切分，
+  直接由 V2 `topk_idx` / expert owner 计算 `(target_rank, target_lane,
+  local_offset, remote_offset)` 并写入 16B `V2TransferCmd`。这比旧 serial
+  descriptor enqueue 更接近真实 V2 JIT 主路径，但仍只是过渡层：它还没有复用
+  `hybrid_dispatch.cuh` 的 expanded slot 分配、per-expert batching、metadata
+  写入和 cached handle 语义。
+- Python `ElasticBuffer` 在已初始化 `V2EfaConnection` 时，dispatch 现在拆成两步：
+  先运行 descriptor kernel 生成 V2 handle metadata/counters，再运行 direct enqueue
+  kernel 生成真实 D2H/EFA command。无 EFA connection 的 reference path 仍使用 fused
+  descriptor enqueue，方便本地对拍。
+- `ElasticBuffer` 的 scaleup/scaleout topology 推断已改为优先使用
+  `LOCAL_WORLD_SIZE` / `LOCAL_SIZE`，再回退到 `torch.cuda.device_count()`。理由是
+  V2 scaleup rank 表示当前 distributed job 的本节点 rank 数，而不是机器物理 GPU 数；
+  EP1x2 smoke 每台只起 1 个进程，如果用物理 8 GPU 推断会把两台机器误判成同一个
+  scaleout rank，direct kernel 会错误跳过跨机 EFA traffic。真实 EP8x2 下 torchrun
+  应提供 `LOCAL_WORLD_SIZE=8`，语义和 V2 rank layout 对齐。
 - 已新增 contiguous transfer layout helper，用 descriptor 中的 expanded/reduced slot
   span 自动计算 per-batch payload stride 和 signal base。combine 路径按
   `reduced_token_slot + count` 计算跨度，避免把 V2 reduced layout 误当作 batch-local
@@ -478,6 +495,17 @@ device enqueue EFA proxy descriptors
 - 在 V2 dispatch JIT kernel 中生成 dispatch descriptor。
 - sender 按 expert/lane semantic batch pack payload。
 - receiver 直接写入 V2 expanded layout 和必要 metadata。
+- 当前已完成一个最小 direct payload RDMA 验证：
+  - device kernel 直接 enqueue `V2TransferCmd` 到 D2H queue；
+  - CPU/EFA sink drain 后将 payload 写入 peer 的 V2 RDMA window；
+  - EP1x2 smoke 通过，每 rank 产生 `drained_commands=2`、
+    `posted_writes=1`、`posted_signals=1`、`posted_bytes=20`。
+- 仍缺真正 native V2 dispatch：
+  - direct kernel 的 remote slot 仍是 `token * expanded_slot_stride`，尚未使用
+    official V2 expanded slot assignment；
+  - 还没有把 payload scatter 合并进官方 V2 epilogue；
+  - receiver window 检查通过，但 public dispatch 返回值仍由 semantic fallback 生成，
+    还不是直接消费 RDMA-expanded layout。
 
 交付标准：EP8x2 dispatch correctness 通过，且不经过 V1 staging buffer。
 

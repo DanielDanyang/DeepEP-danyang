@@ -1141,6 +1141,48 @@ NB_MODULE(ep, m) {
            nb::arg("do_cpu_sync") = false,
            nb::arg("smem_bytes") = 228 * 1024,
            nb::arg("uccl_include_path") = "")
+      .def("build_dispatch_direct_enqueue_d2h_jit_plan",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
+              bool cached_mode, bool deterministic, bool do_cpu_sync,
+              int smem_bytes, const std::string& uccl_include_path) {
+             return jit_launch_plan_to_dict(
+                 self.build_dispatch_direct_enqueue_d2h_jit_plan(
+                     num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
+                     has_topk_weight, cached_mode, deterministic, do_cpu_sync,
+                     smem_bytes, uccl_include_path));
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm") = 1,
+           nb::arg("scale_bytes") = 0,
+           nb::arg("has_topk_weight") = true,
+           nb::arg("cached_mode") = false,
+           nb::arg("deterministic") = false,
+           nb::arg("do_cpu_sync") = false,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("uccl_include_path") = "")
+      .def("compile_dispatch_direct_enqueue_d2h_jit",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
+              bool cached_mode, bool deterministic, bool do_cpu_sync,
+              int smem_bytes, const std::string& uccl_include_path) {
+             const auto plan =
+                 self.build_dispatch_direct_enqueue_d2h_jit_plan(
+                     num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
+                     has_topk_weight, cached_mode, deterministic, do_cpu_sync,
+                     smem_bytes, uccl_include_path);
+             v2::compile_v2_efa_jit_plan(plan);
+             return jit_launch_plan_to_dict(plan);
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm") = 1,
+           nb::arg("scale_bytes") = 0,
+           nb::arg("has_topk_weight") = true,
+           nb::arg("cached_mode") = false,
+           nb::arg("deterministic") = false,
+           nb::arg("do_cpu_sync") = false,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("uccl_include_path") = "")
       .def("build_combine_enqueue_d2h_jit_plan",
            [](const v2::V2EfaRuntime& self,
               const std::string& uccl_include_path) {
@@ -1285,6 +1327,59 @@ NB_MODULE(ep, m) {
            nb::arg("segments_ptr"),
            nb::arg("batches_ptr"),
            nb::arg("counters_ptr"),
+           nb::arg("num_tokens"),
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm") = 1,
+           nb::arg("scale_bytes") = 0,
+           nb::arg("has_topk_weight") = true,
+           nb::arg("cached_mode") = false,
+           nb::arg("deterministic") = false,
+           nb::arg("do_cpu_sync") = false,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("commands_ptr"),
+           nb::arg("head_ptr"),
+           nb::arg("tail_ptr"),
+           nb::arg("queue_capacity"),
+           nb::arg("local_payload_base"),
+           nb::arg("remote_payload_base"),
+           nb::arg("remote_signal_base"),
+           nb::arg("src_token_stride"),
+           nb::arg("expanded_slot_stride"),
+           nb::arg("batch_payload_stride"),
+           nb::arg("signal_stride") = sizeof(std::uint32_t),
+           nb::arg("uccl_include_path") = "",
+           nb::arg("cuda_stream_ptr") = 0)
+      .def("launch_dispatch_direct_enqueue_d2h",
+           [](const v2::V2EfaRuntime& self, std::uintptr_t topk_idx_ptr,
+              int num_tokens, int num_max_tokens_per_rank,
+              int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
+              bool cached_mode, bool deterministic, bool do_cpu_sync,
+              int smem_bytes, std::uintptr_t commands_ptr,
+              std::uintptr_t head_ptr, std::uintptr_t tail_ptr,
+              int queue_capacity, std::uint64_t local_payload_base,
+              std::uint64_t remote_payload_base,
+              std::uint64_t remote_signal_base, std::uint32_t src_token_stride,
+              std::uint32_t expanded_slot_stride,
+              std::uint32_t batch_payload_stride,
+              std::uint32_t signal_stride,
+              const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             v2::DispatchTransferLayout layout;
+             layout.local_payload_base = local_payload_base;
+             layout.remote_payload_base = remote_payload_base;
+             layout.remote_signal_base = remote_signal_base;
+             layout.src_token_stride = src_token_stride;
+             layout.expanded_slot_stride = expanded_slot_stride;
+             layout.batch_payload_stride = batch_payload_stride;
+             layout.signal_stride = signal_stride;
+             self.launch_dispatch_direct_enqueue_d2h(
+                 topk_idx_ptr, num_tokens, num_max_tokens_per_rank,
+                 num_channels_per_sm, scale_bytes, has_topk_weight,
+                 cached_mode, deterministic, do_cpu_sync, smem_bytes,
+                 commands_ptr, head_ptr, tail_ptr, queue_capacity, layout,
+                 uccl_include_path, cuda_stream_ptr);
+           },
+           nb::arg("topk_idx_ptr"),
            nb::arg("num_tokens"),
            nb::arg("num_max_tokens_per_rank"),
            nb::arg("num_channels_per_sm") = 1,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -102,7 +103,12 @@ class ElasticBuffer:
         self.explicitly_destroy = explicitly_destroy
         self._destroyed = False
 
-        local_world = int(torch.cuda.device_count() or 1)
+        local_world = int(
+            os.environ.get("LOCAL_WORLD_SIZE")
+            or os.environ.get("LOCAL_SIZE")
+            or torch.cuda.device_count()
+            or 1
+        )
         self.num_scaleup_ranks = min(max(1, local_world), self.num_ranks)
         self.num_scaleout_ranks = max(1, self.num_ranks // self.num_scaleup_ranks)
         self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
@@ -495,6 +501,33 @@ class ElasticBuffer:
             str(uccl_include_path),
         )
 
+    def compile_dispatch_direct_enqueue_d2h_jit(
+        self,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels_per_sm: int = 1,
+        scale_bytes: int = 0,
+        has_topk_weight: bool = True,
+        cached_mode: bool = False,
+        deterministic: bool = False,
+        do_cpu_sync: bool = False,
+        smem_bytes: int = 0,
+        uccl_include_path: str = "",
+    ):
+        tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        return self.runtime.compile_dispatch_direct_enqueue_d2h_jit(
+            tokens,
+            int(num_channels_per_sm),
+            int(scale_bytes),
+            bool(has_topk_weight),
+            bool(cached_mode),
+            bool(deterministic),
+            bool(do_cpu_sync),
+            int(smem_bytes),
+            str(uccl_include_path),
+        )
+
     def build_combine_enqueue_d2h_jit_plan(self, uccl_include_path: str = ""):
         return self.runtime.build_combine_enqueue_d2h_jit_plan(str(uccl_include_path))
 
@@ -807,6 +840,56 @@ class ElasticBuffer:
             int(segments.data_ptr()),
             int(batches.data_ptr()),
             int(counters.data_ptr()),
+            tokens,
+            max_tokens,
+            int(num_channels_per_sm),
+            int(scale_bytes),
+            bool(has_topk_weight),
+            bool(cached_mode),
+            bool(deterministic),
+            bool(do_cpu_sync),
+            int(smem_bytes),
+            int(queue.commands_ptr()),
+            int(queue.head_ptr()),
+            int(queue.tail_ptr()),
+            int(queue.capacity()),
+            int(layout.get("local_payload_base", 0)),
+            int(layout.get("remote_payload_base", 0)),
+            int(layout.get("remote_signal_base", 0)),
+            int(layout["src_token_stride"]),
+            int(layout["expanded_slot_stride"]),
+            int(layout["batch_payload_stride"]),
+            int(layout.get("signal_stride", 4)),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
+    def launch_dispatch_direct_enqueue_d2h_queue(
+        self,
+        topk_idx: torch.Tensor,
+        queue,
+        layout: dict,
+        num_tokens: Optional[int] = None,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels_per_sm: int = 1,
+        scale_bytes: int = 0,
+        has_topk_weight: bool = True,
+        cached_mode: bool = False,
+        deterministic: bool = False,
+        do_cpu_sync: bool = False,
+        smem_bytes: int = 0,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        _require_cuda_contiguous(topk_idx, "topk_idx")
+        if topk_idx.dtype != torch.int64:
+            raise TypeError("topk_idx must be torch.int64")
+        tokens = int(topk_idx.shape[0] if num_tokens is None else num_tokens)
+        max_tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_dispatch_direct_enqueue_d2h(
+            int(topk_idx.data_ptr()),
             tokens,
             max_tokens,
             int(num_channels_per_sm),
@@ -1154,7 +1237,13 @@ class ElasticBuffer:
         batches = torch.empty((max_batches * int(sizes["dispatch_batch"]),),
                               dtype=torch.uint8, device=topk_idx.device)
         counters = torch.zeros((3,), dtype=torch.int32, device=topk_idx.device)
-        queue_capacity = _next_power_of_two(max_segments + max_batches + 1)
+        descriptor_queue_capacity = max_segments + max_batches + 1
+        direct_queue_capacity = int(num_tokens * self.num_topk * 2 + 1)
+        queue_capacity = _next_power_of_two(
+            direct_queue_capacity
+            if self._v2_efa_connection is not None
+            else descriptor_queue_capacity
+        )
         queue = self.allocate_d2h_queue(queue_capacity)
         if self._v2_efa_connection is not None:
             layout = self._make_dispatch_window_layout(
@@ -1174,20 +1263,45 @@ class ElasticBuffer:
                 "batch_payload_stride": _align(num_max_tokens_per_rank * payload_bytes, 64),
                 "signal_stride": 4,
             }
-        self.launch_dispatch_descriptor_enqueue_d2h_queue(
-            topk_idx=topk_idx.reshape(-1),
-            segments=segments,
-            batches=batches,
-            counters=counters,
-            queue=queue,
-            layout=layout,
-            num_tokens=num_tokens,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            scale_bytes=scale_bytes,
-            has_topk_weight=has_topk_weight,
-            do_cpu_sync=do_cpu_sync,
-            smem_bytes=0,
-        )
+        flat_topk_idx = topk_idx.reshape(-1)
+        if self._v2_efa_connection is not None:
+            self.launch_dispatch_descriptors(
+                topk_idx=flat_topk_idx,
+                segments=segments,
+                batches=batches,
+                counters=counters,
+                num_tokens=num_tokens,
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
+                scale_bytes=scale_bytes,
+                has_topk_weight=has_topk_weight,
+                do_cpu_sync=do_cpu_sync,
+            )
+            self.launch_dispatch_direct_enqueue_d2h_queue(
+                topk_idx=flat_topk_idx,
+                queue=queue,
+                layout=layout,
+                num_tokens=num_tokens,
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
+                scale_bytes=scale_bytes,
+                has_topk_weight=has_topk_weight,
+                do_cpu_sync=do_cpu_sync,
+                smem_bytes=0,
+            )
+        else:
+            self.launch_dispatch_descriptor_enqueue_d2h_queue(
+                topk_idx=flat_topk_idx,
+                segments=segments,
+                batches=batches,
+                counters=counters,
+                queue=queue,
+                layout=layout,
+                num_tokens=num_tokens,
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
+                scale_bytes=scale_bytes,
+                has_topk_weight=has_topk_weight,
+                do_cpu_sync=do_cpu_sync,
+                smem_bytes=0,
+            )
         torch.cuda.current_stream().synchronize()
         num_segments = int(counters[0].item())
         num_batches = int(counters[1].item())
