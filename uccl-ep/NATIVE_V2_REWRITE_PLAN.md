@@ -581,7 +581,8 @@ device enqueue EFA proxy descriptors
     V2-like 多 channel 形状：
     `token_metadata_at_forward = [channels, scaleout_ranks * tokens_per_channel + 1,
     2 + 2 * topk]`，
-    `channel_linked_list = [channels, tokens_per_channel + 1, scaleup_ranks]`；
+    `channel_linked_list = [channels, scaleout_ranks * tokens_per_channel + 1,
+    scaleup_ranks]`；
     但 channel 分配和 linked-list 语义仍是 transitional scaffold，还没有完全匹配官方
     `hybrid_dispatch.cuh` 的 per-channel scheduling。
   - descriptor 构造已下沉到 CUDA/JIT，但还没有解析完整官方

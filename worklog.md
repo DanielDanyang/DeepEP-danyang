@@ -1820,7 +1820,12 @@ README 风格 EP8x2 性能：
 - 将 transitional forward metadata 从 compact 2D 进一步改成 V2-like 多 channel 形状：
   - `token_metadata_at_forward = [channels, scaleout_ranks * tokens_per_channel + 1,
     2 + 2 * topk]`；
-  - `channel_linked_list = [channels, tokens_per_channel + 1, scaleup_ranks]`；
+  - `channel_linked_list = [channels, scaleout_ranks * tokens_per_channel + 1,
+    scaleup_ranks]`；
+  - `channel_linked_list` 现在按官方 V2 语义存 token index，未使用位置保持 `-1`
+    sentinel，不再存 transitional next-index；
+  - combine queue 容量按 flatten 后的 forward metadata row 数计算，避免多 channel
+    metadata 下只按 channel 数分配 descriptor/command 空间；
   - combine JIT / Python fallback 扫描 flatten metadata 时遇到 channel sentinel 继续扫描
     后续 channel，而不是提前终止。
 - 服务器状态：

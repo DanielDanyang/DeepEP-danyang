@@ -1480,7 +1480,8 @@ class ElasticBuffer:
                 handle.do_expand,
                 handle.num_experts,
             )[0]
-        max_segments = max(1, int(forward_metadata.shape[0] * handle.topk_idx.shape[1]))
+        num_forward_rows = int(forward_metadata.numel() // forward_metadata.shape[-1])
+        max_segments = max(1, int(num_forward_rows * handle.topk_idx.shape[1]))
         max_batches = max(1, max_segments)
         segments = torch.empty((max_segments * int(sizes["combine_segment"]),),
                                dtype=torch.uint8, device=x.device)
@@ -1503,7 +1504,7 @@ class ElasticBuffer:
             counters=counters,
             queue=queue,
             layout=layout,
-            num_forward_rows=int(forward_metadata.numel() // forward_metadata.shape[-1]),
+            num_forward_rows=num_forward_rows,
             num_max_tokens_per_rank=handle.num_max_tokens_per_rank,
             payload_bytes=payload_bytes,
             use_expanded_layout=handle.do_expand,
@@ -1629,8 +1630,9 @@ class ElasticBuffer:
             dtype=torch.int32,
             device=recv_src_metadata.device,
         )
-        channel_linked_list = torch.zeros(
-            (num_channels, tokens_per_channel + 1, max(1, self.num_scaleup_ranks)),
+        channel_linked_list = torch.full(
+            (num_channels, rows_per_channel, max(1, self.num_scaleup_ranks)),
+            -1,
             dtype=torch.int32,
             device=recv_src_metadata.device,
         )
@@ -1655,11 +1657,7 @@ class ElasticBuffer:
                     dst[2 + num_topk + topk_slot] = recv_src_metadata[row, 2 + topk_slot]
                 else:
                     dst[2 + num_topk + topk_slot] = row
-            channel_linked_list[channel_idx, channel_row, self.scaleup_rank_idx] = channel_row + 1
-        for channel_idx in range(num_channels):
-            channel_count = (num_recv + num_channels - 1 - channel_idx) // num_channels
-            channel_count = max(0, min(channel_count, tokens_per_channel))
-            channel_linked_list[channel_idx, channel_count, self.scaleup_rank_idx] = channel_count
+            channel_linked_list[channel_idx, channel_row, self.scaleup_rank_idx] = row
         return metadata, channel_linked_list
 
     def _make_combine_window_layout(
