@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -207,7 +208,12 @@ class CoalescingEfaPostSink final : public EfaPostSink {
     }
   }
 
-  ~CoalescingEfaPostSink() override { flush(); }
+  ~CoalescingEfaPostSink() noexcept override {
+    try {
+      flush();
+    } catch (...) {
+    }
+  }
 
   void post(const EfaPostOp& op) override {
     if (op.kind != EfaPostOpKind::kWrite) {
@@ -217,6 +223,13 @@ class CoalescingEfaPostSink final : public EfaPostSink {
     }
 
     if (has_pending_ && can_coalesce_efa_write(pending_, op)) {
+      if (op.bytes >
+          std::numeric_limits<uint32_t>::max() - pending_.bytes) {
+        flush();
+        pending_ = op;
+        has_pending_ = true;
+        return;
+      }
       pending_.bytes += op.bytes;
       return;
     }
@@ -266,10 +279,11 @@ template <uint32_t Capacity>
 inline size_t drain_v2_d2h_queue_to_efa_posts(
     HostV2TransferD2HQueue<Capacity>& queue, EfaPostSink& sink,
     bool ack_after_drain = true) {
-  const auto commands = queue.poll_ready();
+  uint64_t observed_head = 0;
+  const auto commands = queue.poll_ready(&observed_head);
   drain_v2_transfer_cmds_to_efa_posts(commands, sink);
   if (ack_after_drain) {
-    queue.ack_ready();
+    queue.ack_ready_until(observed_head);
   }
   return commands.size();
 }

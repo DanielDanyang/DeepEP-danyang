@@ -773,3 +773,27 @@ V2 JIT sender kernel                      CPU proxy                         V2 r
 - 保留 UCCL EP 在 AWS EFA 上有效的 CPU proxy + FIFO + RDMA posting 模型。
 - 保留 DeepEP V2 的 expanded dispatch、reduced combine、JIT kernel 参数化和 handle/cache
   语义。
+
+### 2026-05-31 外部 review 后的取舍
+
+另一个 review 提出了两个方向：一是回到旧 `DeviceToHostCmdBuffer`、旧 `TransferCmd`、
+旧 `proxy.cpp` 上做最小扩展；二是指出当前 native V2 scaffold 还没有真正 fork DeepEP V2
+JIT dispatch/combine 主路径。这里的取舍如下：
+
+- 不采用“把 V2 command 编回旧 V1 `TransferCmd` / 旧 proxy semantic decode”的方案。
+  原因是这会重新引入 V1 packed/staged token buffer、`low_latency_buffer_idx`、
+  `is_combine` bitfield 等 V1 语义，违背 native V2 的目标。
+- 采纳“现有 descriptor enqueue 仍不是最终 V2 kernel”的批评。当前 serial descriptor
+  JIT 和 Python staging 只用于验证 native V2 command、EFA verbs sink、RDMA window 和
+  receiver layout 地址是否正确；长期实现必须 fork/改造 DeepEP V2 的 JIT `.cuh` 主路径，
+  在真实 dispatch/combine kernel 内部生成 V2 descriptors 或 V2TransferCmd。
+- 保留“同构 CPU proxy + FIFO + EFA post substrate”的方向，但 substrate 必须是 V2-only：
+  command、offset、signal、receiver layout 都来自 V2 descriptor/layout，而不是旧 V1
+  transfer protocol。
+- 当前 scaffold 的下一步不应该继续扩大 parallel infrastructure，而应该收敛到真实 V2
+  JIT kernel：
+  1. fork `deep_ep/impls/hybrid_dispatch.cuh` 的 GIN scaleout put/signal 区域；
+  2. 用 V2 expanded descriptor/layout 生成 `V2TransferCmd`；
+  3. receiver payload 直接落在 expanded layout；
+  4. combine 从 `token_metadata_at_forward` / `channel_linked_list` / V2 psum metadata
+     生成 reduced-combine command，而不是从 CPU reference dispatch plan 反推。

@@ -1579,3 +1579,49 @@ README 风格 EP8x2 性能：
   - public `dispatch()` 的返回值仍用 semantic all-to-all fallback 生成；
   - combine payload 还没有同样 staging 到 V2 window；
   - receiver 的 expanded/reduced tensor view 还没有默认直接绑定到 RDMA window。
+
+## 2026-05-31 外部 review 处理
+
+- 另一个 AI review 的结论拆成两类处理：
+  - 设计建议中“回到旧 `TransferCmd` / 旧 `proxy.cpp` 做最小 patch”不采纳；
+    这会重新引入 V1 command 语义和 packed token staging，不符合 native V2 目标。
+  - “当前 serial descriptor enqueue 不是最终 DeepEP V2 kernel”采纳；已写入
+    `uccl-ep/NATIVE_V2_REWRITE_PLAN.md`，后续应收敛到 fork/改造 DeepEP V2 JIT `.cuh`
+    主路径，而不是继续扩张 parallel scaffold。
+- 修复 review 指出的确定性 bug：
+  - `transfer_d2h_queue.cuh`
+    - GPU D2H enqueue 从 `atomicAdd` 改成 CAS reserve；不会再在 overflow race 中
+      泄漏一个 `kind == 0` 的空 slot。
+    - host `atomic_set_and_commit` 的 `kind` commit 改成 release atomic store，避免
+      plain store vs atomic load 的数据竞争。
+    - `HostV2TransferD2HQueue::poll_ready` 可返回同一个 observed head snapshot；
+      `ack_ready_until(observed_head)` 只 ack 已 poll 的区间。
+  - `efa_adapter.hpp`
+    - `drain_v2_d2h_queue_to_efa_posts` 使用同一个 observed head 做 ack，避免
+      poll/ack 之间新来的 command 被误 ack。
+    - `CoalescingEfaPostSink` destructor 变成 noexcept 防护；显式 `flush()` 仍会暴露
+      downstream sink 错误。
+    - coalesced `bytes` 增长增加 uint32 overflow guard，溢出前切成新的 write。
+  - `transfer_cmd.hpp`
+    - 简单 `V2TransferQueueView` reserve 改成 capacity-aware CAS；不会 tail advance 后
+      静默 drop command。
+  - `uccl_ep.cc`
+    - mapped D2H queue 同样使用 observed head ack，避免 TOCTOU。
+    - `V2EfaConnectionHandle` 只在所有 signaled WR completion 都 poll 完后重置
+      signal scratch，避免 in-flight NIC DMA 读到复用后的 signal value。
+- 本地验证：
+  - `python -m py_compile uccl-ep/tests/v2_efa_connection_smoke.py
+    uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py` 通过。
+  - `python uccl-ep/tests/v2_efa_source_hygiene_test.py` 通过。
+  - `c++ -std=c++17 -Iuccl-ep/include uccl-ep/tests/v2_efa_dispatch_plan_test.cc
+    uccl-ep/src/v2_efa_runtime.cc -o /tmp/v2_efa_dispatch_plan_test &&
+    /tmp/v2_efa_dispatch_plan_test` 通过。
+  - `git diff --check -- uccl-ep worklog.md` 通过。
+- 服务器验证：
+  - 修改同步到 `p5en_0` / `p5en_1` 后，`uccl-ep make -j$(nproc) install` 均通过。
+  - 双机 EP1x2 `uccl-ep/tests/v2_efa_connection_smoke.py` 通过：
+    - rank0/rank1 endpoint connect 成功；
+    - rank0 remote RDMA write 到 rank1 window 通过；
+    - rank0/rank1 dispatch payload RDMA 均通过；
+    - 两边 dispatch stats 仍为 `drained_commands=2`、`posted_writes=1`、
+      `posted_signals=1`、`posted_bytes=20`。

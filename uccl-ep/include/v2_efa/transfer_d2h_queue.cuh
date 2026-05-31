@@ -149,8 +149,7 @@ struct alignas(128) V2TransferD2HQueue {
     const auto saved_kind = tmp.kind;
     tmp.kind = 0;
     commands[idx] = tmp;
-    std::atomic_thread_fence(std::memory_order_release);
-    commands[idx].kind = saved_kind;
+    __atomic_store_n(&commands[idx].kind, saved_kind, __ATOMIC_RELEASE);
     if (out_slot != nullptr) {
       *out_slot = slot;
     }
@@ -169,21 +168,23 @@ __device__ __forceinline__ bool enqueue_v2_transfer_d2h(
       __nanosleep(64);
       continue;
     }
-    const auto slot = atomicAdd(
+    auto expected = h;
+    const auto claimed = atomicCAS(
         reinterpret_cast<unsigned long long*>(queue.head),
-        static_cast<unsigned long long>(1));
-    if (slot - t >= queue.capacity) {
+        static_cast<unsigned long long>(expected),
+        static_cast<unsigned long long>(expected + 1));
+    if (claimed != expected) {
+      __nanosleep(64);
       continue;
     }
 
-    const auto idx = static_cast<uint32_t>(slot) & (queue.capacity - 1);
+    const auto idx = static_cast<uint32_t>(h) & (queue.capacity - 1);
     const auto saved_kind = command.kind;
     command.kind = 0;
     queue.commands[idx] = command;
-    __threadfence_system();
-    queue.commands[idx].kind = saved_kind;
+    __atomic_store_n(&queue.commands[idx].kind, saved_kind, __ATOMIC_RELEASE);
     if (out_slot != nullptr) {
-      *out_slot = slot;
+      *out_slot = h;
     }
     return true;
   }
@@ -216,10 +217,13 @@ class HostV2TransferD2HQueue {
     return stats;
   }
 
-  std::vector<V2TransferCmd> poll_ready() const {
+  std::vector<V2TransferCmd> poll_ready(uint64_t* observed_head = nullptr) const {
     std::vector<V2TransferCmd> out;
     const auto head = queue_.volatile_head();
     const auto tail = queue_.volatile_tail();
+    if (observed_head != nullptr) {
+      *observed_head = head;
+    }
     out.reserve(static_cast<size_t>(head - tail));
     for (uint64_t idx = tail; idx < head; ++idx) {
       if (queue_.volatile_load_kind(idx) == 0) {
@@ -230,8 +234,8 @@ class HostV2TransferD2HQueue {
     return out;
   }
 
-  void ack_ready() {
-    const auto head = queue_.volatile_head();
+  void ack_ready_until(uint64_t observed_head) {
+    const auto head = observed_head;
     const auto tail = queue_.volatile_tail();
     for (uint64_t idx = tail; idx < head; ++idx) {
       if (queue_.volatile_load_kind(idx) == 0) {
@@ -242,6 +246,8 @@ class HostV2TransferD2HQueue {
     }
     queue_.advance_tail_from_mask();
   }
+
+  void ack_ready() { ack_ready_until(queue_.volatile_head()); }
 
  private:
   V2TransferD2HQueue<Capacity> queue_;

@@ -339,15 +339,21 @@ class MappedD2HQueueHandle {
   }
 
   void reset() {
-    std::memset(commands_host_, 0, commands_bytes_);
+    for (uint32_t i = 0; i < capacity_; ++i) {
+      commands_host_[i] = v2::V2TransferCmd{};
+    }
     __atomic_store_n(head_host_, uint64_t{0}, __ATOMIC_RELEASE);
     __atomic_store_n(tail_host_, uint64_t{0}, __ATOMIC_RELEASE);
   }
 
-  std::vector<v2::V2TransferCmd> poll_ready() const {
+  std::vector<v2::V2TransferCmd> poll_ready(
+      uint64_t* observed_head = nullptr) const {
     std::vector<v2::V2TransferCmd> out;
     const auto h = head();
     const auto t = tail();
+    if (observed_head != nullptr) {
+      *observed_head = h;
+    }
     out.reserve(static_cast<size_t>(h - t));
     for (uint64_t idx = t; idx < h; ++idx) {
       const auto slot = static_cast<uint32_t>(idx) & (capacity_ - 1);
@@ -364,7 +370,8 @@ class MappedD2HQueueHandle {
   std::vector<v2::EfaPostOp> drain_ready_to_efa_posts(bool coalesce,
                                                       bool ack_after_drain) {
     v2::RecordingEfaPostSink recorder;
-    const auto commands = poll_ready();
+    uint64_t observed_head = 0;
+    const auto commands = poll_ready(&observed_head);
     if (coalesce) {
       v2::CoalescingEfaPostSink sink(&recorder);
       v2::drain_v2_transfer_cmds_to_efa_posts(commands, sink);
@@ -373,13 +380,13 @@ class MappedD2HQueueHandle {
       v2::drain_v2_transfer_cmds_to_efa_posts(commands, recorder);
     }
     if (ack_after_drain) {
-      ack_ready();
+      ack_ready_until(observed_head);
     }
     return recorder.ops;
   }
 
-  void ack_ready() {
-    const auto h = head();
+  void ack_ready_until(uint64_t observed_head) {
+    const auto h = observed_head;
     auto t = tail();
     while (t < h) {
       const auto slot = static_cast<uint32_t>(t) & (capacity_ - 1);
@@ -394,6 +401,8 @@ class MappedD2HQueueHandle {
     }
     __atomic_store_n(tail_host_, t, __ATOMIC_RELEASE);
   }
+
+  void ack_ready() { ack_ready_until(head()); }
 
  private:
   uint32_t capacity_ = 0;
@@ -551,7 +560,8 @@ class V2EfaConnectionHandle {
                        bool ack_after_drain = true) {
     ensure_connected();
     const auto before = sink_->stats();
-    const auto commands = queue.poll_ready();
+    uint64_t observed_head = 0;
+    const auto commands = queue.poll_ready(&observed_head);
     if (coalesce) {
       v2::CoalescingEfaPostSink coalesced(sink_.get());
       v2::drain_v2_transfer_cmds_to_efa_posts(commands, coalesced);
@@ -560,9 +570,12 @@ class V2EfaConnectionHandle {
       v2::drain_v2_transfer_cmds_to_efa_posts(commands, *sink_);
     }
     if (ack_after_drain) {
-      queue.ack_ready();
+      queue.ack_ready_until(observed_head);
     }
     const auto after = sink_->stats();
+    outstanding_signaled_posts_ +=
+        (after.posted_writes - before.posted_writes) +
+        (after.posted_signals - before.posted_signals);
     nb::dict out;
     out["drained_commands"] = commands.size();
     out["posted_writes"] = after.posted_writes - before.posted_writes;
@@ -591,6 +604,9 @@ class V2EfaConnectionHandle {
     const auto before = sink_->stats();
     sink_->post(op);
     const auto after = sink_->stats();
+    outstanding_signaled_posts_ +=
+        (after.posted_writes - before.posted_writes) +
+        (after.posted_signals - before.posted_signals);
     nb::dict out;
     out["posted_writes"] = after.posted_writes - before.posted_writes;
     out["posted_signals"] = after.posted_signals - before.posted_signals;
@@ -620,7 +636,12 @@ class V2EfaConnectionHandle {
       }
       total += static_cast<uint32_t>(ne);
     }
-    if (sink_ != nullptr && total != 0) {
+    if (total >= outstanding_signaled_posts_) {
+      outstanding_signaled_posts_ = 0;
+    } else {
+      outstanding_signaled_posts_ -= total;
+    }
+    if (sink_ != nullptr && total != 0 && outstanding_signaled_posts_ == 0) {
       sink_->reset_signal_scratch();
     }
     return total;
@@ -803,6 +824,7 @@ class V2EfaConnectionHandle {
   std::vector<ibv_qp*> qps_;
   std::vector<ibv_ah*> ahs_;
   std::vector<uint32_t> signal_values_;
+  uint64_t outstanding_signaled_posts_ = 0;
   std::unique_ptr<v2::V2VerbsEndpointTable> endpoint_table_;
   std::unique_ptr<v2::V2EfaVerbsPostSink> sink_;
 };

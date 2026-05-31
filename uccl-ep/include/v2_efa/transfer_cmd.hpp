@@ -281,7 +281,17 @@ struct V2TransferQueueView {
 #if defined(__CUDA_ARCH__)
 __device__ __forceinline__ uint32_t reserve_v2_transfer_cmd(
     V2TransferQueueView queue) {
-  return atomicAdd(queue.tail, 1u);
+  while (true) {
+    const auto tail = *reinterpret_cast<volatile uint32_t*>(queue.tail);
+    if (tail >= queue.capacity) {
+      return queue.capacity;
+    }
+    const auto claimed = atomicCAS(queue.tail, tail, tail + 1u);
+    if (claimed == tail) {
+      return tail;
+    }
+    __nanosleep(64);
+  }
 }
 
 __device__ __forceinline__ void enqueue_v2_transfer_cmd(
