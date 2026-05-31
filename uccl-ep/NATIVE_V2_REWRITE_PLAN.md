@@ -179,6 +179,41 @@ API 不能再命中。
   - `utils_uccl.py` 中的 rank/node/local rank 发现可以保留。
   - 但返回对象不应再构造 V1 transport handle。
 
+### 附件一建议的采纳边界
+
+附件一里“回旧 V1 `TransferCmd` / 旧 `proxy.cpp` 做最小改动”的建议需要拆成两半处理：
+
+- 不采纳“回旧 V1 `TransferCmd` 协议”。旧 command 的字段虽然也是 16B，但语义绑定
+  V1 packed/staged buffer、low-latency expert counter、atomic offset 和旧 receiver
+  staging。V2 需要表达的是 expanded dispatch / reduced combine 的 target rank、lane、
+  local/remote layout offset、payload/signal kind 和 signal value。把 V2 descriptor 编回旧
+  bitfield 会重新引入 V1 语义。
+- 采纳“尽量复用旧 `proxy.cpp` / D2H FIFO / RDMA post / CQ poll substrate”。这部分是
+  UCCL EP V1 已经验证过的 GPU-to-CPU proxy 方法，和 V1 EP 语义耦合较弱。native V2
+  的目标不是平行维护一套全新的 transport，而是让 retained proxy poll loop 直接消费新的
+  16B `V2TransferCmd`，decode 后生成 V2 expanded/reduced layout 的 EFA write/signal。
+
+因此后续代码收敛方向是：
+
+```text
+DeepEP V2 JIT kernel
+        |
+        v
+16B V2TransferCmd
+        |
+        v
+retained UCCL D2H FIFO / proxy poll loop
+        |
+        v
+decode V2 command, not old TransferCmd
+        |
+        v
+EFA write/signal into V2 expanded or reduced-combine layout
+```
+
+任何只用于 host reference、绕开 D2H/proxy substrate 的临时 queue 都应删除；保留的队列
+必须要么是旧 substrate 的同构 V2 view，要么是走向真实 proxy poll loop 的必要过渡层。
+
 ## 新目录建议
 
 ```text
@@ -191,7 +226,6 @@ uccl-ep/
     transfer_cmd_plan.hpp
     transfer_d2h_queue.cuh
     transfer_layout.hpp
-    transfer_queue_host.hpp
     dispatch_jit.cuh
     combine_jit.cuh
     workspace.hpp
@@ -543,8 +577,13 @@ device enqueue EFA proxy descriptors
   - EP1x2 smoke 已验证 dispatch 和 combine 两个方向都产生
     `drained_commands=2`、`posted_writes=1`、`posted_signals=1`、`posted_bytes=20`。
 - 仍缺真正 native V2 combine：
-  - `token_metadata_at_forward` / `channel_linked_list` 仍是 compact transitional
-    tensor，不是官方多 channel `[channel, token, metadata_dim]` 完整格式；
+  - `token_metadata_at_forward` / `channel_linked_list` 已从 compact 2D tensor 改成
+    V2-like 多 channel 形状：
+    `token_metadata_at_forward = [channels, scaleout_ranks * tokens_per_channel + 1,
+    2 + 2 * topk]`，
+    `channel_linked_list = [channels, tokens_per_channel + 1, scaleup_ranks]`；
+    但 channel 分配和 linked-list 语义仍是 transitional scaffold，还没有完全匹配官方
+    `hybrid_dispatch.cuh` 的 per-channel scheduling。
   - descriptor 构造已下沉到 CUDA/JIT，但还没有解析完整官方
     `token_metadata_at_forward` / `channel_linked_list`；
   - 多 topk / 多 remote contributor 的 reduce 仍由 semantic fallback 兜底，RDMA overlay

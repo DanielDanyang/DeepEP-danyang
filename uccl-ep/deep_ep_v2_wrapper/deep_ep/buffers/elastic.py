@@ -1503,7 +1503,7 @@ class ElasticBuffer:
             counters=counters,
             queue=queue,
             layout=layout,
-            num_forward_rows=int(forward_metadata.shape[0]),
+            num_forward_rows=int(forward_metadata.numel() // forward_metadata.shape[-1]),
             num_max_tokens_per_rank=handle.num_max_tokens_per_rank,
             payload_bytes=payload_bytes,
             use_expanded_layout=handle.do_expand,
@@ -1571,7 +1571,7 @@ class ElasticBuffer:
         for row in range(int(forward_rows.shape[0])):
             token_global = int(forward_rows[row, 0].item())
             if token_global < 0:
-                break
+                continue
             dst_rank = token_global // int(handle.num_max_tokens_per_rank)
             src_scaleout_rank = dst_rank // self.num_scaleup_ranks
             if src_scaleout_rank == self.scaleout_rank_idx:
@@ -1620,41 +1620,46 @@ class ElasticBuffer:
         num_recv = int(recv_src_metadata.shape[0])
         num_topk = int(recv_topk_idx.shape[1]) if recv_topk_idx.numel() else int(self.num_topk)
         dims = 2 + num_topk * 2
+        num_channels = max(1, int(self.num_sms) * max(1, self.num_scaleup_ranks))
+        tokens_per_channel = max(1, (num_recv + num_channels - 1) // num_channels)
+        rows_per_channel = max(1, self.num_scaleout_ranks) * tokens_per_channel + 1
         metadata = torch.full(
-            (max(1, num_recv) + 1, dims),
+            (num_channels, rows_per_channel, dims),
             -1,
             dtype=torch.int32,
             device=recv_src_metadata.device,
         )
+        channel_linked_list = torch.zeros(
+            (num_channels, tokens_per_channel + 1, max(1, self.num_scaleup_ranks)),
+            dtype=torch.int32,
+            device=recv_src_metadata.device,
+        )
         if num_recv == 0:
-            channel_linked_list = torch.zeros(
-                (1, max(1, self.num_scaleup_ranks)),
-                dtype=torch.int32,
-                device=recv_src_metadata.device,
-            )
             return metadata, channel_linked_list
 
-        metadata[:num_recv, 0] = recv_src_metadata[:num_recv, 0].to(torch.int32)
-        metadata[:num_recv, 1] = 0
-        metadata[num_recv - 1, 1] = 1
         num_experts_per_rank = max(1, int(num_experts) // self.num_ranks)
         for row in range(num_recv):
+            channel_idx = row % num_channels
+            channel_row = row // num_channels
+            if channel_row >= rows_per_channel - 1:
+                break
+            dst = metadata[channel_idx, channel_row]
+            dst[0] = recv_src_metadata[row, 0].to(torch.int32)
+            dst[1] = 1 if row == num_recv - 1 else 0
             for topk_slot in range(num_topk):
                 local_expert = int(recv_topk_idx[row, topk_slot].item())
                 if local_expert < 0:
                     continue
-                metadata[row, 2 + topk_slot] = local_expert // num_experts_per_rank
+                dst[2 + topk_slot] = local_expert // num_experts_per_rank
                 if do_expand:
-                    metadata[row, 2 + num_topk + topk_slot] = recv_src_metadata[row, 2 + topk_slot]
+                    dst[2 + num_topk + topk_slot] = recv_src_metadata[row, 2 + topk_slot]
                 else:
-                    metadata[row, 2 + num_topk + topk_slot] = row
-        metadata[num_recv, 0] = -1
-        channel_linked_list = torch.zeros(
-            (1, max(1, self.num_scaleup_ranks)),
-            dtype=torch.int32,
-            device=recv_src_metadata.device,
-        )
-        channel_linked_list[0, self.scaleup_rank_idx] = num_recv
+                    dst[2 + num_topk + topk_slot] = row
+            channel_linked_list[channel_idx, channel_row, self.scaleup_rank_idx] = channel_row + 1
+        for channel_idx in range(num_channels):
+            channel_count = (num_recv + num_channels - 1 - channel_idx) // num_channels
+            channel_count = max(0, min(channel_count, tokens_per_channel))
+            channel_linked_list[channel_idx, channel_count, self.scaleup_rank_idx] = channel_count
         return metadata, channel_linked_list
 
     def _make_combine_window_layout(

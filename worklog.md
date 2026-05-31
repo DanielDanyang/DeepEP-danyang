@@ -1803,3 +1803,34 @@ README 风格 EP8x2 性能：
     layout；
   - dispatch receiver 端 metadata 生成仍在 Python bridge；
   - 多 remote contributor 的 reduced-combine native reduce 尚未实现。
+
+## 2026-05-31 transport substrate 纠偏与多 channel metadata
+
+- 根据附件一的设计意见重新划清边界：
+  - 不回退到旧 V1 `TransferCmd` bitfield，因为旧字段语义绑定 V1 packed/staged
+    buffer、low-latency expert counter 和 atomic offset；
+  - 采纳“复用旧 D2H FIFO / CPU proxy / EFA post / CQ poll substrate”的方向，后续
+    native V2 应让 retained proxy poll loop 直接消费 16B `V2TransferCmd`。
+- 清理早期 host-only reference queue：
+  - 删除 `include/v2_efa/transfer_queue_host.hpp`；
+  - `v2_efa_dispatch_plan_test.cc` 不再通过 host-only queue 对拍，直接验证
+    `V2TransferCmd` 列表、D2H queue 和 EFA adapter；
+  - `NATIVE_V2_REWRITE_PLAN.md` 删除该临时 queue，并补充“旧 TransferCmd 不采纳、
+    旧 proxy substrate 采纳”的设计边界。
+- 将 transitional forward metadata 从 compact 2D 进一步改成 V2-like 多 channel 形状：
+  - `token_metadata_at_forward = [channels, scaleout_ranks * tokens_per_channel + 1,
+    2 + 2 * topk]`；
+  - `channel_linked_list = [channels, tokens_per_channel + 1, scaleup_ranks]`；
+  - combine JIT / Python fallback 扫描 flatten metadata 时遇到 channel sentinel 继续扫描
+    后续 channel，而不是提前终止。
+- 服务器状态：
+  - 检查到 `p5en_0` / `p5en_1` 均有其他用户进程占用 8 张 GPU：
+    - `p5en_0`: `/home/ubuntu/efs/zm/mKernel/ziming/bin/python3`，PID
+      `1758230`-`1758238`，每进程约 78.5GB GPU memory；
+    - `p5en_1`: `/home/ubuntu/efs/zm/mKernel/ziming/bin/python3`，PID
+      `450407`-`450414`，每进程约 78.5GB GPU memory；
+  - 按 agents 约束没有进行 build、profiling 或 benchmark。
+- 验证：
+  - 本地 py_compile / source hygiene / C++ dispatch plan / diff check 全部通过。
+- 待验证：
+  - 服务器空闲后重新 install 并跑 EP1x2 smoke，再扩大到 EP8x2。

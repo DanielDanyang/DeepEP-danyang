@@ -193,10 +193,10 @@ __global__ void v2_efa_combine_forward_metadata_enqueue_d2h_kernel(
     int num_max_tokens_per_rank, int payload_bytes, int max_segments,
     int max_batches, V2TransferD2HQueueView queue,
     CombineTransferLayout layout) {
-  // Transitional native V2 combine path: parse the compact forward metadata
-  // carried in the V2 handle and generate V2TransferCmd directly on device.
-  // The final version should parse the official multi-channel V2 metadata and
-  // linked lists, but this already removes the Python descriptor loop.
+  // Transitional native V2 combine path: parse the V2-like multi-channel
+  // forward metadata carried in the handle and generate V2TransferCmd directly
+  // on device. The final version should also walk channel_linked_list to match
+  // the official V2 scheduling order.
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
@@ -216,7 +216,7 @@ __global__ void v2_efa_combine_forward_metadata_enqueue_d2h_kernel(
     const auto metadata = token_metadata_at_forward + row * kMetadataDims;
     const int src_global = metadata[0];
     if (src_global < 0) {
-      break;
+      continue;
     }
     const int dst_original_rank = src_global / num_max_tokens_per_rank;
     const int dst_scaleout_rank = dst_original_rank / kNumScaleupRanks;

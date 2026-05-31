@@ -7,7 +7,6 @@
 #include "v2_efa/transfer_d2h_queue.cuh"
 #include "v2_efa/transfer_layout.hpp"
 #include "v2_efa/transfer_loopback.hpp"
-#include "v2_efa/transfer_queue_host.hpp"
 
 #include <cassert>
 #include <cstdint>
@@ -310,23 +309,13 @@ int main() {
               sizeof(uint32_t));
   assert(dispatch_signal == 2);
 
-  std::vector<uint8_t> queued_dispatch_remote(4096, 0);
-  HostV2TransferQueue dispatch_queue(
-      static_cast<uint32_t>(dispatch_commands.commands.size()));
-  const auto queue_stats =
-      submit_v2_transfer_cmds(dispatch_queue, dispatch_commands.commands);
-  assert(queue_stats.submitted == dispatch_commands.commands.size());
-  assert(queue_stats.overflow == 0);
-  assert(dispatch_queue.tail() == dispatch_commands.commands.size());
-  const auto transfer_cmds = dispatch_queue.snapshot();
+  const auto& transfer_cmds = dispatch_commands.commands;
   assert(transfer_cmds.size() == dispatch_commands.commands.size());
   assert(is_v2_transfer_cmd(transfer_cmds[0]));
   assert(transfer_cmds[1].kind ==
          static_cast<uint8_t>(V2TransferCmdKind::kDispatchSignal));
-  auto v2_view = dispatch_queue.view();
-  assert(v2_view.capacity == transfer_cmds.size());
   RecordingEfaPostSink v2_sink;
-  drain_v2_transfer_cmds_to_efa_posts(dispatch_queue.snapshot(), v2_sink);
+  drain_v2_transfer_cmds_to_efa_posts(transfer_cmds, v2_sink);
   assert(v2_sink.ops.size() == transfer_cmds.size());
   assert(v2_sink.ops[0].kind == EfaPostOpKind::kWrite);
   assert(v2_sink.ops[1].kind == EfaPostOpKind::kSignalWrite);
@@ -394,14 +383,6 @@ int main() {
   assert(proxy_sink.stats.posted_signals == 8);
   assert(proxy_d2h_queue.queue().volatile_tail() ==
          proxy_d2h_queue.queue().volatile_head());
-
-  const auto queued_dispatch_stats = dispatch_queue.drain_loopback(
-      LoopbackMemoryView{dispatch_local.data(), dispatch_local.size(),
-                         queued_dispatch_remote.data(),
-                         queued_dispatch_remote.size()});
-  assert(queued_dispatch_stats.payload_commands == 4);
-  assert(std::memcmp(queued_dispatch_remote.data() + 2000,
-                     dispatch_local.data() + 1000, 64) == 0);
 
   assert(v2_sink.ops[0].target_rank == dispatch_commands.commands[0].target_rank);
   assert(v2_sink.ops[0].target_lane == dispatch_commands.commands[0].target_lane);
