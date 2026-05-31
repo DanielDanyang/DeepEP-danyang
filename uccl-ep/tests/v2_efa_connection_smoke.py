@@ -112,7 +112,7 @@ def main():
         window.zero_()
         x = (torch.arange(16, dtype=torch.uint8, device=window.device) + rank * 64).reshape(1, 16)
         topk_idx = torch.tensor([[1 - rank]], dtype=torch.int64, device=window.device)
-        _, _, _, handle, _ = buf.dispatch(
+        recv_x, _, _, handle, _ = buf.dispatch(
             x,
             topk_idx=topk_idx,
             num_experts=2,
@@ -130,6 +130,8 @@ def main():
         got = window[offset: offset + 16].cpu().tolist()
         expected = (torch.arange(16, dtype=torch.uint8) + (1 - rank) * 64).tolist()
         assert got == expected, (got, expected, layout, handle.transport_handle.dispatch_drain_stats)
+        recv_got = recv_x.reshape(-1).view(torch.uint8).cpu().tolist()
+        assert recv_got == expected, (recv_got, expected, handle.transport_handle.dispatch_drain_stats)
         print(
             f"rank={rank} dispatch_rdma_recv_ok=True "
             f"stats={handle.transport_handle.dispatch_drain_stats}",

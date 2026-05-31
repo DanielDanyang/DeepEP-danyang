@@ -498,14 +498,17 @@ device enqueue EFA proxy descriptors
 - 当前已完成一个最小 direct payload RDMA 验证：
   - device kernel 直接 enqueue `V2TransferCmd` 到 D2H queue；
   - CPU/EFA sink drain 后将 payload 写入 peer 的 V2 RDMA window；
+  - public `dispatch()` 在 EFA path 下会用 RDMA window 中的 remote scaleout payload
+    覆盖 semantic reference `recv_x`，所以返回 payload 不再只是 NCCL/semantic
+    all-to-all 的结果；
   - EP1x2 smoke 通过，每 rank 产生 `drained_commands=2`、
     `posted_writes=1`、`posted_signals=1`、`posted_bytes=20`。
 - 仍缺真正 native V2 dispatch：
   - direct kernel 的 remote slot 仍是 `token * expanded_slot_stride`，尚未使用
     official V2 expanded slot assignment；
   - 还没有把 payload scatter 合并进官方 V2 epilogue；
-  - receiver window 检查通过，但 public dispatch 返回值仍由 semantic fallback 生成，
-    还不是直接消费 RDMA-expanded layout。
+  - ordering/metadata 仍由 semantic reference path 计算，RDMA window overlay 只是把
+    remote payload 数据面接入 public output，还不是最终的 V2 receiver epilogue。
 
 交付标准：EP8x2 dispatch correctness 通过，且不经过 V1 staging buffer。
 

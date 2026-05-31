@@ -1127,6 +1127,13 @@ class ElasticBuffer:
             self._semantic_dispatch_data(x_tensor, sf, topk_idx, topk_weights,
                                          num_max_tokens_per_rank, num_experts)
         )
+        self._overlay_native_dispatch_payload_from_window(
+            recv_x,
+            recv_src_global,
+            transport,
+            num_max_tokens_per_rank,
+            payload_bytes,
+        )
         num_recv_tokens = int(sum(recv_counts))
         recv_src_metadata, dst_buffer_slot_idx, psum_scaleup, psum_expert, expert_counts = (
             self._build_v2_dispatch_metadata(
@@ -1327,6 +1334,46 @@ class ElasticBuffer:
             scale_bytes=scale_bytes,
             dispatch_drain_stats=dispatch_drain_stats,
         )
+
+    def _overlay_native_dispatch_payload_from_window(
+        self,
+        recv_x: torch.Tensor,
+        recv_src_global: torch.Tensor,
+        transport: V2TransportHandle,
+        num_max_tokens_per_rank: int,
+        payload_bytes: int,
+    ) -> None:
+        """Replace remote dispatch payload rows with bytes delivered by EFA.
+
+        This is an incremental bridge toward native V2 receiver consumption.
+        Ordering and metadata still come from the semantic reference path, but
+        remote scaleout payload bytes are read from the registered V2 RDMA
+        window at the offsets used by the direct enqueue kernel.
+        """
+
+        if self._v2_efa_connection is None or self._v2_efa_window is None:
+            return
+        if transport.dispatch_drain_stats is None:
+            return
+        if int(transport.dispatch_drain_stats.get("posted_writes", 0)) == 0:
+            return
+        layout = transport.dispatch_layout or {}
+        remote_payload_base = int(layout.get("remote_payload_base", 0))
+        expanded_slot_stride = int(layout.get("expanded_slot_stride", payload_bytes))
+        window = self._require_v2_efa_window(
+            remote_payload_base + int(num_max_tokens_per_rank) * expanded_slot_stride
+        )
+
+        for row in range(int(recv_x.shape[0])):
+            src_global = int(recv_src_global[row].item())
+            src_rank = src_global // int(num_max_tokens_per_rank)
+            src_scaleout_rank = src_rank // self.num_scaleup_ranks
+            if src_scaleout_rank == self.scaleout_rank_idx:
+                continue
+            src_token = src_global % int(num_max_tokens_per_rank)
+            offset = remote_payload_base + src_token * expanded_slot_stride
+            row_bytes = recv_x[row].reshape(-1).view(torch.uint8)
+            row_bytes.copy_(window[offset: offset + int(payload_bytes)])
 
     def _launch_native_combine_transport(self, x: torch.Tensor, handle: EPHandle) -> None:
         transport = handle.transport_handle

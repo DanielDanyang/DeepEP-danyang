@@ -1674,3 +1674,29 @@ README 风格 EP8x2 性能：
   - direct kernel 还不是 official `hybrid_dispatch.cuh` fork；expanded slot assignment、
     per-expert batching、metadata 写入和 cached dispatch 仍需下沉到真实 V2 JIT。
   - public dispatch 输出仍由 semantic fallback 产生，不是直接消费 RDMA-expanded layout。
+
+## 2026-05-31 dispatch output 消费 RDMA window
+
+- 新增 `ElasticBuffer._overlay_native_dispatch_payload_from_window`：
+  - 在 EFA path 的 `dispatch()` 中，semantic reference path 仍负责 recv ordering 和
+    metadata；
+  - remote scaleout payload row 现在按 `recv_src_global` 映射回 sender token id，从
+    `V2EfaConnection` 注册的 RDMA window 中读取
+    `remote_payload_base + src_token * expanded_slot_stride`；
+  - 对本 scaleout rank 的 local/NVLink traffic 不覆盖，继续使用 semantic reference
+    payload。
+- 更新 `uccl-ep/tests/v2_efa_connection_smoke.py`：
+  - 除了检查 peer window 内容，也检查 `dispatch()` 返回的 `recv_x` byte 内容等于 peer
+    token；
+  - 这样 smoke 现在覆盖 public dispatch output 是否实际消费了 native EFA payload。
+- 服务器验证：
+  - `p5en_0` / `p5en_1` GPU 空闲后，使用 `LOCAL_WORLD_SIZE=1` 跑双机 EP1x2 smoke。
+  - rank0/rank1 均通过：
+    - window payload 正确；
+    - `recv_x` output payload 正确；
+    - stats 仍为 `drained_commands=2`、`posted_writes=1`、`posted_signals=1`、
+      `posted_bytes=20`。
+- 仍未完成：
+  - 这还是 transitional overlay。最终应把 recv ordering、expanded slot assignment 和
+    metadata 写入都下沉到官方 V2 JIT receiver/epilogue，而不是由 Python semantic path
+    兜底。
