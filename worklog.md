@@ -1839,3 +1839,26 @@ README 风格 EP8x2 性能：
   - 本地 py_compile / source hygiene / C++ dispatch plan / diff check 全部通过。
 - 待验证：
   - 服务器空闲后重新 install 并跑 EP1x2 smoke，再扩大到 EP8x2。
+
+## 2026-05-31 dispatch forward metadata 下沉到 JIT
+
+- 新增 `v2_efa_dispatch_forward_metadata_kernel`：
+  - 输入 `recv_topk_idx` / `recv_src_metadata`；
+  - 在 CUDA/JIT 端填充 V2-like 多 channel `token_metadata_at_forward`；
+  - 在 CUDA/JIT 端填充 `channel_linked_list`，未使用位置写 `-1`；
+  - `metadata[2 + topk_slot]` 现在写当前 `scaleup_rank`，修掉原 Python
+    scaffold 在 EP8x2 下会把 scaleup lane 固定成 0 的问题。
+- 新增 runtime/JIT/binding/Python wrapper：
+  - `build_v2_efa_dispatch_forward_metadata_jit_plan`
+  - `V2EfaRuntime::build_dispatch_forward_metadata_jit_plan`
+  - `V2EfaRuntime::launch_dispatch_forward_metadata`
+  - `ElasticBuffer.launch_dispatch_forward_metadata`
+- `_build_forward_metadata_tensors` 不再用 Python loop 写 metadata，而是分配 tensor 后调用
+  dispatch forward-metadata JIT kernel。
+- 验证：
+  - 本地 py_compile/source hygiene/C++ dispatch plan/diff check 通过。
+- 仍未完成：
+  - `recv_src_metadata` / `recv_topk_idx` 仍来自 semantic dispatch bridge；
+  - channel assignment 仍是 round-robin scaffold，不是官方 `hybrid_dispatch.cuh`
+    receiver epilogue 的 tail/linked-list 协议；
+  - 服务器未验证，需等 GPU 空闲。

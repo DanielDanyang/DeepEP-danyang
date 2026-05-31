@@ -244,6 +244,30 @@ void launch_v2_efa_dispatch_direct_enqueue_d2h_plan(
       scaleout_rank, queue, layout));
 }
 
+void launch_v2_efa_dispatch_forward_metadata_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t recv_topk_idx_ptr,
+    std::uintptr_t recv_src_metadata_ptr,
+    std::uintptr_t token_metadata_at_forward_ptr,
+    std::uintptr_t channel_linked_list_ptr, int num_recv_tokens,
+    int rows_per_channel, int scaleup_rank, bool do_expand,
+    std::uintptr_t cuda_stream_ptr) {
+  if (num_recv_tokens < 0 || rows_per_channel <= 0 || scaleup_rank < 0) {
+    throw std::invalid_argument(
+        "invalid V2 EFA dispatch forward metadata launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config,
+      checked_ptr<const int64_t>(recv_topk_idx_ptr, "recv_topk_idx"),
+      checked_ptr<const int32_t>(recv_src_metadata_ptr, "recv_src_metadata"),
+      checked_ptr<int32_t>(token_metadata_at_forward_ptr,
+                           "token_metadata_at_forward"),
+      checked_ptr<int32_t>(channel_linked_list_ptr, "channel_linked_list"),
+      num_recv_tokens, rows_per_channel, scaleup_rank, do_expand));
+}
+
 void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t dispatch_segments_ptr,
     std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
@@ -422,6 +446,22 @@ void V2EfaRuntime::launch_dispatch_direct_enqueue_d2h(
   launch_v2_efa_dispatch_direct_enqueue_d2h_plan(
       plan, topk_idx_ptr, num_tokens, cfg.scaleout_rank, commands_ptr,
       head_ptr, tail_ptr, queue_capacity, layout, cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_dispatch_forward_metadata(
+    std::uintptr_t recv_topk_idx_ptr, std::uintptr_t recv_src_metadata_ptr,
+    std::uintptr_t token_metadata_at_forward_ptr,
+    std::uintptr_t channel_linked_list_ptr, int num_recv_tokens,
+    int num_max_tokens_per_rank, int num_channels_per_sm,
+    int rows_per_channel, bool do_expand, const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto& cfg = config();
+  const auto plan = build_dispatch_forward_metadata_jit_plan(
+      num_max_tokens_per_rank, num_channels_per_sm, uccl_include_path);
+  launch_v2_efa_dispatch_forward_metadata_plan(
+      plan, recv_topk_idx_ptr, recv_src_metadata_ptr,
+      token_metadata_at_forward_ptr, channel_linked_list_ptr, num_recv_tokens,
+      rows_per_channel, cfg.scaleup_rank, do_expand, cuda_stream_ptr);
 }
 
 void V2EfaRuntime::launch_combine_descriptor_enqueue_d2h(

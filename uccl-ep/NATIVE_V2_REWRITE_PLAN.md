@@ -540,8 +540,12 @@ device enqueue EFA proxy descriptors
 - 仍缺真正 native V2 dispatch：
   - direct kernel 的 remote slot 仍是 `token * expanded_slot_stride`，尚未使用
     official V2 expanded slot assignment；
+  - `token_metadata_at_forward` / `channel_linked_list` 的 V2-like 多 channel tensor
+    填充已经下沉到 `v2_efa_dispatch_forward_metadata_kernel`，不再由 Python loop 写入；
+    但它的输入 `recv_src_metadata` / `recv_topk_idx` 仍来自 semantic dispatch bridge，
+    还不是官方 `hybrid_dispatch.cuh` receiver epilogue 原地产生；
   - 还没有把 payload scatter 合并进官方 V2 epilogue；
-  - ordering/metadata 仍由 semantic reference path 计算，RDMA window overlay 只是把
+  - ordering 仍由 semantic reference path 计算，RDMA window overlay 只是把
     remote payload 数据面接入 public output，还不是最终的 V2 receiver epilogue。
 
 交付标准：EP8x2 dispatch correctness 通过，且不经过 V1 staging buffer。
@@ -583,8 +587,9 @@ device enqueue EFA proxy descriptors
     2 + 2 * topk]`，
     `channel_linked_list = [channels, scaleout_ranks * tokens_per_channel + 1,
     scaleup_ranks]`；
-    但 channel 分配和 linked-list 语义仍是 transitional scaffold，还没有完全匹配官方
-    `hybrid_dispatch.cuh` 的 per-channel scheduling。
+    且填充已由 `v2_efa_dispatch_forward_metadata_kernel` 完成；
+    但 channel 分配仍是 transitional round-robin scaffold，还没有完全匹配官方
+    `hybrid_dispatch.cuh` 的 per-channel scheduling 和 linked-list tail 协议。
   - descriptor 构造已下沉到 CUDA/JIT，但还没有解析完整官方
     `token_metadata_at_forward` / `channel_linked_list`；
   - 多 topk / 多 remote contributor 的 reduce 仍由 semantic fallback 兜底，RDMA overlay

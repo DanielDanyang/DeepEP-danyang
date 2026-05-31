@@ -1183,6 +1183,32 @@ NB_MODULE(ep, m) {
            nb::arg("do_cpu_sync") = false,
            nb::arg("smem_bytes") = 228 * 1024,
            nb::arg("uccl_include_path") = "")
+      .def("build_dispatch_forward_metadata_jit_plan",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              int num_channels_per_sm,
+              const std::string& uccl_include_path) {
+             return jit_launch_plan_to_dict(
+                 self.build_dispatch_forward_metadata_jit_plan(
+                     num_max_tokens_per_rank, num_channels_per_sm,
+                     uccl_include_path));
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm") = 1,
+           nb::arg("uccl_include_path") = "")
+      .def("compile_dispatch_forward_metadata_jit",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              int num_channels_per_sm,
+              const std::string& uccl_include_path) {
+             const auto plan =
+                 self.build_dispatch_forward_metadata_jit_plan(
+                     num_max_tokens_per_rank, num_channels_per_sm,
+                     uccl_include_path);
+             v2::compile_v2_efa_jit_plan(plan);
+             return jit_launch_plan_to_dict(plan);
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm") = 1,
+           nb::arg("uccl_include_path") = "")
       .def("build_combine_enqueue_d2h_jit_plan",
            [](const v2::V2EfaRuntime& self,
               const std::string& uccl_include_path) {
@@ -1420,6 +1446,34 @@ NB_MODULE(ep, m) {
            nb::arg("expanded_slot_stride"),
            nb::arg("batch_payload_stride"),
            nb::arg("signal_stride") = sizeof(std::uint32_t),
+           nb::arg("uccl_include_path") = "",
+           nb::arg("cuda_stream_ptr") = 0)
+      .def("launch_dispatch_forward_metadata",
+           [](const v2::V2EfaRuntime& self,
+              std::uintptr_t recv_topk_idx_ptr,
+              std::uintptr_t recv_src_metadata_ptr,
+              std::uintptr_t token_metadata_at_forward_ptr,
+              std::uintptr_t channel_linked_list_ptr, int num_recv_tokens,
+              int num_max_tokens_per_rank, int num_channels_per_sm,
+              int rows_per_channel, bool do_expand,
+              const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             self.launch_dispatch_forward_metadata(
+                 recv_topk_idx_ptr, recv_src_metadata_ptr,
+                 token_metadata_at_forward_ptr, channel_linked_list_ptr,
+                 num_recv_tokens, num_max_tokens_per_rank,
+                 num_channels_per_sm, rows_per_channel, do_expand,
+                 uccl_include_path, cuda_stream_ptr);
+           },
+           nb::arg("recv_topk_idx_ptr"),
+           nb::arg("recv_src_metadata_ptr"),
+           nb::arg("token_metadata_at_forward_ptr"),
+           nb::arg("channel_linked_list_ptr"),
+           nb::arg("num_recv_tokens"),
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm"),
+           nb::arg("rows_per_channel"),
+           nb::arg("do_expand"),
            nb::arg("uccl_include_path") = "",
            nb::arg("cuda_stream_ptr") = 0)
       .def("launch_combine_descriptors",

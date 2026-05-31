@@ -274,6 +274,62 @@ __global__ void v2_efa_dispatch_direct_enqueue_d2h_kernel(
   }
 }
 
+template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumTopk,
+          int kNumChannels>
+__global__ void v2_efa_dispatch_forward_metadata_kernel(
+    const int64_t* recv_topk_idx, const int32_t* recv_src_metadata,
+    int32_t* token_metadata_at_forward, int32_t* channel_linked_list,
+    int num_recv_tokens, int rows_per_channel, int scaleup_rank,
+    bool do_expand) {
+  constexpr int kMetadataDims = 2 + kNumTopk * 2;
+  constexpr int kRecvMetadataDims = 2 + kNumTopk;
+  static_assert(kNumChannels > 0, "invalid V2 dispatch channel count");
+  static_assert(kNumScaleupRanks > 0, "invalid V2 scale-up rank count");
+  (void)kNumScaleoutRanks;
+
+  const int total_rows = kNumChannels * rows_per_channel;
+  const int global_thread = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const int global_stride = static_cast<int>(gridDim.x * blockDim.x);
+
+  for (int flat_row = global_thread; flat_row < total_rows;
+       flat_row += global_stride) {
+    const int channel_idx = flat_row / rows_per_channel;
+    const int channel_row = flat_row - channel_idx * rows_per_channel;
+    const int token_row = channel_row * kNumChannels + channel_idx;
+
+    auto* metadata = token_metadata_at_forward + flat_row * kMetadataDims;
+    for (int i = 0; i < kMetadataDims; ++i) {
+      metadata[i] = -1;
+    }
+
+    auto* linked =
+        channel_linked_list + flat_row * kNumScaleupRanks;
+    for (int lane = 0; lane < kNumScaleupRanks; ++lane) {
+      linked[lane] = -1;
+    }
+
+    if (token_row >= num_recv_tokens || channel_row >= rows_per_channel - 1) {
+      continue;
+    }
+
+    const auto* src_metadata =
+        recv_src_metadata + token_row * kRecvMetadataDims;
+    metadata[0] = src_metadata[0];
+    metadata[1] = (token_row == num_recv_tokens - 1) ? 1 : 0;
+    for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
+      const int64_t local_expert =
+          __ldg(recv_topk_idx + token_row * kNumTopk + topk_slot);
+      if (local_expert < 0) {
+        continue;
+      }
+      metadata[2 + topk_slot] = scaleup_rank;
+      metadata[2 + kNumTopk + topk_slot] =
+          do_expand ? src_metadata[2 + topk_slot] : token_row;
+    }
+    linked[scaleup_rank] = token_row;
+  }
+}
+
 template <int kInstance>
 __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
     const DispatchSegmentDescriptor* segments,

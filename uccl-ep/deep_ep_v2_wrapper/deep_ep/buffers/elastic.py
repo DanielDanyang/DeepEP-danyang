@@ -528,6 +528,21 @@ class ElasticBuffer:
             str(uccl_include_path),
         )
 
+    def compile_dispatch_forward_metadata_jit(
+        self,
+        num_max_tokens_per_rank: Optional[int] = None,
+        num_channels_per_sm: int = 1,
+        uccl_include_path: str = "",
+    ):
+        tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        return self.runtime.compile_dispatch_forward_metadata_jit(
+            tokens,
+            int(num_channels_per_sm),
+            str(uccl_include_path),
+        )
+
     def build_combine_enqueue_d2h_jit_plan(self, uccl_include_path: str = ""):
         return self.runtime.build_combine_enqueue_d2h_jit_plan(str(uccl_include_path))
 
@@ -937,6 +952,48 @@ class ElasticBuffer:
             _cuda_stream_ptr(stream),
         )
 
+    def launch_dispatch_forward_metadata(
+        self,
+        recv_topk_idx: torch.Tensor,
+        recv_src_metadata: torch.Tensor,
+        token_metadata_at_forward: torch.Tensor,
+        channel_linked_list: torch.Tensor,
+        num_recv_tokens: int,
+        num_max_tokens_per_rank: int,
+        num_channels_per_sm: int,
+        rows_per_channel: int,
+        do_expand: bool,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        _require_cuda_contiguous(recv_topk_idx, "recv_topk_idx")
+        _require_cuda_contiguous(recv_src_metadata, "recv_src_metadata")
+        _require_cuda_contiguous(token_metadata_at_forward, "token_metadata_at_forward")
+        _require_cuda_contiguous(channel_linked_list, "channel_linked_list")
+        if recv_topk_idx.dtype != torch.int64:
+            raise TypeError("recv_topk_idx must be torch.int64")
+        if recv_src_metadata.dtype != torch.int32:
+            raise TypeError("recv_src_metadata must be torch.int32")
+        if token_metadata_at_forward.dtype != torch.int32:
+            raise TypeError("token_metadata_at_forward must be torch.int32")
+        if channel_linked_list.dtype != torch.int32:
+            raise TypeError("channel_linked_list must be torch.int32")
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_dispatch_forward_metadata(
+            int(recv_topk_idx.data_ptr()),
+            int(recv_src_metadata.data_ptr()),
+            int(token_metadata_at_forward.data_ptr()),
+            int(channel_linked_list.data_ptr()),
+            int(num_recv_tokens),
+            int(num_max_tokens_per_rank),
+            int(num_channels_per_sm),
+            int(rows_per_channel),
+            bool(do_expand),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
     def launch_combine_enqueue_d2h(
         self,
         segments: torch.Tensor,
@@ -1227,6 +1284,7 @@ class ElasticBuffer:
             recv_src_metadata,
             do_expand,
             num_experts,
+            num_max_tokens_per_rank,
         )
 
         if cumulative_local_expert_recv_stats is not None:
@@ -1479,6 +1537,7 @@ class ElasticBuffer:
                 handle.recv_src_metadata,
                 handle.do_expand,
                 handle.num_experts,
+                handle.num_max_tokens_per_rank,
             )[0]
         num_forward_rows = int(forward_metadata.numel() // forward_metadata.shape[-1])
         max_segments = max(1, int(num_forward_rows * handle.topk_idx.shape[1]))
@@ -1567,6 +1626,7 @@ class ElasticBuffer:
                 handle.recv_src_metadata,
                 handle.do_expand,
                 handle.num_experts,
+                handle.num_max_tokens_per_rank,
             )[0]
         forward_rows = forward_metadata.reshape(-1, forward_metadata.shape[-1])
         for row in range(int(forward_rows.shape[0])):
@@ -1617,47 +1677,46 @@ class ElasticBuffer:
         recv_src_metadata: torch.Tensor,
         do_expand: bool,
         num_experts: int,
+        num_max_tokens_per_rank: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        del num_experts
         num_recv = int(recv_src_metadata.shape[0])
         num_topk = int(recv_topk_idx.shape[1]) if recv_topk_idx.numel() else int(self.num_topk)
         dims = 2 + num_topk * 2
-        num_channels = max(1, int(self.num_sms) * max(1, self.num_scaleup_ranks))
+        num_channels_per_sm = max(1, self.num_scaleup_ranks)
+        num_channels = max(1, int(self.num_sms) * num_channels_per_sm)
         tokens_per_channel = max(1, (num_recv + num_channels - 1) // num_channels)
         rows_per_channel = max(1, self.num_scaleout_ranks) * tokens_per_channel + 1
-        metadata = torch.full(
+        metadata = torch.empty(
             (num_channels, rows_per_channel, dims),
-            -1,
             dtype=torch.int32,
             device=recv_src_metadata.device,
         )
-        channel_linked_list = torch.full(
+        channel_linked_list = torch.empty(
             (num_channels, rows_per_channel, max(1, self.num_scaleup_ranks)),
-            -1,
             dtype=torch.int32,
             device=recv_src_metadata.device,
         )
         if num_recv == 0:
+            metadata.fill_(-1)
+            channel_linked_list.fill_(-1)
             return metadata, channel_linked_list
 
-        num_experts_per_rank = max(1, int(num_experts) // self.num_ranks)
-        for row in range(num_recv):
-            channel_idx = row % num_channels
-            channel_row = row // num_channels
-            if channel_row >= rows_per_channel - 1:
-                break
-            dst = metadata[channel_idx, channel_row]
-            dst[0] = recv_src_metadata[row, 0].to(torch.int32)
-            dst[1] = 1 if row == num_recv - 1 else 0
-            for topk_slot in range(num_topk):
-                local_expert = int(recv_topk_idx[row, topk_slot].item())
-                if local_expert < 0:
-                    continue
-                dst[2 + topk_slot] = local_expert // num_experts_per_rank
-                if do_expand:
-                    dst[2 + num_topk + topk_slot] = recv_src_metadata[row, 2 + topk_slot]
-                else:
-                    dst[2 + num_topk + topk_slot] = row
-            channel_linked_list[channel_idx, channel_row, self.scaleup_rank_idx] = row
+        self.launch_dispatch_forward_metadata(
+            recv_topk_idx=recv_topk_idx,
+            recv_src_metadata=recv_src_metadata,
+            token_metadata_at_forward=metadata,
+            channel_linked_list=channel_linked_list,
+            num_recv_tokens=num_recv,
+            num_max_tokens_per_rank=(
+                self.num_max_tokens_per_rank
+                if num_max_tokens_per_rank is None
+                else int(num_max_tokens_per_rank)
+            ),
+            num_channels_per_sm=num_channels_per_sm,
+            rows_per_channel=rows_per_channel,
+            do_expand=do_expand,
+        )
         return metadata, channel_linked_list
 
     def _make_combine_window_layout(
