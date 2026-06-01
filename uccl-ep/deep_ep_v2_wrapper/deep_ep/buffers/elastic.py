@@ -142,6 +142,7 @@ class ElasticBuffer:
         self._v2_efa_window: Optional[torch.Tensor] = None
         self._v2_efa_connection = None
         self._v2_efa_window_bytes = 0
+        self._v2_efa_num_lanes = 1
 
     def _make_runtime(
         self,
@@ -408,6 +409,7 @@ class ElasticBuffer:
         self._v2_efa_window = window
         self._v2_efa_connection = connection
         self._v2_efa_window_bytes = int(bytes_in_window if num_bytes is None else num_bytes)
+        self._v2_efa_num_lanes = int(max(1, num_lanes))
         return local_info
 
     def _require_v2_efa_window(self, required_bytes: int) -> torch.Tensor:
@@ -480,6 +482,7 @@ class ElasticBuffer:
             "descriptor_batched": True,
             "max_batches": int(max_batches),
             "done_signal_index": int(max_batches),
+            "num_efa_lanes": int(max(1, self._v2_efa_num_lanes)),
             "src_payload_bytes": src_bytes,
             "remote_payload_bytes": remote_payload_bytes,
             "total_window_bytes": total_bytes,
@@ -641,6 +644,7 @@ class ElasticBuffer:
             int(layout.get("source_signal_stride", 0)),
             int(layout.get("token_record_bytes", 0)),
             int(layout.get("signal_stride", 4)),
+            int(layout.get("num_efa_lanes", 1)),
             str(uccl_include_path),
             _cuda_stream_ptr(stream),
         )

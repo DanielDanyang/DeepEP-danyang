@@ -37,12 +37,14 @@ struct V2VerbsLocalWindow {
   uint64_t base = 0;
   uint64_t bytes = 0;
   uint32_t lkey = 0;
+  std::vector<uint32_t> lkeys_by_lane;
 };
 
 struct V2VerbsSignalScratch {
   uint32_t* values = nullptr;
   uint64_t capacity = 0;
   uint32_t lkey = 0;
+  std::vector<uint32_t> lkeys_by_lane;
 };
 
 struct V2VerbsEndpoint {
@@ -122,7 +124,8 @@ class V2EfaVerbsPostSink final : public EfaPostSink {
       check_v2_verbs_range("local", op.local_offset, op.bytes,
                            local_window_.bytes);
       post_write(endpoint, local_window_.base + op.local_offset,
-                 local_window_.lkey, endpoint.remote_base + op.remote_offset,
+                 local_lkey(endpoint.lane),
+                 endpoint.remote_base + op.remote_offset,
                  endpoint.remote_rkey, op.bytes);
       stats_.posted_writes += 1;
       stats_.posted_bytes += op.bytes;
@@ -135,7 +138,8 @@ class V2EfaVerbsPostSink final : public EfaPostSink {
       post_write(endpoint,
                  reinterpret_cast<uint64_t>(signal_scratch_.values +
                                             scratch_idx),
-                 signal_scratch_.lkey, endpoint.remote_base + op.remote_offset,
+                 signal_lkey(endpoint.lane),
+                 endpoint.remote_base + op.remote_offset,
                  endpoint.remote_rkey, sizeof(uint32_t));
       stats_.posted_signals += 1;
       stats_.posted_bytes += sizeof(uint32_t);
@@ -167,6 +171,20 @@ class V2EfaVerbsPostSink final : public EfaPostSink {
           "V2 EFA signal scratch exhausted before completion polling");
     }
     return next_signal_scratch_++;
+  }
+
+  uint32_t local_lkey(uint32_t lane) const {
+    if (!local_window_.lkeys_by_lane.empty()) {
+      return local_window_.lkeys_by_lane.at(lane);
+    }
+    return local_window_.lkey;
+  }
+
+  uint32_t signal_lkey(uint32_t lane) const {
+    if (!signal_scratch_.lkeys_by_lane.empty()) {
+      return signal_scratch_.lkeys_by_lane.at(lane);
+    }
+    return signal_scratch_.lkey;
   }
 
   void post_write(const V2VerbsEndpoint& endpoint, uint64_t local_addr,

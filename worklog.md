@@ -2579,3 +2579,41 @@ README 风格 EP8x2 性能：
   - 若要继续接近 README SM90 EP16，需要把 dispatch payload 按 V2 semantic
     batch/slot 分到多 EFA lane/NIC，而不是所有 remote payload 都落在
     `layout.efa_lane == 0` 的单通道上。
+
+## 2026-06-01 dispatch EFA lane 主路径
+
+- 先修正主路径 lane 语义：
+  - `DispatchTransferLayout` 增加 `num_efa_lanes`；
+  - dispatch payload 和对应 batch count signal 使用同一个
+    `expert_id % num_efa_lanes` lane；
+  - done signal 仍使用 lane0，只作为 “该 source 已经发完 command” 的门闩；
+  - receiver 仍等待每个 source 的 count table 总和达到 done 携带的
+    expected count，因此 done 先到不会让 receiver 过早 materialize。
+- 第一版 `lanes=2` 只是在同一个 EFA device 上创建多个 QP：
+  - EP16 correctness 通过；
+  - 但 `experts=256 topk=8 tokens=1024 hidden=1024` 下，
+    `lanes=1` 为 `avg_us=10033.69 payload_GBps=1.67`，
+    `lanes=2` 为 `avg_us=10220.51 payload_GBps=1.64`；
+  - 结论：同 NIC 多 QP 对当前瓶颈帮助很小，必须让 lane 对应不同 EFA NIC。
+- 第二版把 `V2EfaConnection` 改成每个 lane 打开一个 EFA device：
+  - 默认 Python device 选择仍是 `device_index = local_rank * 2`；
+  - `num_lanes=2` 时每个 GPU rank 使用 `base_device` 和 `base_device + 1`，
+    整机 EP8 会覆盖 16 个 EFA device；
+  - 每个 lane 独立 `ibv_context / PD / CQ / MR / signal MR / SRD QP`；
+  - `local_info["lanes"]` 交换每 lane 的 `device_name / qpn / rkey / lkey / gid`；
+  - verbs sink 按 command 的 `target_lane` 选择对应 lane 的 local lkey 和
+    signal lkey；
+  - completion polling 轮询所有 lane 的 CQ。
+- 多 NIC lane correctness：
+  - EP16 remote-pair `--lanes 2` 通过；
+  - rank0 单进程 smoke 显示 lane 设备为 `rdmap85s0` 和 `rdmap86s0`。
+- 多 NIC lane small bench：
+  - `experts=256 topk=8 tokens=1024 hidden=1024 sms=8`
+  - `lanes=1`: `avg_us=10033.69 payload_GBps=1.67`,
+    `completion_wait_ms=0.94`
+  - `lanes=2`: `avg_us=9873.97 payload_GBps=1.70`,
+    `completion_wait_ms=0.55`
+  - 结论：真正多 NIC lane 已经降低 completion wait，但端到端只小幅改善；
+    现在更大的问题仍然是 staging/window layout 和 descriptor/materialize 路径：
+    当前临时 record window 按 `world_size * tokens * topk` 为每个 source 预留空间，
+    在 README-size `topk=8` 时会膨胀到每 rank 十几 GB，不是最终 native V2 layout。

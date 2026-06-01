@@ -80,6 +80,7 @@ struct DispatchTransferLayout {
   uint32_t num_ranks = 0;
   uint32_t source_rank = 0;
   uint32_t efa_lane = 0;
+  uint32_t num_efa_lanes = 1;
   uint32_t max_batches = 0;
   int32_t skip_scaleout_rank = -1;
 };
@@ -259,8 +260,11 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_payload_cmd(
                     layout.num_scaleup_ranks +
                 static_cast<uint32_t>(segment.dst_scaleup_lane)
           : static_cast<uint32_t>(segment.dst_scaleout_rank);
+  const uint32_t num_efa_lanes =
+      layout.num_efa_lanes == 0 ? 1u : layout.num_efa_lanes;
   const uint32_t efa_lane =
-      use_global_rank ? layout.efa_lane
+      use_global_rank ? (static_cast<uint32_t>(segment.expert_id) %
+                         num_efa_lanes)
                       : static_cast<uint32_t>(segment.dst_scaleup_lane);
   return make_v2_transfer_cmd(
       V2TransferCmdKind::kDispatchPayload,
@@ -288,8 +292,11 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_signal_cmd(
                     layout.num_scaleup_ranks +
                 static_cast<uint32_t>(batch.dst_scaleup_lane)
           : static_cast<uint32_t>(batch.dst_scaleout_rank);
+  const uint32_t num_efa_lanes =
+      layout.num_efa_lanes == 0 ? 1u : layout.num_efa_lanes;
   const uint32_t efa_lane =
-      use_global_rank ? layout.efa_lane
+      use_global_rank ? (static_cast<uint32_t>(batch.expert_id) %
+                         num_efa_lanes)
                       : static_cast<uint32_t>(batch.dst_scaleup_lane);
   return make_v2_transfer_cmd(
       V2TransferCmdKind::kDispatchSignal,
