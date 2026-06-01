@@ -311,9 +311,10 @@ inline V2EfaJitLaunchPlan build_v2_efa_dispatch_materialize_records_jit_plan(
   }
 
   const int hidden_bytes = config.hidden * config.elem_bytes;
+  const int world_size = config.num_scaleout_ranks * config.num_scaleup_ranks;
   V2EfaJitLaunchPlan plan;
   plan.name = "v2_efa_dispatch_materialize_records";
-  plan.grid_dim_x = config.num_sms;
+  plan.grid_dim_x = std::max(1, world_size * config.num_experts);
   plan.grid_dim_y = 1;
   plan.num_threads = 256;
   plan.smem_bytes = 0;

@@ -467,64 +467,70 @@ __global__ void v2_efa_dispatch_materialize_records_kernel(
   const int global_thread =
       static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
   const int global_stride = static_cast<int>(gridDim.x * blockDim.x);
-  const int total_slots =
-      num_sources * max_batches * num_max_tokens_per_rank;
+  (void)global_thread;
+  (void)global_stride;
   const int world_size = num_sources > 0 ? num_sources : 1;
   const int experts_per_rank = num_experts / world_size;
   const int num_local_experts = experts_per_rank > 0 ? experts_per_rank : 1;
   const int local_expert_begin = rank * num_local_experts;
   const int local_expert_end = local_expert_begin + num_local_experts;
 
-  for (int linear = global_thread; linear < total_slots;
-       linear += global_stride) {
-    const int slot = linear % num_max_tokens_per_rank;
-    const int batch_linear = linear / num_max_tokens_per_rank;
+  const int total_batches = num_sources * max_batches;
+  for (int batch_linear = static_cast<int>(blockIdx.x);
+       batch_linear < total_batches; batch_linear += static_cast<int>(gridDim.x)) {
     const int batch = batch_linear % max_batches;
     const int source = batch_linear / max_batches;
     const int count = __ldg(batch_counts + source * max_batches + batch);
     const int out_begin = __ldg(batch_offsets + source * max_batches + batch);
-    if (count <= 0 || out_begin < 0 || slot >= count) {
+    if (count <= 0 || out_begin < 0) {
       continue;
     }
 
-    const int out_row = out_begin + slot;
-    int source_local_slot = slot;
+    int source_batch_begin = 0;
     for (int prev_batch = 0; prev_batch < batch; ++prev_batch) {
       const int prev_count =
           __ldg(batch_counts + source * max_batches + prev_batch);
-      source_local_slot += prev_count > 0 ? prev_count : 0;
-    }
-    const uint64_t record_offset =
-        layout.remote_payload_base +
-        static_cast<uint64_t>(source) * layout.source_rank_stride +
-        static_cast<uint64_t>(source_local_slot) * layout.expanded_slot_stride;
-    const auto* record = window + record_offset;
-    auto* dst_payload = recv_x + static_cast<uint64_t>(out_row) * kHiddenBytes;
-    const auto* src_payload = record + layout.record_payload_offset;
-    detail::copy_payload_16b<kHiddenBytes>(dst_payload, src_payload);
-
-    const auto src_global_ptr = reinterpret_cast<const int32_t*>(
-        record + layout.record_src_global_offset);
-    recv_src_global[out_row] = *src_global_ptr;
-
-    const auto topk_ptr = reinterpret_cast<const int64_t*>(
-        record + layout.record_topk_idx_offset);
-    for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
-      const int64_t raw_expert = topk_ptr[topk_slot];
-      int64_t local_expert = -1;
-      if (raw_expert >= local_expert_begin && raw_expert < local_expert_end) {
-        local_expert = raw_expert - local_expert_begin;
-      }
-      recv_topk_idx[out_row * kNumTopk + topk_slot] = local_expert;
+      source_batch_begin += prev_count > 0 ? prev_count : 0;
     }
 
-    if (has_topk_weight && recv_topk_weights != nullptr &&
-        layout.record_topk_weight_bytes != 0) {
-      const auto weight_ptr = reinterpret_cast<const float*>(
-          record + layout.record_topk_weight_offset);
+    for (int slot = static_cast<int>(threadIdx.x); slot < count;
+         slot += static_cast<int>(blockDim.x)) {
+      const int out_row = out_begin + slot;
+      const int source_local_slot = source_batch_begin + slot;
+      const uint64_t record_offset =
+          layout.remote_payload_base +
+          static_cast<uint64_t>(source) * layout.source_rank_stride +
+          static_cast<uint64_t>(source_local_slot) *
+              layout.expanded_slot_stride;
+      const auto* record = window + record_offset;
+      auto* dst_payload =
+          recv_x + static_cast<uint64_t>(out_row) * kHiddenBytes;
+      const auto* src_payload = record + layout.record_payload_offset;
+      detail::copy_payload_16b<kHiddenBytes>(dst_payload, src_payload);
+
+      const auto src_global_ptr = reinterpret_cast<const int32_t*>(
+          record + layout.record_src_global_offset);
+      recv_src_global[out_row] = *src_global_ptr;
+
+      const auto topk_ptr = reinterpret_cast<const int64_t*>(
+          record + layout.record_topk_idx_offset);
       for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
-        recv_topk_weights[out_row * kNumTopk + topk_slot] =
-            weight_ptr[topk_slot];
+        const int64_t raw_expert = topk_ptr[topk_slot];
+        int64_t local_expert = -1;
+        if (raw_expert >= local_expert_begin && raw_expert < local_expert_end) {
+          local_expert = raw_expert - local_expert_begin;
+        }
+        recv_topk_idx[out_row * kNumTopk + topk_slot] = local_expert;
+      }
+
+      if (has_topk_weight && recv_topk_weights != nullptr &&
+          layout.record_topk_weight_bytes != 0) {
+        const auto weight_ptr = reinterpret_cast<const float*>(
+            record + layout.record_topk_weight_offset);
+        for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
+          recv_topk_weights[out_row * kNumTopk + topk_slot] =
+              weight_ptr[topk_slot];
+        }
       }
     }
   }

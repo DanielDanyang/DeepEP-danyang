@@ -2703,3 +2703,28 @@ README 风格 EP8x2 性能：
   - receiver materialize 仍从 host-visible window copy 回 GPU output，
     `materialize_records_ms` 约 `0.85ms`；
   - prepare 阶段仍是 `experts * routes` 扫描，只是已经从 pack 中解耦出来。
+
+## 2026-06-01 dispatch materialize 与 CQE 优化
+
+- 将 receiver materialize 从 “遍历所有
+  `num_sources * max_batches * num_max_tokens_per_rank` slot” 改为
+  “一个 CUDA block 负责一个 `(source, expert batch)`，只处理该 batch 的
+  `count` 个有效 token”：
+  - 这个改动保持 V2 semantic batch 语义，不引入 fallback；
+  - EP16 remote-pair `--lanes 2` correctness 通过；
+  - `experts=256 topk=8 tokens=1024 hidden=1024 sms=8 lanes=2`
+    复测结果：
+    `avg_us=5774.03 payload_GBps=2.91 record_GBps=3.06`，
+    `descriptor_enqueue_ms=1.23`，
+    `completion_wait_ms=0.55`，
+    `signal_offsets_ms=0.30`，
+    `materialize_records_ms=0.41`。
+  - 相比三段 pipeline 初版，materialize 从约 `0.85ms` 降到约 `0.41ms`。
+- 下一步已在代码中开始但尚未服务器 correctness 验证：
+  - payload RDMA write 不再 `IBV_SEND_SIGNALED`；
+  - signal RDMA write 保持 signaled；
+  - stats 增加 `posted_completions`，Python completion wait 等待真实 CQE 数；
+  - 服务器 build 已通过，但准备跑 correctness 时两台机器出现
+    `sglang::scheduler_TP*` GPU 进程，按 AGENTS 约束立即停止所有服务器操作；
+  - 因此 signal-only CQE 改动当前是未验证状态，恢复验证时第一步应跑
+    EP16 remote-pair correctness。
