@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -696,8 +697,9 @@ class ElasticBuffer:
         )
         token_record_bytes = _align(record_end, 16)
         src_bytes = _align(int(num_tokens) * int(token_record_bytes), 64)
+        max_records_per_source = int(num_max_tokens_per_rank) * int(self.num_topk)
         batch_payload_stride = _align(int(num_max_tokens_per_rank) * int(token_record_bytes), 64)
-        source_rank_stride = _align(int(max_batches) * batch_payload_stride, 64)
+        source_rank_stride = _align(max_records_per_source * int(token_record_bytes), 64)
         remote_payload_bytes = int(self.num_ranks) * source_rank_stride
         remote_payload_base = src_bytes
         remote_signal_base = _align(remote_payload_base + remote_payload_bytes, 64)
@@ -721,10 +723,25 @@ class ElasticBuffer:
             "record_topk_weight_offset": int(record_topk_weight_offset),
             "record_topk_weight_bytes": int(record_topk_weight_bytes),
             "descriptor_batched": True,
+            "max_batches": int(max_batches),
             "src_payload_bytes": src_bytes,
             "remote_payload_bytes": remote_payload_bytes,
             "total_window_bytes": total_bytes,
         }
+
+    def _clear_dispatch_receive_window(self, layout: dict) -> None:
+        if self._v2_efa_window is None:
+            return
+        remote_payload_base = int(layout["remote_payload_base"])
+        remote_payload_bytes = int(layout["remote_payload_bytes"])
+        remote_signal_base = int(layout["remote_signal_base"])
+        signal_bytes = int(self.num_ranks) * int(layout["source_signal_stride"])
+        window = self._require_v2_efa_window(
+            max(remote_payload_base + remote_payload_bytes,
+                remote_signal_base + signal_bytes)
+        )
+        window[remote_payload_base: remote_payload_base + remote_payload_bytes].zero_()
+        window[remote_signal_base: remote_signal_base + signal_bytes].zero_()
 
     def _stage_dispatch_records_to_v2_window(
         self,
@@ -1466,6 +1483,8 @@ class ElasticBuffer:
 
         if topk_idx is None:
             raise ValueError("topk_idx is required for uncached native V2 dispatch")
+        if self._v2_efa_connection is None:
+            raise RuntimeError("native V2 dispatch requires init_native_v2_efa_transport()")
         _require_cuda_contiguous(topk_idx, "topk_idx")
         if topk_idx.dtype != torch.int64:
             raise TypeError("topk_idx must be torch.int64")
@@ -1506,15 +1525,13 @@ class ElasticBuffer:
         )
 
         recv_x, recv_sf, recv_topk_idx, recv_topk_weights, recv_src_global, recv_counts = (
-            self._semantic_dispatch_data(x_tensor, sf, topk_idx, topk_weights,
-                                         num_max_tokens_per_rank, num_experts)
-        )
-        self._overlay_native_dispatch_payload_from_window(
-            recv_x,
-            recv_src_global,
-            transport,
-            num_max_tokens_per_rank,
-            payload_bytes,
+            self._materialize_native_dispatch_from_window(
+                transport,
+                x_tensor,
+                topk_weights,
+                num_experts,
+                num_max_tokens_per_rank,
+            )
         )
         num_recv_tokens = int(sum(recv_counts))
         recv_src_metadata, dst_buffer_slot_idx, psum_scaleup, psum_expert, expert_counts = (
@@ -1647,6 +1664,9 @@ class ElasticBuffer:
                 num_topk=int(topk_idx.shape[1]),
                 has_topk_weight=has_topk_weight,
             )
+            self._clear_dispatch_receive_window(layout)
+            torch.cuda.current_stream().synchronize()
+            dist.barrier(group=self.group)
             self._stage_dispatch_records_to_v2_window(
                 x_tensor,
                 topk_idx,
@@ -1701,6 +1721,8 @@ class ElasticBuffer:
         dispatch_drain_stats = None
         if self._v2_efa_connection is not None:
             dispatch_drain_stats = self._v2_efa_connection.drain_queue(queue, True, True)
+            self._wait_native_v2_efa_completions(dispatch_drain_stats)
+            dist.barrier(group=self.group)
         return V2TransportHandle(
             dispatch_segments=segments,
             dispatch_batches=batches,
@@ -1721,47 +1743,130 @@ class ElasticBuffer:
             dispatch_drain_stats=dispatch_drain_stats,
         )
 
-    def _overlay_native_dispatch_payload_from_window(
+    def _wait_native_v2_efa_completions(self, stats: Optional[dict]) -> None:
+        if self._v2_efa_connection is None or stats is None:
+            return
+        expected = int(stats.get("posted_writes", 0)) + int(stats.get("posted_signals", 0))
+        seen = 0
+        for _ in range(10000):
+            seen += int(self._v2_efa_connection.poll_completions(max(1, expected - seen)))
+            if seen >= expected:
+                return
+            time.sleep(0.0005)
+        raise TimeoutError(f"timed out waiting for {expected} V2 EFA completions, saw {seen}")
+
+    def _native_dispatch_batch_counts_from_window(
         self,
-        recv_x: torch.Tensor,
-        recv_src_global: torch.Tensor,
-        transport: V2TransportHandle,
-        num_max_tokens_per_rank: int,
-        payload_bytes: int,
-    ) -> None:
-        """Replace remote dispatch payload rows with bytes delivered by EFA.
-
-        This is an incremental bridge toward native V2 receiver consumption.
-        Ordering and metadata still come from the semantic reference path, but
-        remote scaleout payload bytes are read from the registered V2 RDMA
-        window at the offsets used by the direct enqueue kernel.
-        """
-
-        if self._v2_efa_connection is None or self._v2_efa_window is None:
-            return
-        if transport.dispatch_drain_stats is None:
-            return
-        if int(transport.dispatch_drain_stats.get("posted_writes", 0)) == 0:
-            return
-        layout = transport.dispatch_layout or {}
-        if bool(layout.get("descriptor_batched", False)) and int(recv_x.shape[0]) != 1:
-            return
-        remote_payload_base = int(layout.get("remote_payload_base", 0))
-        expanded_slot_stride = int(layout.get("expanded_slot_stride", payload_bytes))
-        window = self._require_v2_efa_window(
-            remote_payload_base + int(num_max_tokens_per_rank) * expanded_slot_stride
+        layout: dict,
+    ) -> Tuple[torch.Tensor, torch.Tensor, list, int]:
+        if self._v2_efa_window is None:
+            raise RuntimeError("native V2 EFA window is not initialized")
+        max_batches = int(layout["max_batches"])
+        source_signal_stride = int(layout["source_signal_stride"])
+        signal_base = int(layout["remote_signal_base"])
+        signal_bytes = int(self.num_ranks) * source_signal_stride
+        signal_cpu = (
+            self._v2_efa_window[signal_base: signal_base + signal_bytes]
+            .detach()
+            .cpu()
+            .numpy()
+            .tobytes()
         )
+        counts = []
+        offsets = []
+        recv_counts = []
+        running = 0
+        for src_rank in range(int(self.num_ranks)):
+            row_counts = []
+            row_offsets = []
+            src_total = 0
+            for batch_idx in range(max_batches):
+                byte_offset = src_rank * source_signal_stride + batch_idx * 4
+                count = int.from_bytes(
+                    signal_cpu[byte_offset: byte_offset + 4],
+                    byteorder="little",
+                    signed=False,
+                )
+                row_counts.append(count)
+                if count > 0:
+                    row_offsets.append(running)
+                    running += count
+                    src_total += count
+                else:
+                    row_offsets.append(-1)
+            counts.append(row_counts)
+            offsets.append(row_offsets)
+            recv_counts.append(src_total)
+        device = self._v2_efa_window.device
+        counts_tensor = torch.tensor(counts, dtype=torch.int32, device=device)
+        offsets_tensor = torch.tensor(offsets, dtype=torch.int32, device=device)
+        return counts_tensor, offsets_tensor, recv_counts, running
 
-        for row in range(int(recv_x.shape[0])):
-            src_global = int(recv_src_global[row].item())
-            src_rank = src_global // int(num_max_tokens_per_rank)
-            src_scaleout_rank = src_rank // self.num_scaleup_ranks
-            if src_scaleout_rank == self.scaleout_rank_idx:
-                continue
-            src_token = src_global % int(num_max_tokens_per_rank)
-            offset = remote_payload_base + src_token * expanded_slot_stride
-            row_bytes = recv_x[row].reshape(-1).view(torch.uint8)
-            row_bytes.copy_(window[offset: offset + int(payload_bytes)])
+    def _materialize_native_dispatch_from_window(
+        self,
+        transport: V2TransportHandle,
+        x_tensor: torch.Tensor,
+        topk_weights: Optional[torch.Tensor],
+        num_experts: int,
+        num_max_tokens_per_rank: int,
+    ):
+        if self._v2_efa_connection is None or self._v2_efa_window is None:
+            raise RuntimeError("native V2 EFA transport has not been initialized")
+        layout = transport.dispatch_layout
+        batch_counts, batch_offsets, recv_counts, num_recv_tokens = (
+            self._native_dispatch_batch_counts_from_window(layout)
+        )
+        recv_x = torch.empty(
+            (max(1, num_recv_tokens), int(x_tensor.shape[1])),
+            dtype=x_tensor.dtype,
+            device=x_tensor.device,
+        )
+        recv_topk_idx = torch.empty(
+            (max(1, num_recv_tokens), int(self.num_topk)),
+            dtype=torch.int64,
+            device=x_tensor.device,
+        )
+        recv_topk_weights = None
+        if topk_weights is not None:
+            recv_topk_weights = torch.empty(
+                (max(1, num_recv_tokens), int(self.num_topk)),
+                dtype=torch.float32,
+                device=x_tensor.device,
+            )
+        recv_src_global = torch.empty(
+            (max(1, num_recv_tokens),),
+            dtype=torch.int32,
+            device=x_tensor.device,
+        )
+        if num_recv_tokens == 0:
+            recv_x.zero_()
+            recv_topk_idx.fill_(-1)
+            if recv_topk_weights is not None:
+                recv_topk_weights.zero_()
+            recv_src_global.zero_()
+            return recv_x[:0], None, recv_topk_idx[:0], recv_topk_weights, recv_src_global[:0], recv_counts
+
+        self.launch_dispatch_materialize_records(
+            batch_counts=batch_counts,
+            batch_offsets=batch_offsets,
+            recv_x=recv_x,
+            recv_topk_idx=recv_topk_idx,
+            recv_topk_weights=recv_topk_weights,
+            recv_src_global=recv_src_global,
+            layout=layout,
+            max_batches=int(layout["max_batches"]),
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            has_topk_weight=topk_weights is not None,
+        )
+        torch.cuda.current_stream().synchronize()
+        return (
+            recv_x[:num_recv_tokens],
+            None,
+            recv_topk_idx[:num_recv_tokens],
+            None if recv_topk_weights is None else recv_topk_weights[:num_recv_tokens],
+            recv_src_global[:num_recv_tokens],
+            recv_counts,
+        )
 
     def _launch_native_combine_transport(self, x: torch.Tensor, handle: EPHandle) -> None:
         transport = handle.transport_handle
@@ -1938,76 +2043,6 @@ class ElasticBuffer:
             combined_x[token].reshape(-1).view(torch.uint8).copy_(
                 window[offset: offset + payload_bytes]
             )
-
-    def _semantic_dispatch_data(
-        self,
-        x: torch.Tensor,
-        sf: Optional[torch.Tensor],
-        topk_idx: torch.Tensor,
-        topk_weights: Optional[torch.Tensor],
-        num_max_tokens_per_rank: int,
-        num_experts: int,
-    ):
-        num_tokens, hidden = x.shape
-        num_topk = topk_idx.shape[1]
-        num_experts_per_rank = num_experts // self.num_ranks
-        weights = topk_weights
-        if weights is None:
-            weights = torch.zeros((num_tokens, num_topk), dtype=torch.float32, device=x.device)
-
-        send_x, send_sf, send_idx, send_w, send_src = [], [], [], [], []
-        send_counts = torch.zeros((self.num_ranks,), dtype=torch.int32, device=x.device)
-        for dst in range(self.num_ranks):
-            begin = dst * num_experts_per_rank
-            end = begin + num_experts_per_rank
-            mask = ((topk_idx >= begin) & (topk_idx < end)).any(dim=1)
-            indices = mask.nonzero(as_tuple=True)[0]
-            send_counts[dst] = indices.numel()
-            send_x.append(x[indices])
-            if sf is not None:
-                send_sf.append(sf[indices])
-            raw_idx = topk_idx[indices]
-            send_idx.append(torch.where((raw_idx >= begin) & (raw_idx < end),
-                                        raw_idx, torch.full_like(raw_idx, -1)))
-            send_w.append(weights[indices])
-            send_src.append(indices.to(torch.int32) + self.rank_idx * num_max_tokens_per_rank)
-
-        recv_counts = torch.empty_like(send_counts)
-        dist.all_to_all_single(recv_counts, send_counts, group=self.group)
-        send_counts_l = [int(v) for v in send_counts.cpu().tolist()]
-        recv_counts_l = [int(v) for v in recv_counts.cpu().tolist()]
-        num_recv = sum(recv_counts_l)
-
-        send_x_t = torch.cat(send_x, dim=0) if send_x else x[:0]
-        recv_x = torch.empty((num_recv, hidden), dtype=x.dtype, device=x.device)
-        dist.all_to_all_single(recv_x, send_x_t, recv_counts_l, send_counts_l, group=self.group)
-
-        recv_sf = None
-        if sf is not None:
-            send_sf_t = torch.cat(send_sf, dim=0) if send_sf else sf[:0]
-            recv_sf = torch.empty((num_recv, sf.shape[1]), dtype=sf.dtype, device=sf.device)
-            dist.all_to_all_single(recv_sf, send_sf_t, recv_counts_l, send_counts_l, group=self.group)
-
-        send_idx_t = torch.cat(send_idx, dim=0) if send_idx else topk_idx[:0]
-        recv_idx = torch.empty((num_recv, num_topk), dtype=topk_idx.dtype, device=topk_idx.device)
-        dist.all_to_all_single(recv_idx, send_idx_t, recv_counts_l, send_counts_l, group=self.group)
-
-        send_w_t = torch.cat(send_w, dim=0) if send_w else weights[:0]
-        recv_w = torch.empty((num_recv, num_topk), dtype=weights.dtype, device=weights.device)
-        dist.all_to_all_single(recv_w, send_w_t, recv_counts_l, send_counts_l, group=self.group)
-
-        send_src_t = torch.cat(send_src, dim=0) if send_src else torch.empty((0,), dtype=torch.int32, device=x.device)
-        recv_src = torch.empty((num_recv,), dtype=torch.int32, device=x.device)
-        dist.all_to_all_single(recv_src, send_src_t, recv_counts_l, send_counts_l, group=self.group)
-
-        local_begin = self.rank_idx * num_experts_per_rank
-        local_end = local_begin + num_experts_per_rank
-        mask = (recv_idx >= local_begin) & (recv_idx < local_end)
-        recv_idx = recv_idx - local_begin
-        recv_idx.masked_fill_(~mask, -1)
-        if topk_weights is None:
-            recv_w = None
-        return recv_x, recv_sf, recv_idx, recv_w, recv_src, recv_counts_l
 
     def _build_v2_dispatch_metadata(
         self,

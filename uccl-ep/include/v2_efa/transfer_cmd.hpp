@@ -245,6 +245,11 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_payload_cmd(
   const uint64_t source_payload_base =
       layout.remote_payload_base +
       static_cast<uint64_t>(layout.source_rank) * layout.source_rank_stride;
+  const uint64_t batch_payload_base =
+      source_payload_base +
+      (layout.token_record_bytes != 0
+           ? 0
+           : static_cast<uint64_t>(batch_idx) * layout.batch_payload_stride);
   const bool use_global_rank = layout.num_scaleup_ranks != 0;
   const uint32_t dst_global_rank =
       use_global_rank
@@ -264,10 +269,8 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_payload_cmd(
       /*signal_value=*/0,
       layout.local_payload_base +
           static_cast<uint64_t>(segment.src_token_begin) * src_stride,
-      source_payload_base +
-          static_cast<uint64_t>(batch_idx) * layout.batch_payload_stride +
-          static_cast<uint64_t>(segment.expanded_slot_begin) *
-              expanded_stride);
+      batch_payload_base + static_cast<uint64_t>(segment.expanded_slot_begin) *
+                               expanded_stride);
 }
 
 V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_signal_cmd(

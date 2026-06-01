@@ -2145,3 +2145,56 @@ README 风格 EP8x2 性能：
   - 本地 C++ dispatch plan test 通过；
   - 服务器空闲检查通过后同步到 EFS；
   - `p5en_0` 上 `make -j8` 通过，确认新增 nanobind/JIT symbol 编译可过。
+
+## 2026-06-01 dispatch native receiver 接入与独立 smoke/bench
+
+- `ElasticBuffer.dispatch()` 的 native-EFA 分支已改为：
+  1. 清空本 rank receive window；
+  2. staging 本 rank V2 token records；
+  3. descriptor enqueue 生成 `V2TransferCmd`；
+  4. CPU proxy drain EFA writes/signals；
+  5. receiver 从 signal 区读取 `batch_counts`，构造 `batch_offsets`；
+  6. `v2_efa_dispatch_materialize_records_kernel` 从 RDMA window 直接生成
+     `recv_x` / `recv_topk_idx` / `recv_topk_weights` / `recv_src_global`；
+  7. 复用 V2 metadata JIT 生成 `recv_src_metadata`、`dst_buffer_slot_idx`、
+     `token_metadata_at_forward`、`channel_linked_list`。
+- 已删除 dispatch 生产路径里的 `_semantic_dispatch_data` 和 dispatch overlay helper；
+  没有 native EFA transport 时 `dispatch()` 直接报错，避免继续悄悄跑 semantic
+  all-to-all。
+- 为了让 README 尺寸有继续扩展空间，dispatch receive window 改为每个 source rank 一段
+  compact token-record 区：
+  - payload 不再按 `num_batches * num_max_tokens` 预留；
+  - `DispatchExpertBatch.reserved` 记录 batch 在 source compact record 区里的起点；
+  - signal/count 表仍按 batch 保存，receiver materialize 时用 count 前缀找 compact
+    record slot。
+- 新增测试脚本：
+  - `uccl-ep/tests/v2_efa_dispatch_only_smoke.py`
+  - `uccl-ep/tests/v2_efa_dispatch_only_bench.py`
+- 本地验证：
+  - `python3 -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py
+    uccl-ep/tests/v2_efa_dispatch_only_smoke.py
+    uccl-ep/tests/v2_efa_dispatch_only_bench.py` 通过；
+  - C++ dispatch plan test 通过；
+  - `git diff --check -- uccl-ep worklog.md` 通过。
+- 服务器验证：
+  - 每次运行前均检查 `p5en_0` / `p5en_1`，未看到 compute process；
+  - EP1x2 dispatch-only smoke 通过：
+    - rank0 收到 rank1 payload `[64,65,66,67,...]`、`idx=[0]`、
+      `weight=1.25`、`src=[4]`；
+    - rank1 收到 rank0 payload `[0,1,2,3,...]`、`idx=[0]`、
+      `weight=0.25`、`src=[0]`；
+    - 两边 dispatch stats: `drained_commands=2, posted_writes=1,
+      posted_signals=1, posted_bytes=52`。
+  - EP1x2 dispatch-only bench：
+    - `tokens=1024 hidden=1024 topk=1 sms=8 iters=5`:
+      `avg_us=3171.48 payload_GBps=0.66 record_GBps=0.67`；
+    - `tokens=8192 hidden=7168 topk=1 sms=8 iters=2`:
+      `avg_us=34878.37 payload_GBps=3.37 record_GBps=3.37`，
+      last dispatch stats `posted_bytes=117702660`。
+- 仍未完成：
+  - 还没有 fork 官方 `hybrid_dispatch.cuh` 主循环；当前 descriptor builder 仍是
+    单线程/per-expert scaffold；
+  - receiver expanded layout 现在仍是 materialize 后再由 Python/JIT metadata 辅助 scatter，
+    还不是直接从 RDMA record 写 expanded output；
+  - `batch_counts` / `batch_offsets` 仍由 Python 从 signal window 读取，性能很差；
+  - EP8x2 / EP16 correctness 和 README 风格 BW 还没跑通。

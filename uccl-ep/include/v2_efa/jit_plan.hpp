@@ -305,7 +305,8 @@ inline V2EfaJitLaunchPlan build_v2_efa_dispatch_descriptor_enqueue_d2h_jit_plan(
          << ".cuh>\n"
          << "#include "
          << quote_include(config.uccl_include_path, "v2_efa/dispatch_jit.cuh")
-         << "\n\n"
+         << "\n"
+         << "// UCCL V2 EFA dispatch token-record ABI v2: payload+src+topk+weight\n\n"
          << "using namespace uccl::v2_efa;\n\n"
          << "static void __instantiate_kernel() {\n"
          << "    auto ptr = reinterpret_cast<void*>(&"
@@ -348,7 +349,8 @@ inline V2EfaJitLaunchPlan build_v2_efa_dispatch_direct_enqueue_d2h_jit_plan(
          << ".cuh>\n"
          << "#include "
          << quote_include(config.uccl_include_path, "v2_efa/dispatch_jit.cuh")
-         << "\n\n"
+         << "\n"
+         << "// UCCL V2 EFA direct dispatch token-record ABI v2\n\n"
          << "using namespace uccl::v2_efa;\n\n"
          << "static void __instantiate_kernel() {\n"
          << "    auto ptr = reinterpret_cast<void*>(&"

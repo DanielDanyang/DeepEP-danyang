@@ -43,6 +43,7 @@ __device__ __forceinline__ DispatchDescriptorBuildResult build_dispatch_descript
   const auto flags = make_dispatch_flags(scale_bytes, has_topk_weight);
   int num_segments = 0;
   int num_batches = 0;
+  int compact_slot_cursor = 0;
   DispatchDescriptorBuildResult result;
 
   for (int i = 0; i < max_batches; ++i) {
@@ -129,7 +130,8 @@ __device__ __forceinline__ DispatchDescriptorBuildResult build_dispatch_descript
     batch.first_segment = first_segment;
     batch.num_segments = num_segments - first_segment;
     batch.total_tokens = total_tokens;
-    batch.reserved = 0;
+    batch.reserved = compact_slot_cursor;
+    compact_slot_cursor += total_tokens;
   }
 
   counters[kDescriptorCounterSegments] = num_segments;
@@ -150,15 +152,14 @@ __device__ __forceinline__ void enqueue_dispatch_d2h(
     if (batch.num_segments <= 0 || batch.total_tokens <= 0) {
       continue;
     }
-    if (batch.dst_scaleout_rank == layout.skip_scaleout_rank) {
-      continue;
-    }
     for (int i = 0; i < batch.num_segments; ++i) {
       const auto segment_idx =
           static_cast<uint32_t>(batch.first_segment + i);
+      auto segment = segments[segment_idx];
+      segment.expanded_slot_begin += batch.reserved;
       enqueue_v2_transfer_d2h(
           queue, make_v2_dispatch_payload_cmd(
-                     segments[segment_idx], segment_idx,
+                     segment, segment_idx,
                      static_cast<uint32_t>(batch_idx), layout));
     }
     enqueue_v2_transfer_d2h(
@@ -242,9 +243,7 @@ __global__ void v2_efa_dispatch_direct_enqueue_d2h_kernel(
     const int owner_rank = expert / kExpertsPerRank;
     const int dst_scaleout_rank = owner_rank / kNumScaleupRanks;
     const int dst_scaleup_lane = owner_rank % kNumScaleupRanks;
-    if (dst_scaleout_rank == scaleout_rank) {
-      continue;
-    }
+    (void)scaleout_rank;
     const uint32_t dst_global_rank =
         static_cast<uint32_t>(dst_scaleout_rank * kNumScaleupRanks +
                               dst_scaleup_lane);
@@ -480,11 +479,16 @@ __global__ void v2_efa_dispatch_materialize_records_kernel(
     }
 
     const int out_row = out_begin + slot;
+    int source_local_slot = slot;
+    for (int prev_batch = 0; prev_batch < batch; ++prev_batch) {
+      const int prev_count =
+          __ldg(batch_counts + source * max_batches + prev_batch);
+      source_local_slot += prev_count > 0 ? prev_count : 0;
+    }
     const uint64_t record_offset =
         layout.remote_payload_base +
         static_cast<uint64_t>(source) * layout.source_rank_stride +
-        static_cast<uint64_t>(batch) * layout.batch_payload_stride +
-        static_cast<uint64_t>(slot) * layout.expanded_slot_stride;
+        static_cast<uint64_t>(source_local_slot) * layout.expanded_slot_stride;
     const auto* record = window + record_offset;
     auto* dst_payload = recv_x + static_cast<uint64_t>(out_row) * kHiddenBytes;
     const auto* src_payload = record + layout.record_payload_offset;
@@ -536,9 +540,11 @@ __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
     for (int i = 0; i < batch.num_segments; ++i) {
       const auto segment_idx =
           static_cast<uint32_t>(batch.first_segment + i);
+      auto segment = segments[segment_idx];
+      segment.expanded_slot_begin += batch.reserved;
       enqueue_v2_transfer_cmd(
           queue, make_v2_dispatch_payload_cmd(
-                     segments[segment_idx], segment_idx,
+                     segment, segment_idx,
                      static_cast<uint32_t>(batch_idx), layout));
     }
     enqueue_v2_transfer_cmd(
@@ -564,9 +570,11 @@ __global__ void v2_efa_dispatch_enqueue_d2h_kernel(
     for (int i = 0; i < batch.num_segments; ++i) {
       const auto segment_idx =
           static_cast<uint32_t>(batch.first_segment + i);
+      auto segment = segments[segment_idx];
+      segment.expanded_slot_begin += batch.reserved;
       enqueue_v2_transfer_d2h(
           queue, make_v2_dispatch_payload_cmd(
-                     segments[segment_idx], segment_idx,
+                     segment, segment_idx,
                      static_cast<uint32_t>(batch_idx), layout));
     }
     enqueue_v2_transfer_d2h(
