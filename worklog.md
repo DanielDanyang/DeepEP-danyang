@@ -2652,3 +2652,54 @@ README 风格 EP8x2 性能：
   - payload 清零和 signal 等待不是最大项；
   - 下一步必须拆掉当前 record staging/materialize 架构，并让 descriptor 构造不再按
     `experts * tokens * topk` 扫描。
+
+## 2026-06-01 dispatch semantic pack 与三段 JIT pipeline
+
+- 删除 Python 侧 token staging：
+  - `_stage_dispatch_records_to_v2_window` 和通用 byte staging 被移除；
+  - dispatch descriptor/enqueue JIT 直接读取 `x/topk_idx/topk_weights`；
+  - kernel 在本地 EFA window 中生成 V2 token record：
+    `payload + src_global + full topk_idx row + full topk_weight row`；
+  - 每个 `(token, topk)` route 按 expert semantic batch 写入 compact local
+    payload 区，receiver 仍直接 materialize 到 V2 expanded/reduced-dispatch
+    所需 metadata。
+- 第一版 stable semantic pack 为保证 expert 内 token-major 顺序，在每条 route 上扫描
+  之前所有 route：
+  - correctness 通过；
+  - `experts=256 topk=8 tokens=1024 hidden=1024 lanes=2`：
+    `avg_us=10778.39 payload_GBps=1.56`，
+    `descriptor_enqueue_ms=4.56`。
+  - 结论：语义正确，但 `O(routes^2)` local slot 计算不可接受。
+- 第二版加入主路径 scratch `dispatch_route_offsets`：
+  - 每个 expert 生成该 expert 下每条 route 的 stable local slot；
+  - pack 阶段按 route 并行读取 `route_offsets`，不再扫描前缀；
+  - correctness 通过；
+  - 同配置结果：
+    `avg_us=8354.27 payload_GBps=2.01`，
+    `descriptor_enqueue_ms=2.39`。
+  - 结论：稳定性和性能都比二次扫描好，但 descriptor+pack 仍被单 CUDA block 限制。
+- 第三版把原 fused single-block kernel 拆成三段 native V2 JIT 主路径：
+  - `v2_efa_dispatch_prepare_descriptors_kernel`：单 block 生成 expert batch、
+    route offset 和 descriptor；
+  - `v2_efa_dispatch_pack_records_kernel`：按 `num_sms` 个 block 并行 pack
+    payload/metadata 到本地 EFA window；
+  - `v2_efa_dispatch_enqueue_d2h_kernel`：单 block/thread 按 descriptor 顺序写
+    V2 D2H FIFO，保持 proxy FIFO 语义；
+  - 旧 fused dispatch kernel 已删除，不保留 fallback/reference 分支。
+- 三段 JIT pipeline 服务器验证：
+  - EP16 remote-pair `--lanes 2` correctness 通过；
+  - `experts=256 topk=8 tokens=1024 hidden=1024 sms=8 lanes=2`：
+    `avg_us=5859.77 payload_GBps=2.86 record_GBps=3.02`，
+    `stage_and_pre_barrier_ms=0.92`，
+    `descriptor_enqueue_ms=1.30`，
+    `completion_wait_ms=0.56`，
+    `signal_offsets_ms=0.30`，
+    `materialize_records_ms=0.85`，
+    `metadata_ms=0.43`。
+- 当前剩余 dispatch 阻塞：
+  - 每轮仍有 `dist.barrier` + signal table 清零，`stage_and_pre_barrier_ms`
+    约 `0.9ms`；
+  - send CQ completion polling 仍约 `0.55ms`；
+  - receiver materialize 仍从 host-visible window copy 回 GPU output，
+    `materialize_records_ms` 约 `0.85ms`；
+  - prepare 阶段仍是 `experts * routes` 扫描，只是已经从 pack 中解耦出来。

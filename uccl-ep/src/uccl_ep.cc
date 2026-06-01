@@ -1179,8 +1179,12 @@ NB_MODULE(ep, m) {
            nb::arg("smem_bytes") = 0,
            nb::arg("uccl_include_path") = "")
       .def("launch_dispatch_descriptor_enqueue_d2h",
-           [](const v2::V2EfaRuntime& self, std::uintptr_t topk_idx_ptr,
+           [](const v2::V2EfaRuntime& self, std::uintptr_t x_ptr,
+              std::uintptr_t topk_idx_ptr,
+              std::uintptr_t topk_weights_ptr,
+              std::uintptr_t window_ptr,
               std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
+              std::uintptr_t route_offsets_ptr,
               std::uintptr_t counters_ptr, int num_tokens,
               int num_max_tokens_per_rank, int num_channels_per_sm,
               int scale_bytes, bool has_topk_weight, bool cached_mode,
@@ -1195,6 +1199,11 @@ NB_MODULE(ep, m) {
               std::uint32_t source_rank_stride,
               std::uint32_t source_signal_stride,
               std::uint32_t token_record_bytes,
+              std::uint32_t record_payload_offset,
+              std::uint32_t record_src_global_offset,
+              std::uint32_t record_topk_idx_offset,
+              std::uint32_t record_topk_weight_offset,
+              std::uint32_t record_topk_weight_bytes,
               std::uint32_t signal_stride,
               std::uint32_t num_efa_lanes,
               const std::string& uccl_include_path,
@@ -1209,18 +1218,29 @@ NB_MODULE(ep, m) {
              layout.source_rank_stride = source_rank_stride;
              layout.source_signal_stride = source_signal_stride;
              layout.token_record_bytes = token_record_bytes;
+             layout.record_payload_offset = record_payload_offset;
+             layout.record_src_global_offset = record_src_global_offset;
+             layout.record_topk_idx_offset = record_topk_idx_offset;
+             layout.record_topk_weight_offset = record_topk_weight_offset;
+             layout.record_topk_weight_bytes = record_topk_weight_bytes;
              layout.signal_stride = signal_stride;
              layout.num_efa_lanes = std::max<std::uint32_t>(num_efa_lanes, 1);
              self.launch_dispatch_descriptor_enqueue_d2h(
-                 topk_idx_ptr, segments_ptr, batches_ptr, counters_ptr,
-                 num_tokens, num_max_tokens_per_rank, num_channels_per_sm,
-                 scale_bytes, has_topk_weight, cached_mode, deterministic,
-                 do_cpu_sync, smem_bytes, commands_ptr, head_ptr, tail_ptr,
-                 queue_capacity, layout, uccl_include_path, cuda_stream_ptr);
+                 x_ptr, topk_idx_ptr, topk_weights_ptr, window_ptr, segments_ptr,
+                 batches_ptr, route_offsets_ptr, counters_ptr,
+                 num_tokens, num_max_tokens_per_rank,
+                 num_channels_per_sm, scale_bytes, has_topk_weight,
+                 cached_mode, deterministic, do_cpu_sync, smem_bytes,
+                 commands_ptr, head_ptr, tail_ptr, queue_capacity, layout,
+                 uccl_include_path, cuda_stream_ptr);
            },
+           nb::arg("x_ptr"),
            nb::arg("topk_idx_ptr"),
+           nb::arg("topk_weights_ptr"),
+           nb::arg("window_ptr"),
            nb::arg("segments_ptr"),
            nb::arg("batches_ptr"),
+           nb::arg("route_offsets_ptr"),
            nb::arg("counters_ptr"),
            nb::arg("num_tokens"),
            nb::arg("num_max_tokens_per_rank"),
@@ -1244,6 +1264,11 @@ NB_MODULE(ep, m) {
            nb::arg("source_rank_stride") = 0,
            nb::arg("source_signal_stride") = 0,
            nb::arg("token_record_bytes") = 0,
+           nb::arg("record_payload_offset") = 0,
+           nb::arg("record_src_global_offset") = 0,
+           nb::arg("record_topk_idx_offset") = 0,
+           nb::arg("record_topk_weight_offset") = 0,
+           nb::arg("record_topk_weight_bytes") = 0,
            nb::arg("signal_stride") = sizeof(std::uint32_t),
            nb::arg("num_efa_lanes") = 1,
            nb::arg("uccl_include_path") = "",

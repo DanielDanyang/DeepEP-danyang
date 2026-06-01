@@ -50,6 +50,7 @@ class EPHandle:
 class V2TransportHandle:
     dispatch_segments: torch.Tensor
     dispatch_batches: torch.Tensor
+    dispatch_route_offsets: torch.Tensor
     dispatch_counters: torch.Tensor
     combine_segments: Optional[torch.Tensor]
     combine_batches: Optional[torch.Tensor]
@@ -422,14 +423,6 @@ class ElasticBuffer:
             )
         return self._v2_efa_window
 
-    def _stage_tensor_bytes_to_v2_window(self, tensor: torch.Tensor, base: int) -> int:
-        _require_cuda_contiguous(tensor, "tensor")
-        num_bytes = int(tensor.numel() * tensor.element_size())
-        window = self._require_v2_efa_window(int(base) + num_bytes)
-        byte_view = tensor.reshape(-1).view(torch.uint8)
-        window[int(base): int(base) + num_bytes].copy_(byte_view.reshape(-1))
-        return num_bytes
-
     def _make_dispatch_window_layout(
         self,
         num_tokens: int,
@@ -450,7 +443,7 @@ class ElasticBuffer:
             record_topk_idx_offset + int(num_topk) * 8
         )
         token_record_bytes = _align(record_end, 16)
-        src_bytes = _align(int(num_tokens) * int(token_record_bytes), 64)
+        src_bytes = _align(int(num_tokens) * int(num_topk) * int(token_record_bytes), 64)
         max_records_per_source = int(num_max_tokens_per_rank) * int(self.num_topk)
         batch_payload_stride = _align(int(num_max_tokens_per_rank) * int(token_record_bytes), 64)
         source_rank_stride = _align(max_records_per_source * int(token_record_bytes), 64)
@@ -496,59 +489,6 @@ class ElasticBuffer:
         window = self._require_v2_efa_window(remote_signal_base + signal_bytes)
         window[remote_signal_base: remote_signal_base + signal_bytes].zero_()
 
-    def _stage_dispatch_records_to_v2_window(
-        self,
-        x_tensor: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: Optional[torch.Tensor],
-        num_max_tokens_per_rank: int,
-        layout: dict,
-    ) -> int:
-        _require_cuda_contiguous(x_tensor, "x")
-        _require_cuda_contiguous(topk_idx, "topk_idx")
-        if topk_weights is not None:
-            _require_cuda_contiguous(topk_weights, "topk_weights")
-
-        num_tokens = int(x_tensor.shape[0])
-        payload_bytes = int(x_tensor.shape[1] * x_tensor.element_size())
-        num_topk = int(topk_idx.shape[1])
-        record_stride = int(layout["src_token_stride"])
-        src_bytes = int(layout["src_payload_bytes"])
-        base = int(layout["local_payload_base"])
-        window = self._require_v2_efa_window(base + src_bytes)
-        staging = window[base: base + src_bytes]
-        staging.zero_()
-        if num_tokens == 0:
-            return src_bytes
-
-        payload_offset = int(layout.get("record_payload_offset", 0))
-        payload_dst = staging[payload_offset:].as_strided(
-            (num_tokens, payload_bytes), (record_stride, 1)
-        )
-        payload_dst.copy_(x_tensor.reshape(num_tokens, -1).view(torch.uint8))
-
-        src_global = (
-            torch.arange(num_tokens, dtype=torch.int32, device=x_tensor.device) +
-            int(self.rank_idx) * int(num_max_tokens_per_rank)
-        )
-        src_offset = int(layout["record_src_global_offset"])
-        src_dst = staging[src_offset:].as_strided((num_tokens, 4), (record_stride, 1))
-        src_dst.copy_(src_global.view(torch.uint8).reshape(num_tokens, 4))
-
-        topk_offset = int(layout["record_topk_idx_offset"])
-        topk_dst = staging[topk_offset:].as_strided(
-            (num_tokens, num_topk * 8), (record_stride, 1)
-        )
-        topk_dst.copy_(topk_idx.reshape(num_tokens, num_topk).view(torch.uint8))
-
-        if topk_weights is not None:
-            weight_offset = int(layout["record_topk_weight_offset"])
-            weight_dst = staging[weight_offset:].as_strided(
-                (num_tokens, num_topk * 4), (record_stride, 1)
-            )
-            weight_dst.copy_(topk_weights.reshape(num_tokens, num_topk).view(torch.uint8))
-        return src_bytes
-
     def has_native_v2_efa_transport(self) -> bool:
         return self._v2_efa_connection is not None
 
@@ -584,9 +524,12 @@ class ElasticBuffer:
 
     def launch_dispatch_descriptor_enqueue_d2h_queue(
         self,
+        x_tensor: torch.Tensor,
         topk_idx: torch.Tensor,
+        topk_weights: Optional[torch.Tensor],
         segments: torch.Tensor,
         batches: torch.Tensor,
+        route_offsets: torch.Tensor,
         counters: torch.Tensor,
         queue,
         layout: dict,
@@ -602,18 +545,30 @@ class ElasticBuffer:
         uccl_include_path: str = "",
         stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
+        if self._v2_efa_window is None:
+            raise RuntimeError("native V2 EFA window is not initialized")
+        _require_cuda_contiguous(x_tensor, "x")
         _require_cuda_contiguous(topk_idx, "topk_idx")
+        if topk_weights is not None:
+            _require_cuda_contiguous(topk_weights, "topk_weights")
         _require_cuda_contiguous(segments, "segments")
         _require_cuda_contiguous(batches, "batches")
+        _require_cuda_contiguous(route_offsets, "route_offsets")
         _require_cuda_contiguous(counters, "counters")
+        if route_offsets.dtype != torch.int32:
+            raise TypeError("route_offsets must be torch.int32")
         tokens = int(topk_idx.shape[0] if num_tokens is None else num_tokens)
         max_tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
         if not uccl_include_path:
             uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
         self.runtime.launch_dispatch_descriptor_enqueue_d2h(
+            int(x_tensor.data_ptr()),
             int(topk_idx.data_ptr()),
+            0 if topk_weights is None else int(topk_weights.data_ptr()),
+            int(self._v2_efa_window.data_ptr()),
             int(segments.data_ptr()),
             int(batches.data_ptr()),
+            int(route_offsets.data_ptr()),
             int(counters.data_ptr()),
             tokens,
             max_tokens,
@@ -637,6 +592,11 @@ class ElasticBuffer:
             int(layout.get("source_rank_stride", 0)),
             int(layout.get("source_signal_stride", 0)),
             int(layout.get("token_record_bytes", 0)),
+            int(layout.get("record_payload_offset", 0)),
+            int(layout.get("record_src_global_offset", 0)),
+            int(layout.get("record_topk_idx_offset", 0)),
+            int(layout.get("record_topk_weight_offset", 0)),
+            int(layout.get("record_topk_weight_bytes", 0)),
             int(layout.get("signal_stride", 4)),
             int(layout.get("num_efa_lanes", 1)),
             str(uccl_include_path),
@@ -1244,6 +1204,8 @@ class ElasticBuffer:
                                dtype=torch.uint8, device=topk_idx.device)
         batches = torch.empty((max_batches * int(sizes["dispatch_batch"]),),
                               dtype=torch.uint8, device=topk_idx.device)
+        route_offsets = torch.empty((max(1, int(num_tokens * self.num_topk)),),
+                                    dtype=torch.int32, device=topk_idx.device)
         counters = torch.zeros((3,), dtype=torch.int32, device=topk_idx.device)
         descriptor_queue_capacity = max_segments + max_batches + int(self.num_ranks) + 1
         queue_capacity = _next_power_of_two(descriptor_queue_capacity)
@@ -1262,21 +1224,16 @@ class ElasticBuffer:
         self._clear_dispatch_receive_window(layout)
         torch.cuda.current_stream().synchronize()
         dist.barrier(group=self.group)
-        self._stage_dispatch_records_to_v2_window(
-            x_tensor,
-            topk_idx,
-            topk_weights if has_topk_weight else None,
-            num_max_tokens_per_rank,
-            layout,
-        )
-        torch.cuda.current_stream().synchronize()
         timings["stage_and_pre_barrier_ms"] = (time.perf_counter() - stage_begin) * 1000.0
         flat_topk_idx = topk_idx.reshape(-1)
         enqueue_begin = time.perf_counter()
         self.launch_dispatch_descriptor_enqueue_d2h_queue(
+            x_tensor=x_tensor,
             topk_idx=flat_topk_idx,
+            topk_weights=topk_weights if has_topk_weight else None,
             segments=segments,
             batches=batches,
+            route_offsets=route_offsets,
             counters=counters,
             queue=queue,
             layout=layout,
@@ -1303,6 +1260,7 @@ class ElasticBuffer:
         return V2TransportHandle(
             dispatch_segments=segments,
             dispatch_batches=batches,
+            dispatch_route_offsets=route_offsets,
             dispatch_counters=counters,
             combine_segments=None,
             combine_batches=None,

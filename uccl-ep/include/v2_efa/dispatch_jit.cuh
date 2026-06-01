@@ -27,13 +27,29 @@ __device__ __forceinline__ uint32_t make_dispatch_flags(int scale_bytes,
   return flags;
 }
 
+template <int kBytes>
+__device__ __forceinline__ void copy_payload_16b(uint8_t* dst,
+                                                const uint8_t* src) {
+  constexpr int kVecBytes = 16;
+  constexpr int kNumVec = kBytes / kVecBytes;
+  auto* dst_vec = reinterpret_cast<uint4*>(dst);
+  const auto* src_vec = reinterpret_cast<const uint4*>(src);
+  for (int i = 0; i < kNumVec; ++i) {
+    dst_vec[i] = src_vec[i];
+  }
+  for (int byte = kNumVec * kVecBytes; byte < kBytes; ++byte) {
+    dst[byte] = src[byte];
+  }
+}
+
 template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
           int kNumTopk, int kHiddenBytes>
 __device__ __forceinline__ DispatchDescriptorBuildResult build_dispatch_descriptors(
     const int64_t* topk_idx, DispatchSegmentDescriptor* segments,
-    DispatchExpertBatch* batches, uint32_t* counters, int num_tokens,
+    DispatchExpertBatch* batches, int32_t* route_offsets,
+    uint32_t* counters, int num_tokens, int num_max_tokens_per_rank,
     int scale_bytes, bool has_topk_weight, int max_segments,
-    int max_batches) {
+    int max_batches, DispatchTransferLayout layout) {
   constexpr int kWorldSize = kNumScaleoutRanks * kNumScaleupRanks;
   static_assert(kWorldSize > 0, "invalid V2 EFA topology");
   static_assert(kNumExperts % kWorldSize == 0,
@@ -59,40 +75,23 @@ __device__ __forceinline__ DispatchDescriptorBuildResult build_dispatch_descript
     return result;
   }
 
+  const int total_routes = num_tokens * kNumTopk;
+  for (int route = tid; route < total_routes; route += stride) {
+    route_offsets[route] = -1;
+  }
+  __syncthreads();
+
   for (int expert = tid; expert < kNumExperts; expert += stride) {
     const int owner_rank = expert / kExpertsPerRank;
     const int dst_scaleout_rank = owner_rank / kNumScaleupRanks;
     const int dst_scaleup_lane = owner_rank % kNumScaleupRanks;
 
     int total_tokens = 0;
-    int num_expert_segments = 0;
-    int last_src_token_begin = -1;
-    int last_count = 0;
-    int last_topk_slot = -1;
-    int last_expanded_slot_begin = -1;
-
-    for (int token = 0; token < num_tokens; ++token) {
-      for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
-        const auto routed_expert = static_cast<int>(
-            topk_idx[token * kNumTopk + topk_slot]);
-        if (routed_expert != expert) {
-          continue;
-        }
-
-        const int expanded_slot = total_tokens++;
-        const bool can_extend =
-            last_src_token_begin >= 0 && last_topk_slot == topk_slot &&
-            last_src_token_begin + last_count == token &&
-            last_expanded_slot_begin + last_count == expanded_slot;
-        if (!can_extend) {
-          ++num_expert_segments;
-          last_src_token_begin = token;
-          last_count = 1;
-          last_topk_slot = topk_slot;
-          last_expanded_slot_begin = expanded_slot;
-        } else {
-          ++last_count;
-        }
+    for (int route = 0; route < total_routes; ++route) {
+      const auto routed_expert = static_cast<int>(topk_idx[route]);
+      if (routed_expert == expert) {
+        route_offsets[route] = total_tokens;
+        ++total_tokens;
       }
     }
 
@@ -101,7 +100,7 @@ __device__ __forceinline__ DispatchDescriptorBuildResult build_dispatch_descript
     batch.dst_scaleup_lane = dst_scaleup_lane;
     batch.expert_id = expert;
     batch.first_segment = 0;
-    batch.num_segments = num_expert_segments;
+    batch.num_segments = total_tokens > 0 ? 1 : 0;
     batch.total_tokens = total_tokens;
     batch.reserved = 0;
   }
@@ -114,6 +113,20 @@ __device__ __forceinline__ DispatchDescriptorBuildResult build_dispatch_descript
       auto& batch = batches[expert];
       batch.first_segment = segment_cursor;
       batch.reserved = compact_slot_cursor;
+      if (batch.num_segments > 0) {
+        auto& segment = segments[segment_cursor];
+        segment.dst_scaleout_rank = batch.dst_scaleout_rank;
+        segment.dst_scaleup_lane = batch.dst_scaleup_lane;
+        segment.expert_id = expert;
+        segment.count = batch.total_tokens;
+        segment.src_token_begin = batch.reserved;
+        segment.src_token_index_offset = -1;
+        segment.topk_slot = 0;
+        segment.expanded_slot_begin = 0;
+        segment.payload_bytes = kHiddenBytes;
+        segment.scale_bytes = scale_bytes;
+        segment.flags = flags;
+      }
       segment_cursor += batch.num_segments;
       compact_slot_cursor += batch.total_tokens;
     }
@@ -123,63 +136,69 @@ __device__ __forceinline__ DispatchDescriptorBuildResult build_dispatch_descript
   }
   __syncthreads();
 
-  if (counters[kDescriptorCounterOverflow] == 0) {
-    for (int expert = tid; expert < kNumExperts; expert += stride) {
-      const auto& batch = batches[expert];
-      if (batch.total_tokens <= 0 || batch.num_segments <= 0) {
-        continue;
-      }
-
-      int write_segment = batch.first_segment;
-      int total_tokens = 0;
-      int current_segment = -1;
-      for (int token = 0; token < num_tokens; ++token) {
-        for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
-          const auto routed_expert = static_cast<int>(
-              topk_idx[token * kNumTopk + topk_slot]);
-          if (routed_expert != expert) {
-            continue;
-          }
-
-          const int expanded_slot = total_tokens++;
-          bool can_extend = false;
-          if (current_segment >= batch.first_segment) {
-            auto& last = segments[current_segment];
-            can_extend = last.src_token_index_offset < 0 &&
-                         last.topk_slot == topk_slot &&
-                         last.src_token_begin + last.count == token &&
-                         last.expanded_slot_begin + last.count == expanded_slot &&
-                         last.payload_bytes == kHiddenBytes &&
-                         last.scale_bytes == scale_bytes && last.flags == flags;
-          }
-          if (can_extend) {
-            segments[current_segment].count += 1;
-            continue;
-          }
-
-          current_segment = write_segment++;
-          auto& segment = segments[current_segment];
-          segment.dst_scaleout_rank = batch.dst_scaleout_rank;
-          segment.dst_scaleup_lane = batch.dst_scaleup_lane;
-          segment.expert_id = expert;
-          segment.count = 1;
-          segment.src_token_begin = token;
-          segment.src_token_index_offset = -1;
-          segment.topk_slot = topk_slot;
-          segment.expanded_slot_begin = expanded_slot;
-          segment.payload_bytes = kHiddenBytes;
-          segment.scale_bytes = scale_bytes;
-          segment.flags = flags;
-        }
-      }
-    }
-  }
-  __syncthreads();
-
   result.num_segments = static_cast<int>(counters[kDescriptorCounterSegments]);
   result.num_batches = static_cast<int>(counters[kDescriptorCounterBatches]);
   result.overflow = static_cast<int>(counters[kDescriptorCounterOverflow]);
   return result;
+}
+
+template <int kNumExperts, int kNumTopk, int kHiddenBytes>
+__device__ __forceinline__ void pack_dispatch_records(
+    const uint8_t* x, const int64_t* topk_idx, const float* topk_weights,
+    uint8_t* window, const DispatchExpertBatch* batches,
+    const int32_t* route_offsets, int num_tokens,
+    int num_max_tokens_per_rank, bool has_topk_weight,
+    DispatchTransferLayout layout) {
+  const int total_routes = num_tokens * kNumTopk;
+  const int global_thread =
+      static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const int global_stride =
+      static_cast<int>(gridDim.x * blockDim.x);
+
+  for (int route = global_thread; route < total_routes;
+       route += global_stride) {
+    const int token = route / kNumTopk;
+    const int expert = static_cast<int>(topk_idx[route]);
+    if (expert < 0 || expert >= kNumExperts) {
+      continue;
+    }
+    const auto& batch = batches[expert];
+    if (batch.total_tokens <= 0 || batch.num_segments <= 0) {
+      continue;
+    }
+
+    const int local_slot = __ldg(route_offsets + route);
+    if (local_slot < 0 || local_slot >= batch.total_tokens) {
+      continue;
+    }
+    const int packed_slot = batch.reserved + local_slot;
+    auto* record =
+        window + layout.local_payload_base +
+        static_cast<uint64_t>(packed_slot) * layout.src_token_stride;
+    const auto* src_payload =
+        x + static_cast<uint64_t>(token) * kHiddenBytes;
+    auto* dst_payload = record + layout.record_payload_offset;
+    copy_payload_16b<kHiddenBytes>(dst_payload, src_payload);
+
+    auto* src_global_ptr = reinterpret_cast<int32_t*>(
+        record + layout.record_src_global_offset);
+    *src_global_ptr = layout.source_rank * num_max_tokens_per_rank + token;
+
+    auto* topk_ptr = reinterpret_cast<int64_t*>(
+        record + layout.record_topk_idx_offset);
+    for (int slot = 0; slot < kNumTopk; ++slot) {
+      topk_ptr[slot] = topk_idx[token * kNumTopk + slot];
+    }
+
+    if (has_topk_weight && topk_weights != nullptr &&
+        layout.record_topk_weight_bytes != 0) {
+      auto* weight_ptr = reinterpret_cast<float*>(
+          record + layout.record_topk_weight_offset);
+      for (int slot = 0; slot < kNumTopk; ++slot) {
+        weight_ptr[slot] = topk_weights[token * kNumTopk + slot];
+      }
+    }
+  }
 }
 
 __device__ __forceinline__ void enqueue_dispatch_d2h(
@@ -223,47 +242,60 @@ __device__ __forceinline__ void enqueue_dispatch_d2h(
   }
 }
 
-template <int kBytes>
-__device__ __forceinline__ void copy_payload_16b(uint8_t* dst,
-                                                const uint8_t* src) {
-  constexpr int kVecBytes = 16;
-  constexpr int kNumVec = kBytes / kVecBytes;
-  auto* dst_vec = reinterpret_cast<uint4*>(dst);
-  const auto* src_vec = reinterpret_cast<const uint4*>(src);
-  for (int i = 0; i < kNumVec; ++i) {
-    dst_vec[i] = src_vec[i];
-  }
-  for (int byte = kNumVec * kVecBytes; byte < kBytes; ++byte) {
-    dst[byte] = src[byte];
-  }
-}
-
 #endif
 
 }  // namespace detail
 
 template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
           int kNumTopk, int kHiddenBytes>
-__global__ void v2_efa_dispatch_descriptor_enqueue_d2h_kernel(
+__global__ void v2_efa_dispatch_prepare_descriptors_kernel(
     const int64_t* topk_idx, DispatchSegmentDescriptor* segments,
-    DispatchExpertBatch* batches, uint32_t* counters, int num_tokens,
-    int scaleout_rank, int scaleup_rank, int scale_bytes,
-    bool has_topk_weight, int max_segments, int max_batches,
-    V2TransferD2HQueueView queue, DispatchTransferLayout layout) {
+    DispatchExpertBatch* batches, int32_t* route_offsets, uint32_t* counters,
+    int num_tokens, int num_max_tokens_per_rank, int scaleout_rank,
+    int scaleup_rank, int scale_bytes, bool has_topk_weight, int max_segments,
+    int max_batches, DispatchTransferLayout layout) {
   if (blockIdx.x != 0) {
     return;
   }
   (void)scaleout_rank;
   (void)scaleup_rank;
 
-  const auto result = detail::build_dispatch_descriptors<
+  detail::build_dispatch_descriptors<
       kNumScaleoutRanks, kNumScaleupRanks, kNumExperts, kNumTopk, kHiddenBytes>(
-      topk_idx, segments, batches, counters, num_tokens, scale_bytes,
-      has_topk_weight, max_segments, max_batches);
-  if (threadIdx.x != 0 || result.overflow != 0) {
+      topk_idx, segments, batches, route_offsets, counters, num_tokens,
+      num_max_tokens_per_rank, scale_bytes, has_topk_weight, max_segments,
+      max_batches, layout);
+}
+
+template <int kNumExperts, int kNumTopk, int kHiddenBytes>
+__global__ void v2_efa_dispatch_pack_records_kernel(
+    const uint8_t* x, const int64_t* topk_idx, const float* topk_weights,
+    uint8_t* window, const DispatchExpertBatch* batches,
+    const int32_t* route_offsets, int num_tokens,
+    int num_max_tokens_per_rank, bool has_topk_weight,
+    DispatchTransferLayout layout) {
+  detail::pack_dispatch_records<kNumExperts, kNumTopk, kHiddenBytes>(
+      x, topk_idx, topk_weights, window, batches, route_offsets, num_tokens,
+      num_max_tokens_per_rank, has_topk_weight, layout);
+}
+
+template <int kInstance>
+__global__ void v2_efa_dispatch_enqueue_d2h_kernel(
+    const DispatchSegmentDescriptor* segments,
+    const DispatchExpertBatch* batches, uint32_t* counters,
+    int max_batches, V2TransferD2HQueueView queue,
+    DispatchTransferLayout layout) {
+  (void)kInstance;
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
-  detail::enqueue_dispatch_d2h(segments, batches, max_batches, queue, layout);
+  if (counters[kDescriptorCounterOverflow] != 0) {
+    return;
+  }
+  const int num_batches = static_cast<int>(counters[kDescriptorCounterBatches]);
+  detail::enqueue_dispatch_d2h(segments, batches,
+                               num_batches > 0 ? num_batches : max_batches,
+                               queue, layout);
 }
 
 template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumTopk,
