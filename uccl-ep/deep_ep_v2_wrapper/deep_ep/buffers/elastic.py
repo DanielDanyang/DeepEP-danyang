@@ -66,6 +66,7 @@ class V2TransportHandle:
     scale_bytes: int
     dispatch_drain_stats: Optional[dict] = None
     combine_drain_stats: Optional[dict] = None
+    timings: Optional[dict] = None
 
 
 class ElasticBuffer:
@@ -639,6 +640,11 @@ class ElasticBuffer:
         bytes_in_window = int(window.numel() * window.element_size())
         if num_bytes is not None and int(num_bytes) > bytes_in_window:
             raise ValueError("num_bytes exceeds the provided V2 EFA window")
+        if device_index < 0 and "UCCL_V2_EFA_DEVICE_INDEX" not in os.environ:
+            local_rank = int(os.environ.get("LOCAL_RANK", self.scaleup_rank_idx))
+            efa_stride = int(os.environ.get("UCCL_V2_EFA_DEVICE_STRIDE", "2"))
+            efa_offset = int(os.environ.get("UCCL_V2_EFA_DEVICE_OFFSET", "0"))
+            device_index = efa_offset + local_rank * max(1, efa_stride)
 
         connection = ep.V2EfaConnection(
             int(window.data_ptr()),
@@ -1621,6 +1627,7 @@ class ElasticBuffer:
             )
         )
         num_recv_tokens = int(sum(recv_counts))
+        metadata_begin = time.perf_counter()
         recv_src_metadata, dst_buffer_slot_idx, psum_scaleup, psum_expert, expert_counts = (
             self._build_v2_dispatch_metadata(
                 recv_topk_idx, recv_src_global, topk_idx, recv_counts,
@@ -1635,6 +1642,8 @@ class ElasticBuffer:
             num_experts,
             num_max_tokens_per_rank,
         )
+        if transport.timings is not None:
+            transport.timings["metadata_ms"] = (time.perf_counter() - metadata_begin) * 1000.0
 
         if cumulative_local_expert_recv_stats is not None:
             cumulative_local_expert_recv_stats.add_(
@@ -1643,6 +1652,7 @@ class ElasticBuffer:
             )
 
         if do_expand:
+            expand_begin = time.perf_counter()
             expanded_tokens = int(psum_expert[-1].item()) if psum_expert.numel() else 0
             expanded_x = torch.empty((max(expanded_tokens, 1), hidden),
                                      dtype=x_tensor.dtype, device=x_tensor.device)
@@ -1666,6 +1676,9 @@ class ElasticBuffer:
             recv_x_out = expanded_x
             recv_topk_idx_out = None
             recv_topk_weights_out = expanded_weights
+            if transport.timings is not None:
+                torch.cuda.current_stream().synchronize()
+                transport.timings["expand_ms"] = (time.perf_counter() - expand_begin) * 1000.0
         else:
             recv_x_out = recv_x
             recv_topk_idx_out = recv_topk_idx
@@ -1734,6 +1747,8 @@ class ElasticBuffer:
         has_topk_weight: bool,
         do_cpu_sync: bool,
     ) -> V2TransportHandle:
+        transport_begin = time.perf_counter()
+        timings = {}
         sizes = ep.v2_descriptor_sizes()
         max_segments = max(1, int(num_tokens * self.num_topk))
         max_batches = max(1, int(self.num_experts))
@@ -1746,6 +1761,7 @@ class ElasticBuffer:
         queue_capacity = _next_power_of_two(descriptor_queue_capacity)
         queue = self.allocate_d2h_queue(queue_capacity)
         if self._v2_efa_connection is not None:
+            stage_begin = time.perf_counter()
             layout = self._make_dispatch_window_layout(
                 num_tokens=num_tokens,
                 num_max_tokens_per_rank=num_max_tokens_per_rank,
@@ -1764,6 +1780,8 @@ class ElasticBuffer:
                 num_max_tokens_per_rank,
                 layout,
             )
+            torch.cuda.current_stream().synchronize()
+            timings["stage_and_pre_barrier_ms"] = (time.perf_counter() - stage_begin) * 1000.0
         else:
             layout = {
                 "local_payload_base": 0,
@@ -1775,6 +1793,7 @@ class ElasticBuffer:
                 "signal_stride": 4,
             }
         flat_topk_idx = topk_idx.reshape(-1)
+        enqueue_begin = time.perf_counter()
         if self._v2_efa_connection is not None:
             self.launch_dispatch_descriptor_enqueue_d2h_queue(
                 topk_idx=flat_topk_idx,
@@ -1806,13 +1825,21 @@ class ElasticBuffer:
                 smem_bytes=0,
             )
         torch.cuda.current_stream().synchronize()
+        timings["descriptor_enqueue_ms"] = (time.perf_counter() - enqueue_begin) * 1000.0
         num_segments = int(counters[0].item())
         num_batches = int(counters[1].item())
         dispatch_drain_stats = None
         if self._v2_efa_connection is not None:
+            drain_begin = time.perf_counter()
             dispatch_drain_stats = self._v2_efa_connection.drain_queue(queue, True, True)
+            timings["proxy_drain_ms"] = (time.perf_counter() - drain_begin) * 1000.0
+            wait_begin = time.perf_counter()
             self._wait_native_v2_efa_completions(dispatch_drain_stats)
+            timings["completion_wait_ms"] = (time.perf_counter() - wait_begin) * 1000.0
+            barrier_begin = time.perf_counter()
             dist.barrier(group=self.group)
+            timings["post_barrier_ms"] = (time.perf_counter() - barrier_begin) * 1000.0
+        timings["transport_total_ms"] = (time.perf_counter() - transport_begin) * 1000.0
         return V2TransportHandle(
             dispatch_segments=segments,
             dispatch_batches=batches,
@@ -1831,6 +1858,7 @@ class ElasticBuffer:
             payload_bytes=payload_bytes,
             scale_bytes=scale_bytes,
             dispatch_drain_stats=dispatch_drain_stats,
+            timings=timings,
         )
 
     def _wait_native_v2_efa_completions(self, stats: Optional[dict]) -> None:
@@ -1848,7 +1876,7 @@ class ElasticBuffer:
     def _native_dispatch_batch_counts_from_window(
         self,
         layout: dict,
-    ) -> Tuple[torch.Tensor, torch.Tensor, list, int]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, list, int, float]:
         if self._v2_efa_window is None:
             raise RuntimeError("native V2 EFA window is not initialized")
         max_batches = int(layout["max_batches"])
@@ -1859,6 +1887,7 @@ class ElasticBuffer:
         offsets_tensor = torch.empty_like(counts_tensor)
         recv_counts_tensor = torch.empty((int(self.num_ranks),), dtype=torch.int32, device=device)
         total_recv_tensor = torch.empty((1,), dtype=torch.int32, device=device)
+        begin = time.perf_counter()
         self.launch_dispatch_signal_offsets(
             batch_counts=counts_tensor,
             batch_offsets=offsets_tensor,
@@ -1868,9 +1897,10 @@ class ElasticBuffer:
             max_batches=max_batches,
         )
         torch.cuda.current_stream().synchronize()
+        signal_offsets_ms = (time.perf_counter() - begin) * 1000.0
         recv_counts = [int(v) for v in recv_counts_tensor.cpu().tolist()]
         total_recv = int(total_recv_tensor.item())
-        return counts_tensor, offsets_tensor, recv_counts, total_recv
+        return counts_tensor, offsets_tensor, recv_counts, total_recv, signal_offsets_ms
 
     def _materialize_native_dispatch_from_window(
         self,
@@ -1883,9 +1913,11 @@ class ElasticBuffer:
         if self._v2_efa_connection is None or self._v2_efa_window is None:
             raise RuntimeError("native V2 EFA transport has not been initialized")
         layout = transport.dispatch_layout
-        batch_counts, batch_offsets, recv_counts, num_recv_tokens = (
+        batch_counts, batch_offsets, recv_counts, num_recv_tokens, signal_offsets_ms = (
             self._native_dispatch_batch_counts_from_window(layout)
         )
+        if transport.timings is not None:
+            transport.timings["signal_offsets_ms"] = signal_offsets_ms
         recv_x = torch.empty(
             (max(1, num_recv_tokens), int(x_tensor.shape[1])),
             dtype=x_tensor.dtype,
@@ -1916,6 +1948,7 @@ class ElasticBuffer:
             recv_src_global.zero_()
             return recv_x[:0], None, recv_topk_idx[:0], recv_topk_weights, recv_src_global[:0], recv_counts
 
+        materialize_begin = time.perf_counter()
         self.launch_dispatch_materialize_records(
             batch_counts=batch_counts,
             batch_offsets=batch_offsets,
@@ -1929,6 +1962,10 @@ class ElasticBuffer:
             has_topk_weight=topk_weights is not None,
         )
         torch.cuda.current_stream().synchronize()
+        if transport.timings is not None:
+            transport.timings["materialize_records_ms"] = (
+                time.perf_counter() - materialize_begin
+            ) * 1000.0
         return (
             recv_x[:num_recv_tokens],
             None,

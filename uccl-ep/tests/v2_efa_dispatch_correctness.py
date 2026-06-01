@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--experts", type=int, default=0)
     parser.add_argument("--sms", type=int, default=8)
     parser.add_argument("--window-mb", type=int, default=512)
+    parser.add_argument("--lanes", type=int, default=1)
     parser.add_argument(
         "--remote-pair",
         action="store_true",
@@ -71,7 +72,10 @@ def main() -> None:
         hidden=args.hidden,
         num_topk=1,
     )
-    buf.init_native_v2_efa_transport(num_bytes=args.window_mb << 20, num_lanes=1)
+    local_info = buf.init_native_v2_efa_transport(
+        num_bytes=args.window_mb << 20,
+        num_lanes=args.lanes,
+    )
 
     base = torch.arange(args.tokens * args.hidden, dtype=torch.float32, device="cuda")
     x = (base.reshape(args.tokens, args.hidden) + rank * 10000).to(torch.bfloat16)
@@ -128,7 +132,8 @@ def main() -> None:
     if rank == 0:
         print(
             f"dispatch_correctness_ok EP{world} tokens={args.tokens} hidden={args.hidden} "
-            f"remote_pair={args.remote_pair} stats={handle.transport_handle.dispatch_drain_stats}",
+            f"remote_pair={args.remote_pair} device={local_info.get('device_name')} "
+            f"stats={handle.transport_handle.dispatch_drain_stats}",
             flush=True,
         )
     dist.destroy_process_group()

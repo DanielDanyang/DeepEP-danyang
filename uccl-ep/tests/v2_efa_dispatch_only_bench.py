@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--window-mb", type=int, default=512)
+    parser.add_argument("--lanes", type=int, default=1)
     parser.add_argument("--remote-pair", action="store_true")
     parser.add_argument("--do-expand", action="store_true")
     args = parser.parse_args()
@@ -58,7 +59,10 @@ def main() -> None:
         hidden=args.hidden,
         num_topk=args.topk,
     )
-    buf.init_native_v2_efa_transport(num_bytes=args.window_mb << 20, num_lanes=1)
+    local_info = buf.init_native_v2_efa_transport(
+        num_bytes=args.window_mb << 20,
+        num_lanes=args.lanes,
+    )
 
     x = torch.randn((args.tokens, args.hidden), dtype=torch.bfloat16, device="cuda")
     dst_rank = (rank + local_world) % world if args.remote_pair else (rank + 1) % world
@@ -106,13 +110,16 @@ def main() -> None:
     payload_bytes = args.tokens * args.topk * args.hidden * 2
     record_bytes = int(last_handle.transport_handle.dispatch_layout["token_record_bytes"]) * args.tokens * args.topk
     stats = last_handle.transport_handle.dispatch_drain_stats
+    timings = last_handle.transport_handle.timings or {}
     if rank == 0:
         print(
             f"dispatch-only EP{world} tokens={args.tokens} hidden={args.hidden} topk={args.topk} "
             f"sms={args.sms} remote_pair={args.remote_pair} do_expand={args.do_expand} "
+            f"lanes={args.lanes} device={local_info.get('device_name')} "
             f"avg_us={avg * 1e6:.2f} "
             f"payload_GBps={_gbps(payload_bytes, avg):.2f} "
-            f"record_GBps={_gbps(record_bytes, avg):.2f} stats={stats}",
+            f"record_GBps={_gbps(record_bytes, avg):.2f} stats={stats} "
+            f"timings={timings}",
             flush=True,
         )
     dist.destroy_process_group()

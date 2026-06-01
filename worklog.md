@@ -2270,3 +2270,54 @@ README 风格 EP8x2 性能：
   - 当前瓶颈更像 native scaffold 的同步/CPU proxy/completion/receiver materialize
     串行路径，而不是 payload command 数量，因为每 rank 已经只有 1 个大 payload
     write + 1 个 signal。
+
+## 2026-06-01 dispatch EFA 设备绑定与 timing 分解
+
+- 发现一个 AWS-only backend 的明显问题：
+  - `V2EfaConnection(device_index=-1)` 的 C++ 默认逻辑会选择第一张 EFA；
+  - EP16 下如果 Python 不显式传 `device_index`，8 个 local rank 会挤到同一张
+    EFA 上；
+  - 已在 `ElasticBuffer.init_native_v2_efa_transport()` 增加 AWS p5en 默认映射：
+    未设置 `UCCL_V2_EFA_DEVICE_INDEX` 时，`device_index =
+    UCCL_V2_EFA_DEVICE_OFFSET + LOCAL_RANK * UCCL_V2_EFA_DEVICE_STRIDE`，
+    默认 offset=0、stride=2。
+- 新增 dispatch timing：
+  - `stage_and_pre_barrier_ms`
+  - `descriptor_enqueue_ms`
+  - `proxy_drain_ms`
+  - `completion_wait_ms`
+  - `post_barrier_ms`
+  - `transport_total_ms`
+  - `signal_offsets_ms`
+  - `materialize_records_ms`
+  - `metadata_ms`
+  - `expand_ms`（仅 `do_expand=True`）
+- 验证与数据：
+  - EP16 correctness 在自动 EFA 绑定后通过，rank0 显示设备 `rdmap85s0`；
+  - EP16 remote-pair small bench:
+    - 自动 EFA 绑定前：`tokens=1024 hidden=1024`，`avg_us=5081.58`,
+      `payload_GBps=0.41`；
+    - 自动 EFA 绑定后：`avg_us=5224.87`, `payload_GBps=0.40`；
+    - 说明低速不是单纯因为所有 rank 挤第一张 EFA；
+  - EP16 remote-pair README-size bench:
+    - 自动 EFA 绑定前：`tokens=8192 hidden=7168`，`avg_us=94106.46`,
+      `payload_GBps=1.25`；
+    - 自动 EFA 绑定后一次有效结果：`avg_us=81123.71`,
+      `payload_GBps=1.45`。
+  - EP16 small bench timing（`tokens=1024 hidden=1024 iters=3`）：
+    - `stage_and_pre_barrier_ms=0.83`
+    - `descriptor_enqueue_ms=1.17`
+    - `proxy_drain_ms=0.005`
+    - `completion_wait_ms=0.57`
+    - `post_barrier_ms=2.17`
+    - `transport_total_ms=4.86`
+    - `signal_offsets_ms=0.15`
+    - `materialize_records_ms=0.84`
+    - `metadata_ms=0.33`
+- 停止条件：
+  - 后续一次 README-size timing run 异常长；
+  - `pgrep` 发现服务器上已有其他用户的 `mKernel` / `ncu` 任务；
+  - 按 `agents.md` 约束，已立即停止自己启动的
+    `v2_efa_dispatch_only_bench.py --tokens 8192 ... --master_port=29680`
+    相关进程；
+  - 不再进行服务器构建、测试、benchmark 或 profiling，等待服务器空闲后再继续。
