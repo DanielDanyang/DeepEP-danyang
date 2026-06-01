@@ -195,7 +195,15 @@ nb::dict dispatch_transfer_layout_to_dict(
   out["src_token_stride"] = layout.src_token_stride;
   out["expanded_slot_stride"] = layout.expanded_slot_stride;
   out["batch_payload_stride"] = layout.batch_payload_stride;
+  out["source_rank_stride"] = layout.source_rank_stride;
+  out["source_signal_stride"] = layout.source_signal_stride;
   out["signal_stride"] = layout.signal_stride;
+  out["token_record_bytes"] = layout.token_record_bytes;
+  out["record_payload_offset"] = layout.record_payload_offset;
+  out["record_src_global_offset"] = layout.record_src_global_offset;
+  out["record_topk_idx_offset"] = layout.record_topk_idx_offset;
+  out["record_topk_weight_offset"] = layout.record_topk_weight_offset;
+  out["record_topk_weight_bytes"] = layout.record_topk_weight_bytes;
   return out;
 }
 
@@ -1336,6 +1344,9 @@ NB_MODULE(ep, m) {
               std::uint64_t remote_signal_base, std::uint32_t src_token_stride,
               std::uint32_t expanded_slot_stride,
               std::uint32_t batch_payload_stride,
+              std::uint32_t source_rank_stride,
+              std::uint32_t source_signal_stride,
+              std::uint32_t token_record_bytes,
               std::uint32_t signal_stride,
               const std::string& uccl_include_path,
               std::uintptr_t cuda_stream_ptr) {
@@ -1346,6 +1357,9 @@ NB_MODULE(ep, m) {
              layout.src_token_stride = src_token_stride;
              layout.expanded_slot_stride = expanded_slot_stride;
              layout.batch_payload_stride = batch_payload_stride;
+             layout.source_rank_stride = source_rank_stride;
+             layout.source_signal_stride = source_signal_stride;
+             layout.token_record_bytes = token_record_bytes;
              layout.signal_stride = signal_stride;
              self.launch_dispatch_enqueue_d2h(
                  segments_ptr, batches_ptr, num_batches, commands_ptr,
@@ -1365,6 +1379,9 @@ NB_MODULE(ep, m) {
            nb::arg("src_token_stride") = 0,
            nb::arg("expanded_slot_stride") = 0,
            nb::arg("batch_payload_stride") = 0,
+           nb::arg("source_rank_stride") = 0,
+           nb::arg("source_signal_stride") = 0,
+           nb::arg("token_record_bytes") = 0,
            nb::arg("signal_stride") = sizeof(std::uint32_t),
            nb::arg("uccl_include_path") = "",
            nb::arg("cuda_stream_ptr") = 0)
@@ -1382,6 +1399,9 @@ NB_MODULE(ep, m) {
               std::uint64_t remote_signal_base, std::uint32_t src_token_stride,
               std::uint32_t expanded_slot_stride,
               std::uint32_t batch_payload_stride,
+              std::uint32_t source_rank_stride,
+              std::uint32_t source_signal_stride,
+              std::uint32_t token_record_bytes,
               std::uint32_t signal_stride,
               const std::string& uccl_include_path,
               std::uintptr_t cuda_stream_ptr) {
@@ -1392,6 +1412,9 @@ NB_MODULE(ep, m) {
              layout.src_token_stride = src_token_stride;
              layout.expanded_slot_stride = expanded_slot_stride;
              layout.batch_payload_stride = batch_payload_stride;
+             layout.source_rank_stride = source_rank_stride;
+             layout.source_signal_stride = source_signal_stride;
+             layout.token_record_bytes = token_record_bytes;
              layout.signal_stride = signal_stride;
              self.launch_dispatch_descriptor_enqueue_d2h(
                  topk_idx_ptr, segments_ptr, batches_ptr, counters_ptr,
@@ -1423,6 +1446,9 @@ NB_MODULE(ep, m) {
            nb::arg("src_token_stride"),
            nb::arg("expanded_slot_stride"),
            nb::arg("batch_payload_stride"),
+           nb::arg("source_rank_stride") = 0,
+           nb::arg("source_signal_stride") = 0,
+           nb::arg("token_record_bytes") = 0,
            nb::arg("signal_stride") = sizeof(std::uint32_t),
            nb::arg("uccl_include_path") = "",
            nb::arg("cuda_stream_ptr") = 0)
@@ -1438,6 +1464,9 @@ NB_MODULE(ep, m) {
               std::uint64_t remote_signal_base, std::uint32_t src_token_stride,
               std::uint32_t expanded_slot_stride,
               std::uint32_t batch_payload_stride,
+              std::uint32_t source_rank_stride,
+              std::uint32_t source_signal_stride,
+              std::uint32_t token_record_bytes,
               std::uint32_t signal_stride,
               const std::string& uccl_include_path,
               std::uintptr_t cuda_stream_ptr) {
@@ -1448,6 +1477,9 @@ NB_MODULE(ep, m) {
              layout.src_token_stride = src_token_stride;
              layout.expanded_slot_stride = expanded_slot_stride;
              layout.batch_payload_stride = batch_payload_stride;
+             layout.source_rank_stride = source_rank_stride;
+             layout.source_signal_stride = source_signal_stride;
+             layout.token_record_bytes = token_record_bytes;
              layout.signal_stride = signal_stride;
              self.launch_dispatch_direct_enqueue_d2h(
                  topk_idx_ptr, num_tokens, num_max_tokens_per_rank,
@@ -1476,6 +1508,9 @@ NB_MODULE(ep, m) {
            nb::arg("src_token_stride"),
            nb::arg("expanded_slot_stride"),
            nb::arg("batch_payload_stride"),
+           nb::arg("source_rank_stride") = 0,
+           nb::arg("source_signal_stride") = 0,
+           nb::arg("token_record_bytes") = 0,
            nb::arg("signal_stride") = sizeof(std::uint32_t),
            nb::arg("uccl_include_path") = "",
            nb::arg("cuda_stream_ptr") = 0)

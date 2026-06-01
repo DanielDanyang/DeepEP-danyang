@@ -245,33 +245,46 @@ __global__ void v2_efa_dispatch_direct_enqueue_d2h_kernel(
     if (dst_scaleout_rank == scaleout_rank) {
       continue;
     }
+    const uint32_t dst_global_rank =
+        static_cast<uint32_t>(dst_scaleout_rank * kNumScaleupRanks +
+                              dst_scaleup_lane);
+    const uint64_t source_payload_base =
+        layout.remote_payload_base +
+        static_cast<uint64_t>(layout.source_rank) * layout.source_rank_stride;
+    const uint64_t source_signal_base =
+        layout.remote_signal_base +
+        static_cast<uint64_t>(layout.source_rank) * layout.source_signal_stride;
+    const uint32_t token_bytes =
+        layout.token_record_bytes != 0
+            ? layout.token_record_bytes
+            : static_cast<uint32_t>(kHiddenBytes);
 
     const auto local_offset =
         layout.local_payload_base +
         static_cast<uint64_t>(token) * layout.src_token_stride;
     const auto remote_offset =
-        layout.remote_payload_base +
+        source_payload_base +
         static_cast<uint64_t>(token) * layout.expanded_slot_stride;
     enqueue_v2_transfer_d2h(
         queue, make_v2_transfer_cmd(
                    V2TransferCmdKind::kDispatchPayload,
-                   static_cast<uint32_t>(dst_scaleout_rank),
-                   static_cast<uint32_t>(dst_scaleup_lane),
+                   dst_global_rank,
+                   layout.efa_lane,
                    static_cast<uint32_t>(linear),
                    static_cast<uint32_t>(linear),
-                   static_cast<uint32_t>(kHiddenBytes),
+                   token_bytes,
                    /*signal_value=*/0, local_offset, remote_offset));
     enqueue_v2_transfer_d2h(
         queue, make_v2_transfer_cmd(
                    V2TransferCmdKind::kDispatchSignal,
-                   static_cast<uint32_t>(dst_scaleout_rank),
-                   static_cast<uint32_t>(dst_scaleup_lane),
+                   dst_global_rank,
+                   layout.efa_lane,
                    static_cast<uint32_t>(linear),
                    static_cast<uint32_t>(linear),
                    sizeof(uint32_t),
                    /*signal_value=*/1,
                    /*local_offset=*/0,
-                   layout.remote_signal_base +
+                   source_signal_base +
                        static_cast<uint64_t>(linear) * layout.signal_stride));
     (void)topk_slot;
   }

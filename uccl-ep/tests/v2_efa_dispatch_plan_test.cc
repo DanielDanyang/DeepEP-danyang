@@ -253,6 +253,24 @@ int main() {
   assert(unpacked_v2_dispatch_cmd.bytes == v2_dispatch_cmd.bytes);
   assert(v2_transfer_local_offset(unpacked_v2_dispatch_cmd) == 1000);
   assert(v2_transfer_remote_offset(unpacked_v2_dispatch_cmd) == 2000);
+  auto global_dispatch_layout = dispatch_layout;
+  global_dispatch_layout.num_scaleup_ranks = 2;
+  global_dispatch_layout.source_rank = 3;
+  global_dispatch_layout.source_rank_stride = 4096;
+  global_dispatch_layout.source_signal_stride = 256;
+  global_dispatch_layout.efa_lane = 0;
+  const auto global_rank_dispatch_cmd =
+      make_v2_dispatch_payload_cmd(plan.segments[3], 3, 3,
+                                   global_dispatch_layout);
+  assert(global_rank_dispatch_cmd.target_rank == 3);
+  assert(global_rank_dispatch_cmd.target_lane == 0);
+  assert(v2_transfer_remote_offset(global_rank_dispatch_cmd) ==
+         2000 + 3 * 4096 + 3 * 64);
+  const auto global_rank_dispatch_signal =
+      make_v2_dispatch_signal_cmd(plan.batches[3], 3, global_dispatch_layout);
+  assert(global_rank_dispatch_signal.target_rank == 3);
+  assert(v2_transfer_remote_offset(global_rank_dispatch_signal) ==
+         2256 + 3 * 256 + 3 * sizeof(uint32_t));
 
   const auto combine_layout = make_contiguous_combine_transfer_layout(
       combine_plan, /*expanded_slot_stride=*/32, /*reduced_token_stride=*/32,

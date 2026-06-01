@@ -2068,3 +2068,56 @@ README 风格 EP8x2 性能：
       `posted_signals=1`、`posted_bytes=20`、`head=2`、`tail=2`；
     - smoke 的 native EFA window 从 4096B 调到 8192B，因为当前 combine layout 最小
       需要 4160B。
+
+## 2026-06-01 dispatch wire format 改成 V2 token record
+
+- 当前 dispatch-only 目标下，先修正两个会阻塞 EP8x2 native receiver 的 wire-format
+  问题：
+  - `V2TransferCmd.target_rank` 在 runtime 路径改为 global rank
+    (`dst_scaleout_rank * num_scaleup_ranks + dst_scaleup_lane`)；`target_lane`
+    留给 EFA/NIC lane，避免把 scaleup lane 误当成 endpoint lane。
+  - remote dispatch window 按 source global rank 分片：
+    `remote_payload_base + source_rank * source_rank_stride + batch * batch_stride`，
+    signal 区也同样按 source rank 分片，避免多个 sender 写到 receiver 同一 batch
+    offset 互相覆盖。
+- `_make_dispatch_window_layout` 不再只给 hidden payload 分配裸 byte 区，而是分配 V2
+  token record：
+  - payload bytes；
+  - `src_global` (`int32`)；
+  - raw global `topk_idx` (`int64[num_topk]`)；
+  - 可选 `topk_weights` (`float32[num_topk]`)。
+- 新增 `_stage_dispatch_records_to_v2_window`，在本地 EFA window 中按 record stride
+  staging dispatch sender record。这样 receiver 下一步可以从 RDMA window 直接 materialize
+  `recv_x` / `recv_topk_idx` / `recv_topk_weights` / `recv_src_global`，不再依赖
+  `_semantic_dispatch_data`。
+- 保留旧 helper 的兼容默认：如果 layout 没有设置 `num_scaleup_ranks`，host-side plan
+  test 仍使用旧的 scaleout-rank + lane 解释，避免破坏已有 reference 测试；runtime launch
+  会显式填入真实 `num_scaleup_ranks` 和 `source_rank`。
+- 本地验证：
+  - `python3 -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+    通过。
+  - `g++ -std=c++17 -Iuccl-ep/include -Ideep_ep/include -Iinclude
+    uccl-ep/tests/v2_efa_dispatch_plan_test.cc uccl-ep/src/v2_efa_runtime.cc
+    -o /tmp/v2_efa_dispatch_plan_test && /tmp/v2_efa_dispatch_plan_test` 通过。
+- 服务器验证：
+  - 检查 `p5en_0` / `p5en_1` 时未看到 compute process；
+  - 同步相关文件到 EFS；
+  - `p5en_0` 执行
+    `source /home/ubuntu/.venvs/deepep-danyang-cu13/bin/activate &&
+    cd /home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/uccl-ep &&
+    make -j8 && make install` 通过；
+  - 将 `/home/ubuntu/.venvs/deepep-danyang-cu13/lib/python3.12/site-packages/uccl/ep.abi3.so`
+    从 `p5en_0` 复制到 `p5en_1` venv，避免两台同时写 EFS `.so`；
+  - EP1x2 `uccl-ep/tests/v2_efa_connection_smoke.py` 通过：
+    - rank0 dispatch stats:
+      `drained_commands=2, posted_writes=1, posted_signals=1, posted_bytes=20,
+      head=2, tail=2`；
+    - rank1 dispatch stats:
+      `drained_commands=2, posted_writes=1, posted_signals=1, posted_bytes=20,
+      head=2, tail=2`；
+    - combine 仍是旧过渡路径，本轮只确认没有被 dispatch layout 改动打断。
+- 仍未完成：
+  - receiver materialize kernel 还未接上；
+  - dispatch Python path 仍会调用 `_semantic_dispatch_data` 和 overlay；
+  - descriptor 仍是当前 per-expert scaffold，还没有真正 fork 官方
+    `hybrid_dispatch.cuh` 的 scaleout/forward 主循环。

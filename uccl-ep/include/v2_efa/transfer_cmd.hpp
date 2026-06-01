@@ -67,7 +67,18 @@ struct DispatchTransferLayout {
   uint32_t src_token_stride = 0;
   uint32_t expanded_slot_stride = 0;
   uint32_t batch_payload_stride = 0;
+  uint32_t source_rank_stride = 0;
+  uint32_t source_signal_stride = 0;
   uint32_t signal_stride = sizeof(uint32_t);
+  uint32_t token_record_bytes = 0;
+  uint32_t record_payload_offset = 0;
+  uint32_t record_src_global_offset = 0;
+  uint32_t record_topk_idx_offset = 0;
+  uint32_t record_topk_weight_offset = 0;
+  uint32_t record_topk_weight_bytes = 0;
+  uint32_t num_scaleup_ranks = 0;
+  uint32_t source_rank = 0;
+  uint32_t efa_lane = 0;
   int32_t skip_scaleout_rank = -1;
 };
 
@@ -222,33 +233,68 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_transfer_cmd(
 V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_payload_cmd(
     const DispatchSegmentDescriptor& segment, uint32_t segment_idx,
     uint32_t batch_idx, const DispatchTransferLayout& layout) {
+  const uint32_t token_bytes =
+      layout.token_record_bytes != 0
+          ? layout.token_record_bytes
+          : static_cast<uint32_t>(segment.payload_bytes);
+  const uint32_t src_stride =
+      layout.src_token_stride != 0 ? layout.src_token_stride : token_bytes;
+  const uint32_t expanded_stride =
+      layout.expanded_slot_stride != 0 ? layout.expanded_slot_stride
+                                       : token_bytes;
+  const uint64_t source_payload_base =
+      layout.remote_payload_base +
+      static_cast<uint64_t>(layout.source_rank) * layout.source_rank_stride;
+  const bool use_global_rank = layout.num_scaleup_ranks != 0;
+  const uint32_t dst_global_rank =
+      use_global_rank
+          ? static_cast<uint32_t>(segment.dst_scaleout_rank) *
+                    layout.num_scaleup_ranks +
+                static_cast<uint32_t>(segment.dst_scaleup_lane)
+          : static_cast<uint32_t>(segment.dst_scaleout_rank);
+  const uint32_t efa_lane =
+      use_global_rank ? layout.efa_lane
+                      : static_cast<uint32_t>(segment.dst_scaleup_lane);
   return make_v2_transfer_cmd(
       V2TransferCmdKind::kDispatchPayload,
-      static_cast<uint32_t>(segment.dst_scaleout_rank),
-      static_cast<uint32_t>(segment.dst_scaleup_lane),
+      dst_global_rank,
+      efa_lane,
       segment_idx, batch_idx,
-      static_cast<uint32_t>(segment.count * segment.payload_bytes),
+      static_cast<uint32_t>(segment.count) * token_bytes,
       /*signal_value=*/0,
       layout.local_payload_base +
-          static_cast<uint64_t>(segment.src_token_begin) * layout.src_token_stride,
-      layout.remote_payload_base +
+          static_cast<uint64_t>(segment.src_token_begin) * src_stride,
+      source_payload_base +
           static_cast<uint64_t>(batch_idx) * layout.batch_payload_stride +
           static_cast<uint64_t>(segment.expanded_slot_begin) *
-              layout.expanded_slot_stride);
+              expanded_stride);
 }
 
 V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_signal_cmd(
     const DispatchExpertBatch& batch, uint32_t batch_idx,
     const DispatchTransferLayout& layout) {
+  const uint64_t source_signal_base =
+      layout.remote_signal_base +
+      static_cast<uint64_t>(layout.source_rank) * layout.source_signal_stride;
+  const bool use_global_rank = layout.num_scaleup_ranks != 0;
+  const uint32_t dst_global_rank =
+      use_global_rank
+          ? static_cast<uint32_t>(batch.dst_scaleout_rank) *
+                    layout.num_scaleup_ranks +
+                static_cast<uint32_t>(batch.dst_scaleup_lane)
+          : static_cast<uint32_t>(batch.dst_scaleout_rank);
+  const uint32_t efa_lane =
+      use_global_rank ? layout.efa_lane
+                      : static_cast<uint32_t>(batch.dst_scaleup_lane);
   return make_v2_transfer_cmd(
       V2TransferCmdKind::kDispatchSignal,
-      static_cast<uint32_t>(batch.dst_scaleout_rank),
-      static_cast<uint32_t>(batch.dst_scaleup_lane),
+      dst_global_rank,
+      efa_lane,
       static_cast<uint32_t>(batch.first_segment), batch_idx,
       sizeof(uint32_t),
       static_cast<uint32_t>(batch.total_tokens),
       /*local_offset=*/0,
-      layout.remote_signal_base +
+      source_signal_base +
           static_cast<uint64_t>(batch_idx) * layout.signal_stride);
 }
 
