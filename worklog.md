@@ -2198,3 +2198,33 @@ README 风格 EP8x2 性能：
     还不是直接从 RDMA record 写 expanded output；
   - `batch_counts` / `batch_offsets` 仍由 Python 从 signal window 读取，性能很差；
   - EP8x2 / EP16 correctness 和 README 风格 BW 还没跑通。
+
+## 2026-06-01 dispatch signal scan 与 expanded scatter 下沉到 JIT
+
+- 将 receiver signal/count 的解析从 Python CPU 读 window 改成
+  `v2_efa_dispatch_signal_offsets_kernel`：
+  - kernel 直接读取本 rank 的 EFA receive window signal 区；
+  - 生成 GPU 上的 `batch_counts`、`batch_offsets`、`recv_counts_per_rank`、
+    `total_recv_tokens`；
+  - Python 只同步最终每 rank count 和 total，避免把整块 signal window 搬回 CPU。
+- 将 `do_expand=True` 的 payload scatter 从 Python loop 改成
+  `v2_efa_dispatch_expand_records_kernel`：
+  - 输入 `recv_x` / `recv_topk_weights` / `recv_src_metadata`；
+  - 直接写 V2 expanded output layout；
+  - `dispatch()` 不再使用 Python mask/index loop 写 expanded payload。
+- 服务器验证：
+  - 运行前检查 `p5en_0` / `p5en_1`，两边 `nvidia-smi` 均无 compute process；
+  - 在 `p5en_0` 重新 `make -j8 && make install`，并将 `ep.abi3.so` 同步到
+    `p5en_1` venv；
+  - EP1x2 dispatch-only smoke（含 `do_expand=True`）通过：
+    - rank0: payload `[64,65,66,67]`、expanded `[64,65,66,67]`、
+      `weight=1.25`、`src=[4]`；
+    - rank1: payload `[0,1,2,3]`、expanded `[0,1,2,3]`、
+      `weight=0.25`、`src=[0]`；
+    - 两边 dispatch stats 均为 `drained_commands=2, posted_writes=1,
+      posted_signals=1, posted_bytes=52`。
+- 当前仍未完成：
+  - signal scan kernel 仍是单 CTA / 单线程 correctness 版本，后续要并行化；
+  - `dispatch` 还没有真正 fork DeepEP V2 `hybrid_dispatch.cuh` 主循环；
+  - local/self path 仍暂时走 EFA command，后续应恢复 V2 local/NVLink 语义；
+  - EP8x2 / EP16 dispatch-only correctness 和 BW 还没有跑。

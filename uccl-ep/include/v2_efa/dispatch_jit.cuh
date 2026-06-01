@@ -524,6 +524,78 @@ __global__ void v2_efa_dispatch_materialize_records_kernel(
 }
 
 template <int kInstance>
+__global__ void v2_efa_dispatch_signal_offsets_kernel(
+    const uint8_t* window, int32_t* batch_counts, int32_t* batch_offsets,
+    int32_t* recv_counts_per_rank, int32_t* total_recv_tokens,
+    int num_sources, int max_batches, DispatchTransferLayout layout) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  (void)kInstance;
+
+  int running = 0;
+  for (int source = 0; source < num_sources; ++source) {
+    int source_total = 0;
+    const uint64_t source_signal_base =
+        layout.remote_signal_base +
+        static_cast<uint64_t>(source) * layout.source_signal_stride;
+    for (int batch = 0; batch < max_batches; ++batch) {
+      const uint64_t signal_offset =
+          source_signal_base + static_cast<uint64_t>(batch) * layout.signal_stride;
+      const auto* count_ptr =
+          reinterpret_cast<const uint32_t*>(window + signal_offset);
+      const int count = static_cast<int>(*count_ptr);
+      const int idx = source * max_batches + batch;
+      batch_counts[idx] = count;
+      if (count > 0) {
+        batch_offsets[idx] = running;
+        running += count;
+        source_total += count;
+      } else {
+        batch_offsets[idx] = -1;
+      }
+    }
+    recv_counts_per_rank[source] = source_total;
+  }
+  total_recv_tokens[0] = running;
+}
+
+template <int kNumTopk, int kHiddenBytes>
+__global__ void v2_efa_dispatch_expand_records_kernel(
+    const uint8_t* recv_x, const float* recv_topk_weights,
+    const int32_t* recv_src_metadata, uint8_t* expanded_x,
+    float* expanded_topk_weights, int num_recv_tokens,
+    int num_expanded_tokens, bool has_topk_weight) {
+  const int global_thread =
+      static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const int global_stride = static_cast<int>(gridDim.x * blockDim.x);
+  const int total_routes = num_recv_tokens * kNumTopk;
+
+  for (int linear = global_thread; linear < total_routes;
+       linear += global_stride) {
+    const int row = linear / kNumTopk;
+    const int slot = linear - row * kNumTopk;
+    const int expanded_idx =
+        __ldg(recv_src_metadata + row * (2 + kNumTopk) + 2 + slot);
+    if (expanded_idx < 0 || expanded_idx >= num_expanded_tokens) {
+      continue;
+    }
+    const auto* src_payload =
+        recv_x + static_cast<uint64_t>(row) * kHiddenBytes;
+    auto* dst_payload =
+        expanded_x + static_cast<uint64_t>(expanded_idx) * kHiddenBytes;
+    for (int byte = 0; byte < kHiddenBytes; ++byte) {
+      dst_payload[byte] = src_payload[byte];
+    }
+    if (has_topk_weight && recv_topk_weights != nullptr &&
+        expanded_topk_weights != nullptr) {
+      expanded_topk_weights[expanded_idx * kNumTopk + slot] =
+          recv_topk_weights[row * kNumTopk + slot];
+    }
+  }
+}
+
+template <int kInstance>
 __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
     const DispatchSegmentDescriptor* segments,
     const DispatchExpertBatch* batches, int num_batches,

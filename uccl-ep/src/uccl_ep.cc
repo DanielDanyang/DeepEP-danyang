@@ -1655,7 +1655,85 @@ NB_MODULE(ep, m) {
            nb::arg("record_topk_weight_offset"),
            nb::arg("record_topk_weight_bytes"),
            nb::arg("signal_stride"),
+	           nb::arg("has_topk_weight"),
+	           nb::arg("uccl_include_path") = "",
+	           nb::arg("cuda_stream_ptr") = 0)
+      .def("launch_dispatch_signal_offsets",
+           [](const v2::V2EfaRuntime& self, std::uintptr_t window_ptr,
+              std::uintptr_t batch_counts_ptr,
+              std::uintptr_t batch_offsets_ptr,
+              std::uintptr_t recv_counts_per_rank_ptr,
+              std::uintptr_t total_recv_tokens_ptr, int max_batches,
+              std::uint64_t local_payload_base,
+              std::uint64_t remote_payload_base,
+              std::uint64_t remote_signal_base, std::uint32_t src_token_stride,
+              std::uint32_t expanded_slot_stride,
+              std::uint32_t batch_payload_stride,
+              std::uint32_t source_rank_stride,
+              std::uint32_t source_signal_stride,
+              std::uint32_t token_record_bytes,
+              std::uint32_t signal_stride,
+              const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             v2::DispatchTransferLayout layout;
+             layout.local_payload_base = local_payload_base;
+             layout.remote_payload_base = remote_payload_base;
+             layout.remote_signal_base = remote_signal_base;
+             layout.src_token_stride = src_token_stride;
+             layout.expanded_slot_stride = expanded_slot_stride;
+             layout.batch_payload_stride = batch_payload_stride;
+             layout.source_rank_stride = source_rank_stride;
+             layout.source_signal_stride = source_signal_stride;
+             layout.token_record_bytes = token_record_bytes;
+             layout.signal_stride = signal_stride;
+             self.launch_dispatch_signal_offsets(
+                 window_ptr, batch_counts_ptr, batch_offsets_ptr,
+                 recv_counts_per_rank_ptr, total_recv_tokens_ptr, max_batches,
+                 layout, uccl_include_path, cuda_stream_ptr);
+           },
+           nb::arg("window_ptr"),
+           nb::arg("batch_counts_ptr"),
+           nb::arg("batch_offsets_ptr"),
+           nb::arg("recv_counts_per_rank_ptr"),
+           nb::arg("total_recv_tokens_ptr"),
+           nb::arg("max_batches"),
+           nb::arg("local_payload_base"),
+           nb::arg("remote_payload_base"),
+           nb::arg("remote_signal_base"),
+           nb::arg("src_token_stride"),
+           nb::arg("expanded_slot_stride"),
+           nb::arg("batch_payload_stride"),
+           nb::arg("source_rank_stride"),
+           nb::arg("source_signal_stride"),
+           nb::arg("token_record_bytes"),
+           nb::arg("signal_stride"),
+           nb::arg("uccl_include_path") = "",
+           nb::arg("cuda_stream_ptr") = 0)
+      .def("launch_dispatch_expand_records",
+           [](const v2::V2EfaRuntime& self, std::uintptr_t recv_x_ptr,
+              std::uintptr_t recv_topk_weights_ptr,
+              std::uintptr_t recv_src_metadata_ptr,
+              std::uintptr_t expanded_x_ptr,
+              std::uintptr_t expanded_topk_weights_ptr, int num_recv_tokens,
+              int num_expanded_tokens, bool has_topk_weight,
+              int num_max_tokens_per_rank,
+              const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             self.launch_dispatch_expand_records(
+                 recv_x_ptr, recv_topk_weights_ptr, recv_src_metadata_ptr,
+                 expanded_x_ptr, expanded_topk_weights_ptr, num_recv_tokens,
+                 num_expanded_tokens, has_topk_weight,
+                 num_max_tokens_per_rank, uccl_include_path, cuda_stream_ptr);
+           },
+           nb::arg("recv_x_ptr"),
+           nb::arg("recv_topk_weights_ptr"),
+           nb::arg("recv_src_metadata_ptr"),
+           nb::arg("expanded_x_ptr"),
+           nb::arg("expanded_topk_weights_ptr"),
+           nb::arg("num_recv_tokens"),
+           nb::arg("num_expanded_tokens"),
            nb::arg("has_topk_weight"),
+           nb::arg("num_max_tokens_per_rank"),
            nb::arg("uccl_include_path") = "",
            nb::arg("cuda_stream_ptr") = 0)
       .def("launch_combine_descriptors",

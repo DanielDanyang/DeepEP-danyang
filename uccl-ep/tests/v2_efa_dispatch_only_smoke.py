@@ -65,9 +65,27 @@ def main() -> None:
     assert abs(got_w[0] - expected_weight) < 1e-6, (rank, got_w, expected_weight)
     assert got_src == expected_src, (rank, got_src, expected_src)
     stats = handle.transport_handle.dispatch_drain_stats
+
+    expanded_x, expanded_idx, expanded_w, expanded_handle, _ = buf.dispatch(
+        x,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        num_experts=world,
+        num_max_tokens_per_rank=4,
+        do_cpu_sync=True,
+        do_expand=True,
+    )
+    torch.cuda.synchronize()
+    expanded_tokens = int(expanded_handle.psum_num_recv_tokens_per_expert[-1].item())
+    assert expanded_idx is None
+    assert expanded_tokens == 1, (rank, expanded_tokens)
+    assert expanded_x[:1].reshape(-1).cpu().tolist() == expected_payload
+    assert abs(expanded_w[:1].reshape(-1).cpu().tolist()[0] - expected_weight) < 1e-6
+
     print(
         f"rank={rank} native_dispatch_only_ok=True "
         f"payload={got_payload[:4]} idx={got_idx} weight={got_w[0]:.2f} "
+        f"expanded={expanded_x[:1].reshape(-1).cpu().tolist()[:4]} "
         f"src={got_src} stats={stats}",
         flush=True,
     )

@@ -1250,6 +1250,93 @@ class ElasticBuffer:
             _cuda_stream_ptr(stream),
         )
 
+    def launch_dispatch_signal_offsets(
+        self,
+        batch_counts: torch.Tensor,
+        batch_offsets: torch.Tensor,
+        recv_counts_per_rank: torch.Tensor,
+        total_recv_tokens: torch.Tensor,
+        layout: dict,
+        max_batches: int,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        if self._v2_efa_window is None:
+            raise RuntimeError("native V2 EFA window is not initialized")
+        for name, tensor in (
+            ("batch_counts", batch_counts),
+            ("batch_offsets", batch_offsets),
+            ("recv_counts_per_rank", recv_counts_per_rank),
+            ("total_recv_tokens", total_recv_tokens),
+        ):
+            _require_cuda_contiguous(tensor, name)
+            if tensor.dtype != torch.int32:
+                raise TypeError(f"{name} must be torch.int32")
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_dispatch_signal_offsets(
+            int(self._v2_efa_window.data_ptr()),
+            int(batch_counts.data_ptr()),
+            int(batch_offsets.data_ptr()),
+            int(recv_counts_per_rank.data_ptr()),
+            int(total_recv_tokens.data_ptr()),
+            int(max_batches),
+            int(layout.get("local_payload_base", 0)),
+            int(layout["remote_payload_base"]),
+            int(layout["remote_signal_base"]),
+            int(layout["src_token_stride"]),
+            int(layout["expanded_slot_stride"]),
+            int(layout["batch_payload_stride"]),
+            int(layout["source_rank_stride"]),
+            int(layout["source_signal_stride"]),
+            int(layout["token_record_bytes"]),
+            int(layout.get("signal_stride", 4)),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
+    def launch_dispatch_expand_records(
+        self,
+        recv_x: torch.Tensor,
+        recv_topk_weights: Optional[torch.Tensor],
+        recv_src_metadata: torch.Tensor,
+        expanded_x: torch.Tensor,
+        expanded_topk_weights: Optional[torch.Tensor],
+        num_recv_tokens: int,
+        num_expanded_tokens: int,
+        num_max_tokens_per_rank: int,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        _require_cuda_contiguous(recv_x, "recv_x")
+        _require_cuda_contiguous(recv_src_metadata, "recv_src_metadata")
+        _require_cuda_contiguous(expanded_x, "expanded_x")
+        if recv_topk_weights is not None:
+            _require_cuda_contiguous(recv_topk_weights, "recv_topk_weights")
+        if expanded_topk_weights is not None:
+            _require_cuda_contiguous(expanded_topk_weights, "expanded_topk_weights")
+        if recv_src_metadata.dtype != torch.int32:
+            raise TypeError("recv_src_metadata must be torch.int32")
+        if recv_topk_weights is not None and recv_topk_weights.dtype != torch.float32:
+            raise TypeError("recv_topk_weights must be torch.float32")
+        if expanded_topk_weights is not None and expanded_topk_weights.dtype != torch.float32:
+            raise TypeError("expanded_topk_weights must be torch.float32")
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_dispatch_expand_records(
+            int(recv_x.data_ptr()),
+            0 if recv_topk_weights is None else int(recv_topk_weights.data_ptr()),
+            int(recv_src_metadata.data_ptr()),
+            int(expanded_x.data_ptr()),
+            0 if expanded_topk_weights is None else int(expanded_topk_weights.data_ptr()),
+            int(num_recv_tokens),
+            int(num_expanded_tokens),
+            bool(recv_topk_weights is not None and expanded_topk_weights is not None),
+            int(num_max_tokens_per_rank),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
     def launch_combine_enqueue_d2h(
         self,
         segments: torch.Tensor,
@@ -1566,13 +1653,16 @@ class ElasticBuffer:
                                                dtype=topk_weights.dtype,
                                                device=topk_weights.device)
                 expanded_weights.zero_()
-            for slot in range(num_topk):
-                idx = recv_src_metadata[:num_recv_tokens, 2 + slot]
-                mask = idx >= 0
-                if mask.any():
-                    expanded_x[idx[mask].long()] = recv_x[mask]
-                    if expanded_weights is not None:
-                        expanded_weights[idx[mask].long(), slot] = recv_topk_weights[mask, slot]
+            self.launch_dispatch_expand_records(
+                recv_x=recv_x,
+                recv_topk_weights=recv_topk_weights,
+                recv_src_metadata=recv_src_metadata,
+                expanded_x=expanded_x,
+                expanded_topk_weights=expanded_weights,
+                num_recv_tokens=num_recv_tokens,
+                num_expanded_tokens=expanded_tokens,
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
+            )
             recv_x_out = expanded_x
             recv_topk_idx_out = None
             recv_topk_weights_out = expanded_weights
@@ -1762,45 +1852,25 @@ class ElasticBuffer:
         if self._v2_efa_window is None:
             raise RuntimeError("native V2 EFA window is not initialized")
         max_batches = int(layout["max_batches"])
-        source_signal_stride = int(layout["source_signal_stride"])
-        signal_base = int(layout["remote_signal_base"])
-        signal_bytes = int(self.num_ranks) * source_signal_stride
-        signal_cpu = (
-            self._v2_efa_window[signal_base: signal_base + signal_bytes]
-            .detach()
-            .cpu()
-            .numpy()
-            .tobytes()
-        )
-        counts = []
-        offsets = []
-        recv_counts = []
-        running = 0
-        for src_rank in range(int(self.num_ranks)):
-            row_counts = []
-            row_offsets = []
-            src_total = 0
-            for batch_idx in range(max_batches):
-                byte_offset = src_rank * source_signal_stride + batch_idx * 4
-                count = int.from_bytes(
-                    signal_cpu[byte_offset: byte_offset + 4],
-                    byteorder="little",
-                    signed=False,
-                )
-                row_counts.append(count)
-                if count > 0:
-                    row_offsets.append(running)
-                    running += count
-                    src_total += count
-                else:
-                    row_offsets.append(-1)
-            counts.append(row_counts)
-            offsets.append(row_offsets)
-            recv_counts.append(src_total)
         device = self._v2_efa_window.device
-        counts_tensor = torch.tensor(counts, dtype=torch.int32, device=device)
-        offsets_tensor = torch.tensor(offsets, dtype=torch.int32, device=device)
-        return counts_tensor, offsets_tensor, recv_counts, running
+        counts_tensor = torch.empty(
+            (int(self.num_ranks), max_batches), dtype=torch.int32, device=device
+        )
+        offsets_tensor = torch.empty_like(counts_tensor)
+        recv_counts_tensor = torch.empty((int(self.num_ranks),), dtype=torch.int32, device=device)
+        total_recv_tensor = torch.empty((1,), dtype=torch.int32, device=device)
+        self.launch_dispatch_signal_offsets(
+            batch_counts=counts_tensor,
+            batch_offsets=offsets_tensor,
+            recv_counts_per_rank=recv_counts_tensor,
+            total_recv_tokens=total_recv_tensor,
+            layout=layout,
+            max_batches=max_batches,
+        )
+        torch.cuda.current_stream().synchronize()
+        recv_counts = [int(v) for v in recv_counts_tensor.cpu().tolist()]
+        total_recv = int(total_recv_tensor.item())
+        return counts_tensor, offsets_tensor, recv_counts, total_recv
 
     def _materialize_native_dispatch_from_window(
         self,

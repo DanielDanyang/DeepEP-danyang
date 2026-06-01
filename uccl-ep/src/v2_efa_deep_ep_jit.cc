@@ -338,6 +338,54 @@ void launch_v2_efa_dispatch_materialize_records_plan(
       layout, has_topk_weight));
 }
 
+void launch_v2_efa_dispatch_signal_offsets_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t window_ptr,
+    std::uintptr_t batch_counts_ptr, std::uintptr_t batch_offsets_ptr,
+    std::uintptr_t recv_counts_per_rank_ptr,
+    std::uintptr_t total_recv_tokens_ptr, int num_sources, int max_batches,
+    DispatchTransferLayout layout, std::uintptr_t cuda_stream_ptr) {
+  if (num_sources <= 0 || max_batches <= 0) {
+    throw std::invalid_argument(
+        "invalid V2 EFA dispatch signal-offset launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config,
+      checked_ptr<const uint8_t>(window_ptr, "window"),
+      checked_ptr<int32_t>(batch_counts_ptr, "batch_counts"),
+      checked_ptr<int32_t>(batch_offsets_ptr, "batch_offsets"),
+      checked_ptr<int32_t>(recv_counts_per_rank_ptr,
+                           "recv_counts_per_rank"),
+      checked_ptr<int32_t>(total_recv_tokens_ptr, "total_recv_tokens"),
+      num_sources, max_batches, layout));
+}
+
+void launch_v2_efa_dispatch_expand_records_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t recv_x_ptr,
+    std::uintptr_t recv_topk_weights_ptr,
+    std::uintptr_t recv_src_metadata_ptr, std::uintptr_t expanded_x_ptr,
+    std::uintptr_t expanded_topk_weights_ptr, int num_recv_tokens,
+    int num_expanded_tokens, bool has_topk_weight,
+    std::uintptr_t cuda_stream_ptr) {
+  if (num_recv_tokens < 0 || num_expanded_tokens < 0) {
+    throw std::invalid_argument(
+        "invalid V2 EFA dispatch expand-records launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config,
+      checked_ptr<const uint8_t>(recv_x_ptr, "recv_x"),
+      reinterpret_cast<const float*>(recv_topk_weights_ptr),
+      checked_ptr<const int32_t>(recv_src_metadata_ptr, "recv_src_metadata"),
+      checked_ptr<uint8_t>(expanded_x_ptr, "expanded_x"),
+      reinterpret_cast<float*>(expanded_topk_weights_ptr), num_recv_tokens,
+      num_expanded_tokens, has_topk_weight));
+}
+
 void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t dispatch_segments_ptr,
     std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
@@ -588,6 +636,36 @@ void V2EfaRuntime::launch_dispatch_materialize_records(
       recv_topk_idx_ptr, recv_topk_weights_ptr, recv_src_global_ptr,
       cfg.world_size, max_batches, num_max_tokens_per_rank, cfg.num_experts,
       cfg.rank, layout, has_topk_weight, cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_dispatch_signal_offsets(
+    std::uintptr_t window_ptr, std::uintptr_t batch_counts_ptr,
+    std::uintptr_t batch_offsets_ptr,
+    std::uintptr_t recv_counts_per_rank_ptr,
+    std::uintptr_t total_recv_tokens_ptr, int max_batches,
+    DispatchTransferLayout layout, const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto& cfg = config();
+  const auto plan = build_dispatch_signal_offsets_jit_plan(uccl_include_path);
+  launch_v2_efa_dispatch_signal_offsets_plan(
+      plan, window_ptr, batch_counts_ptr, batch_offsets_ptr,
+      recv_counts_per_rank_ptr, total_recv_tokens_ptr, cfg.world_size,
+      max_batches, layout, cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_dispatch_expand_records(
+    std::uintptr_t recv_x_ptr, std::uintptr_t recv_topk_weights_ptr,
+    std::uintptr_t recv_src_metadata_ptr, std::uintptr_t expanded_x_ptr,
+    std::uintptr_t expanded_topk_weights_ptr, int num_recv_tokens,
+    int num_expanded_tokens, bool has_topk_weight,
+    int num_max_tokens_per_rank, const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto plan = build_dispatch_expand_records_jit_plan(
+      num_max_tokens_per_rank, uccl_include_path);
+  launch_v2_efa_dispatch_expand_records_plan(
+      plan, recv_x_ptr, recv_topk_weights_ptr, recv_src_metadata_ptr,
+      expanded_x_ptr, expanded_topk_weights_ptr, num_recv_tokens,
+      num_expanded_tokens, has_topk_weight, cuda_stream_ptr);
 }
 
 void V2EfaRuntime::launch_combine_descriptor_enqueue_d2h(
