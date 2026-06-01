@@ -1868,10 +1868,15 @@ class ElasticBuffer:
             return
         expected = int(stats.get("posted_writes", 0)) + int(stats.get("posted_signals", 0))
         seen = 0
-        for _ in range(10000):
+        deadline = time.perf_counter() + 5.0
+        spins = 0
+        while time.perf_counter() < deadline:
             seen += int(self._v2_efa_connection.poll_completions(max(1, expected - seen)))
             if seen >= expected:
                 return
+            spins += 1
+            if spins % 4096 == 0:
+                time.sleep(0)
         raise TimeoutError(f"timed out waiting for {expected} V2 EFA completions, saw {seen}")
 
     def _native_dispatch_batch_counts_from_window(

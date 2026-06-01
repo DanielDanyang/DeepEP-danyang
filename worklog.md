@@ -2371,3 +2371,65 @@ README 风格 EP8x2 性能：
 - 在 receiver signal kernel 中，done-spin 结束后、读取 batch count table 前加入
   `__threadfence_system()`，避免只靠 block barrier 处理 NIC 写入的系统可见性。
 - 本地检查通过；仍未服务器验证，因为服务器有其他用户任务。
+
+## 2026-06-01 done signal 服务器验证
+
+- 空闲检查：
+  - `p5en_0` / `p5en_1` `nvidia-smi` 无 compute process；
+  - `pgrep` 未见其他 `torchrun` / `ncu` / `nsys` / DeepEP 测试进程。
+- 同步并构建：
+  - 最新 `uccl-ep` 文件已同步到远端；
+  - `p5en_0` 上 `make -j8 && make install` 通过；
+  - `ep.abi3.so` 已复制到 `p5en_1` venv。
+- correctness：
+  - EP2 correctness 通过：
+    - `dispatch_correctness_ok EP2 tokens=8 hidden=16 remote_pair=False`
+    - stats: `drained_commands=4, posted_writes=1, posted_signals=3,
+      posted_bytes=524`
+    - 命令数符合 `1 payload + 1 count signal + 2 done signals`。
+  - EP16 remote-pair correctness 通过：
+    - `dispatch_correctness_ok EP16 tokens=8 hidden=16 remote_pair=True`
+    - stats: `drained_commands=18, posted_writes=1, posted_signals=17,
+      posted_bytes=580`
+    - 命令数符合 `1 payload + 1 count signal + 16 done signals`。
+- small bench：
+  - `tokens=1024 hidden=1024 experts=16 topk=1 sms=8 iters=5`：
+    `avg_us=4394.19 payload_GBps=0.48 record_GBps=0.48`
+  - timing:
+    - `stage_and_pre_barrier_ms=0.82`
+    - `descriptor_enqueue_ms=1.23`
+    - `proxy_drain_ms=0.012`
+    - `completion_wait_ms=0.28`
+    - `post_barrier_ms=0.0`
+    - `transport_total_ms=2.44`
+    - `signal_offsets_ms=0.19`
+    - `materialize_records_ms=0.84`
+    - `metadata_ms=0.31`
+  - 对比之前 small bench：`post_barrier_ms` 从约 `2.17ms` 归零，
+    `completion_wait_ms` 从约 `0.57ms` 降到约 `0.28ms`，
+    `transport_total_ms` 从约 `4.86ms` 降到约 `2.44ms`。
+- README-size bench：
+  - 首次运行因 CQ wait 仍用固定 10000 次 tight loop，部分 rank 在大 payload 下只看到
+    `15/18` 个 completion 后超时；
+  - 修正 `_wait_native_v2_efa_completions()` 为 5 秒 deadline tight polling，
+    每 4096 次 `time.sleep(0)` 让出调度，不恢复 0.5ms sleep；
+  - 重新运行通过：
+    - `tokens=8192 hidden=7168 experts=16 topk=1 sms=8 iters=2 window=4096MB`
+    - `avg_us=53524.71 payload_GBps=2.19 record_GBps=2.20`
+    - stats: `drained_commands=18, posted_writes=1, posted_signals=17,
+      posted_bytes=117702724`
+    - timing:
+      - `stage_and_pre_barrier_ms=13.26`
+      - `descriptor_enqueue_ms=8.32`
+      - `completion_wait_ms=5.35`
+      - `post_barrier_ms=0.0`
+      - `transport_total_ms=28.14`
+      - `signal_offsets_ms=0.14`
+      - `materialize_records_ms=23.87`
+      - `metadata_ms=0.68`
+- 当前结论：
+  - done signal 替代 post barrier 的 correctness 成立；
+  - small-message latency 明显下降；
+  - README-size BW 从自动 EFA 绑定后的有效 `1.45 GB/s` 提升到 `2.19 GB/s`；
+  - 下一批主要瓶颈已经转为 staging / descriptor enqueue /
+    receiver materialize / CQ completion wait，而不是 post CPU barrier。
