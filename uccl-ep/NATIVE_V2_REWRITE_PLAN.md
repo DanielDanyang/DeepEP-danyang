@@ -398,21 +398,19 @@ device enqueue EFA proxy descriptors
 完成 native V2 前的硬阻塞：
 
 1. **真实 fork DeepEP V2 dispatch JIT 主路径。**
-   当前 direct enqueue kernel 仍是 sidecar 过渡层。必须进入真实
-   `hybrid_dispatch.cuh` scaleout path，把 GIN notify/tail/payload call site 替换为
-   V2TransferCmd enqueue，而不是在 semantic dispatch 之后补一条 RDMA overlay。
+   direct enqueue 过渡层已删除。下一步必须进入真实 `hybrid_dispatch.cuh`
+   scaleout path，把 GIN notify/tail/payload call site 替换为 V2TransferCmd enqueue，
+   让 command 直接来自官方 V2 route/slot/metadata 语义。
 
 2. **receiver 端直接生成官方 V2 expanded layout。**
-   现在 remote slot 仍接近 `token * expanded_slot_stride` 的临时映射，ordering 和输出主要
-   由 semantic bridge 保证。最终必须在 receiver epilogue 里直接写 expanded payload、
-   `recv_src_metadata`、`dst_buffer_slot_idx`、psum/count metadata，并删除 public
-   `dispatch()` 里的 RDMA window overlay。
+   当前 receiver 仍先从 RDMA window materialize record，再构造 V2 metadata。最终必须在
+   receiver epilogue 里直接写 expanded payload、`recv_src_metadata`、
+   `dst_buffer_slot_idx`、psum/count metadata。
 
 3. **真实 native reduced-combine。**
-   combine 必须完整解析官方 V2 `token_metadata_at_forward`、`channel_linked_list` 和
-   psum metadata，支持 topk>1、多 remote contributor、同 token 多贡献 reduce。当前只在
-   简单唯一 remote contributor 场景 overlay payload，多 contributor 仍依赖 semantic
-   fallback，这还不是 native V2 combine。
+   public `combine()` 已移除 semantic all-to-all 路径并明确报未实现。后续 combine 必须
+   完整解析官方 V2 `token_metadata_at_forward`、`channel_linked_list` 和 psum metadata，
+   支持 topk>1、多 remote contributor、同 token 多贡献 reduce。
 
 4. **cached dispatch/combine 走官方 V2 handle/cache。**
    cached path 不能从 semantic tensors 或 transitional descriptor 重新推导。需要复用
@@ -478,28 +476,19 @@ device enqueue EFA proxy descriptors
 
 当前进度：
 
-- 已新增 `include/v2_efa/jit_plan.hpp`，开始接入真实 DeepEP V2 JIT kernel 组织方式：
-  - dispatch/combine 的 launch plan 复刻官方 V2 `DispatchRuntime` /
-    `CombineRuntime` 的 SM、warp、thread、cluster、cooperative 计算。
-  - 生成的 JIT source 会 include 官方 DeepEP V2
-    `deep_ep/impls/{dispatch,hybrid_dispatch,combine,hybrid_combine}.cuh`，
-    同时 instantiate `v2_efa/{dispatch,combine}_jit.cuh` 的 AWS V2 kernel。
-  - 这一步先打通“native V2 EFA kernel 由 DeepEP V2 JIT source 生成”的 host/runtime
-    边界；`launch_dispatch/launch_combine` 仍未接到 `deep_ep::jit::compiler->build`
-    和真实 CUDA launch。
-- `V2EfaRuntime` / Python wrapper 已暴露 `build_dispatch_jit_plan` 和
-  `build_combine_jit_plan`，可检查生成 source、launch 维度和 include 路径。
-- 已新增 `src/v2_efa_deep_ep_jit.cc`，把 native V2 EFA JIT plan 接到官方
-  `deep_ep::jit::compiler->build()`：
-  - Python 可调用 `deep_ep.init_deep_ep_jit(...)` 初始化 DeepEP JIT root、CUDA root、
-    NCCL root。
-  - `V2EfaRuntime.compile_dispatch_jit` / `compile_combine_jit` 会生成 plan 并编译进
-    DeepEP JIT cubin cache。
-  - 当前只 build/缓存 kernel，还没有保存 `KernelRuntime` handle 并 launch。
+- `src/v2_efa_deep_ep_jit.cc` 已把 native V2 EFA JIT plan 接到官方
+  `deep_ep::jit::compiler->build()` 和真实 CUDA launch。
+- 清理后不再暴露 standalone `build_dispatch_jit_plan` /
+  `build_combine_jit_plan`。这些只生成 descriptor/reference kernel，容易让测试绕开
+  最终数据路径。
+- dispatch 当前只保留一条主入口：
+  `compile/launch_dispatch_descriptor_enqueue_d2h`。它在同一个 JIT kernel 中生成 V2
+  descriptor 并写入 `V2TransferCmd` D2H queue。
+- combine 暂时只保留后续 native combine 会用到的 fused descriptor/enqueue 与
+  forward-metadata/enqueue 入口；public `combine()` 不再回退到 semantic all-to-all。
 
-交付标准：不同 hidden/topk/expert/num_sms 配置能生成不同 JIT kernel。当前已能生成
-不同 JIT source/launch plan，并提供 `compiler->build` 入口；下一步要保存
-`KernelRuntime` handle 并 launch。
+交付标准：所有保留的 JIT 入口必须对应最终 native V2 数据路径；任何只用于
+reference、两阶段对拍或绕过 D2H/proxy 的入口都应删除。
 
 ### 4. 设计 V2 EFA command queue
 
@@ -509,26 +498,12 @@ device enqueue EFA proxy descriptors
 
 当前进度：
 
-- 已定义 dispatch/combine descriptor 和 native V2 transfer command scaffold。
-- 已实现 CPU reference dispatch planner，用来固定 CUDA/JIT descriptor 语义。
-- dispatch planner 当前按 `(dst_scaleout_rank, dst_scaleup_lane, expert_id)` 做
-  semantic batching，并保留 `topk_slot`。
-- 已实现 CPU reference combine planner，从 dispatch plan 反推 reduced-combine
-  descriptor，保留 expanded/reduced slot 和 `topk_slot`。
-- `dispatch_jit.cuh` 已实现 device-side reference descriptor generator，后续需要把
-  serial expert scan 并行化并接入 DeepEP V2 `hybrid_dispatch` JIT。
-- `combine_jit.cuh` 已实现从 dispatch descriptor 反推 combine descriptor 的
-  device-side reference generator，后续需要改为直接读取 V2 forward metadata。
-- 已新增 native transfer command planner，将 descriptor 直接转成
-  `V2TransferCmd` payload/signal command；不再保留旧 `ProxyCommand` 过渡层。
-- 已新增 device-side transfer enqueue kernel，把 dispatch/combine descriptor 写入
-  `V2TransferQueueView`。当前是 serial reference 版本，后续需要并行化并接到
-  retained EFA host proxy。
-- 已新增 host loopback executor，用本地 byte buffers 验证 payload copy 和 signal write。
-- transfer command 已包含 signal value 和目标 rank/lane；layout 里有
-  `batch_payload_stride`，用于隔离 per-expert semantic batch 的远端 payload 区域。
-- 已新增 fixed-capacity host queue scaffold，模拟 host proxy 从 command ring drain
-  commands；下一步可以把这个 queue adapter 接到 retained EFA posting path。
+- 已定义 dispatch/combine descriptor 和 native V2 `V2TransferCmd`。
+- 已删除 CPU reference planner、host loopback executor、contiguous transfer layout helper、
+  host-side transfer command planner，以及 standalone descriptor/enqueue/direct enqueue
+  JIT kernel。
+- 保留的 command 生成位置必须在 JIT `.cuh` 主路径里：dispatch 现在只允许
+  `v2_efa_dispatch_descriptor_enqueue_d2h_kernel` 生成 `V2TransferCmd`。
 - 已新增 transport-neutral `EfaPostOp` / `EfaPostSink` adapter。真实 EFA verbs sink
   应实现这个接口，避免把 native V2 command 再编码回旧协议。
 - 已新增 `EndpointTable` -> `ResolvedEfaPostOp` 解析层，把 V2 command 里的
@@ -545,53 +520,37 @@ device enqueue EFA proxy descriptors
   FIFO/trigger words decode 成 `EfaPostOp`。真实 CPU proxy poll loop 后续应在这里
   分流 V2 command，而不是进入旧 `TransferCmd` decode 逻辑。
 - command helper 已改为 CUDA/HIP host-device inline；device enqueue kernel 和 host
-  reference planner 共用同一套 builder/codec。
+  EFA adapter 共用同一套 builder/codec。
 - 已新增 V2 专用 D2H ring scaffold：`transfer_d2h_queue.cuh`。它复用 UCCL EP 的
   head/tail/ack 思路和 128-bit slot 宽度，但 readiness byte 是 `V2TransferCmd.kind`，
-  不依赖旧 `TransferCmd.cmd_type`。host reference 已覆盖 submit -> poll -> EFA post
-  -> ack -> advance tail。
+  不依赖旧 `TransferCmd.cmd_type`。
 - D2H queue publish/ack 已修正成 32-bit header 协议：device 写完整 command 后用
   `atomicExch` publish header，host acquire 读取 header，并只 ack 当前连续 ready end。
   这修掉了 leaked slot 永久卡死、poll/ack TOCTOU 丢 command、`kind` 非原子 data race、
   enqueue overflow 后 tail 前进导致 stale slot 被处理等问题。
-- `dispatch_jit.cuh` / `combine_jit.cuh` 已新增直接写 `V2TransferD2HQueueView` 的
-  enqueue kernel scaffold。下一步是把这个 view 映射到 retained CPU proxy 的真实
-  pinned D2H queue，并让 proxy poll loop 只消费 V2 command。
+- `dispatch_jit.cuh` / `combine_jit.cuh` 保留直接写 `V2TransferD2HQueueView` 的
+  fused enqueue kernel。下一步是继续把 dispatch 的 payload staging/materialize
+  去掉，让 sender/receiver 直接写 V2 layout。
 - `efa_adapter.hpp` 已新增从 host V2 D2H queue 直接 drain 到 `EfaPostSink` 的 adapter，
-  作为真实 proxy poll loop 的 reference 入口。
+  作为真实 proxy poll loop 的入口。
 - 已新增 V2-only host proxy scaffold：`v2_efa/proxy.hpp`。它只接受
   `HostV2TransferD2HQueue`，只产出 `EfaPostOp`，不再接收旧 V1 `TransferCmd`。
   当前 reference test 已覆盖单个 V2 queue 同时承载 dispatch/combine command、
   post 计数和 ack/tail advance。多 queue 只表示多 channel/proxy thread，不表示
   dispatch/combine 分离。
-- JIT header 已新增直接写 `V2TransferCmd` 的 device enqueue kernel。旧
-  `ProxyCommand` enqueue/reference 路径已删除，host transfer queue 和 EFA adapter
-  都直接消费 `V2TransferCmd`。
-- 已新增 parallel-ish direct dispatch enqueue JIT scaffold：
-  `v2_efa_dispatch_direct_enqueue_d2h_kernel` 按 `num_tokens * topk` 在线程间切分，
-  直接由 V2 `topk_idx` / expert owner 计算 `(target_rank, target_lane,
-  local_offset, remote_offset)` 并写入 16B `V2TransferCmd`。这比旧 serial
-  descriptor enqueue 更接近真实 V2 JIT 主路径，但仍只是过渡层：它还没有复用
-  `hybrid_dispatch.cuh` 的 expanded slot 分配、per-expert batching、metadata
-  写入和 cached handle 语义。
-- Python `ElasticBuffer` 在已初始化 `V2EfaConnection` 时，dispatch 现在拆成两步：
-  先运行 descriptor kernel 生成 V2 handle metadata/counters，再运行 direct enqueue
-  kernel 生成真实 D2H/EFA command。无 EFA connection 的 reference path 仍使用 fused
-  descriptor enqueue，方便本地对拍。
+- JIT header 已新增直接写 `V2TransferCmd` 的 fused device enqueue kernel。旧
+  `ProxyCommand` enqueue/reference 路径、direct enqueue 过渡层和无 EFA connection
+  的 reference path 都已删除。
+- Python `ElasticBuffer` dispatch 现在要求真实 `V2EfaConnection`；未初始化 EFA
+  connection 时直接报错，不再构造 dummy layout 或本地 reference path。
 - `ElasticBuffer` 的 scaleup/scaleout topology 推断已改为优先使用
   `LOCAL_WORLD_SIZE` / `LOCAL_SIZE`，再回退到 `torch.cuda.device_count()`。理由是
   V2 scaleup rank 表示当前 distributed job 的本节点 rank 数，而不是机器物理 GPU 数；
   EP1x2 smoke 每台只起 1 个进程，如果用物理 8 GPU 推断会把两台机器误判成同一个
   scaleout rank，direct kernel 会错误跳过跨机 EFA traffic。真实 EP8x2 下 torchrun
   应提供 `LOCAL_WORLD_SIZE=8`，语义和 V2 rank layout 对齐。
-- 已新增 contiguous transfer layout helper，用 descriptor 中的 expanded/reduced slot
-  span 自动计算 per-batch payload stride 和 signal base。combine 路径按
-  `reduced_token_slot + count` 计算跨度，避免把 V2 reduced layout 误当作 batch-local
-  packed layout。
-- nanobind/Python runtime 已新增 `build_reference_transfer_roundtrip_plan`，可导出
-  descriptor、contiguous layout 和 `V2TransferCmd` 列表，作为接入真实 V2 JIT/handle
-  metadata 前的对拍入口。
-交付标准：单机 loopback 或 fake remote 可以验证 descriptor enqueue/dequeue 正确。
+交付标准：dispatch 只有一条 native V2 D2H/proxy/EFA 主路径；源码中不保留
+reference planner、loopback executor、direct enqueue 过渡层或 semantic/overlay 兜底。
 
 ### 5. Dispatch direct expanded layout
 
@@ -599,23 +558,18 @@ device enqueue EFA proxy descriptors
 - sender 按 expert/lane semantic batch pack payload。
 - receiver 直接写入 V2 expanded layout 和必要 metadata。
 - 当前已完成一个最小 direct payload RDMA 验证：
-  - device kernel 直接 enqueue `V2TransferCmd` 到 D2H queue；
+  - fused dispatch JIT kernel 直接 enqueue `V2TransferCmd` 到 D2H queue；
   - CPU/EFA sink drain 后将 payload 写入 peer 的 V2 RDMA window；
-  - public `dispatch()` 在 EFA path 下会用 RDMA window 中的 remote scaleout payload
-    覆盖 semantic reference `recv_x`，所以返回 payload 不再只是 NCCL/semantic
-    all-to-all 的结果；
-  - EP1x2 smoke 通过，每 rank 产生 `drained_commands=2`、
-    `posted_writes=1`、`posted_signals=1`、`posted_bytes=20`。
+  - EP16 dispatch-only correctness 已通过，但性能仍很低。
 - 仍缺真正 native V2 dispatch：
-  - direct kernel 的 remote slot 仍是 `token * expanded_slot_stride`，尚未使用
-    official V2 expanded slot assignment；
+  - sender 仍先把 token record stage 到本地 EFA window，未在官方
+    `hybrid_dispatch.cuh` scaleout path 中直接生成 payload command；
   - `token_metadata_at_forward` / `channel_linked_list` 的 V2-like 多 channel tensor
     填充已经下沉到 `v2_efa_dispatch_forward_metadata_kernel`，不再由 Python loop 写入；
-    但它的输入 `recv_src_metadata` / `recv_topk_idx` 仍来自 semantic dispatch bridge，
-    还不是官方 `hybrid_dispatch.cuh` receiver epilogue 原地产生；
-  - 还没有把 payload scatter 合并进官方 V2 epilogue；
-  - ordering 仍由 semantic reference path 计算，RDMA window overlay 只是把
-    remote payload 数据面接入 public output，还不是最终的 V2 receiver epilogue。
+    但 receiver 仍要先 materialize window record，再构造 V2 metadata；
+  - 还没有把 payload scatter 和 metadata 写入合并进官方 V2 receiver epilogue；
+  - 当前 `signal_offsets` 之后仍有 D2H total count、动态 allocation 和
+    `materialize_records`，这是 README-size dispatch 的主要阻塞。
 
 交付标准：EP8x2 dispatch correctness 通过，且不经过 V1 staging buffer。
 
@@ -631,24 +585,12 @@ device enqueue EFA proxy descriptors
 - 从 V2 forward metadata 生成 combine descriptor。
 - 支持 reduced-combine，receiver 直接写回 owner rank 的 reduced layout。
 - reduce epilogue 保持 V2 语义。
-- 当前已完成一个最小 native combine payload RDMA 验证：
-  - `v2_efa_combine_forward_metadata_enqueue_d2h_kernel` 已在 CUDA/JIT 端解析
-    compact `token_metadata_at_forward`，生成 `CombineSegmentDescriptor` /
-    `CombineExpertBatch` 并直接 enqueue `V2TransferCmd`，不再由 Python loop 构造
-    combine descriptors；
-  - combine 目标不再从本 rank 的 outgoing dispatch descriptor 反推，而来自 forward
-    metadata 中的 source global token id / expanded slot；
-  - dispatch handle 现在填充 compact transitional `token_metadata_at_forward` 和
-    `channel_linked_list`，combine descriptor builder 优先消费
-    `token_metadata_at_forward`；这让语义来源更接近官方 V2 handle/cache，而不是直接
-    依赖 Python-only `recv_src_metadata`；
-  - sender 将 combine input staging 到 V2 EFA window，然后用 existing
-    `v2_efa_combine_enqueue_d2h_kernel` 生成 `V2TransferCmd`；
-  - CPU/EFA sink drain 后把 payload 写回 owner rank 的 V2 RDMA window；
-  - public `combine()` 在可唯一判定一个 remote scaleout contributor 的 token 上，会用
-    RDMA window payload 覆盖 semantic reference output；
-  - EP1x2 smoke 已验证 dispatch 和 combine 两个方向都产生
-    `drained_commands=2`、`posted_writes=1`、`posted_signals=1`、`posted_bytes=20`。
+- 当前已清理 combine 的临时可运行路径：
+  - standalone combine descriptor kernel、两阶段 combine enqueue kernel、Python
+    semantic all-to-all 和 RDMA window overlay 都已删除；
+  - public `combine()` 现在明确报未实现，避免 correctness 通过但走错路线；
+  - 保留的底层入口只用于后续 native combine：fused descriptor/enqueue 和
+    forward-metadata/enqueue。
 - 仍缺真正 native V2 combine：
   - `token_metadata_at_forward` / `channel_linked_list` 已从 compact 2D tensor 改成
     V2-like 多 channel 形状：
@@ -661,8 +603,7 @@ device enqueue EFA proxy descriptors
     `hybrid_dispatch.cuh` 的 per-channel scheduling 和 linked-list tail 协议。
   - descriptor 构造已下沉到 CUDA/JIT，但还没有解析完整官方
     `token_metadata_at_forward` / `channel_linked_list`；
-  - 多 topk / 多 remote contributor 的 reduce 仍由 semantic fallback 兜底，RDMA overlay
-    只覆盖单 remote contributor 情况；
+  - 多 topk / 多 remote contributor 的 reduce 尚未实现；
   - receiver reduced layout 还不是官方 V2 reduce epilogue 的完整实现。
 
 交付标准：combine / reduced combine correctness 通过。

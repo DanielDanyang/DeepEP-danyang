@@ -2433,3 +2433,43 @@ README 风格 EP8x2 性能：
   - README-size BW 从自动 EFA 绑定后的有效 `1.45 GB/s` 提升到 `2.19 GB/s`；
   - 下一批主要瓶颈已经转为 staging / descriptor enqueue /
     receiver materialize / CQ completion wait，而不是 post CPU barrier。
+
+## 2026-06-01 清理非主路径代码
+
+- 按“不要用 fallback/临时路径跑 correctness”的要求，删除 native V2 dispatch/combine
+  中不属于最终主路径的入口：
+  - CPU reference dispatch/combine planner；
+  - host loopback executor；
+  - contiguous transfer layout helper；
+  - host-side transfer command planner；
+  - standalone descriptor JIT；
+  - 两阶段 dispatch/combine enqueue JIT；
+  - dispatch direct enqueue 过渡 kernel；
+  - Python semantic combine all-to-all 和 RDMA window overlay。
+- `ElasticBuffer.dispatch()` 现在要求真实 `V2EfaConnection`；未初始化 EFA connection
+  时直接报错，不再构造 dummy layout 或本地 reference path。
+- `ElasticBuffer.combine()` 现在明确 `NotImplementedError`，不再回到 semantic
+  all-to-all correctness。
+- 保留的 dispatch 主路径只有：
+  `launch_dispatch_descriptor_enqueue_d2h_queue()` ->
+  `v2_efa_dispatch_descriptor_enqueue_d2h_kernel` ->
+  `V2TransferCmd` D2H queue ->
+  EFA sink。
+- 本地检查：
+  - `python3 -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+    通过；
+  - `git diff --check -- uccl-ep` 通过；
+  - 源码中已无 `build_reference*`、`direct_enqueue`、standalone dispatch/combine
+    enqueue JIT、`_semantic_*`、`_overlay_*` 入口。
+- 服务器构建验证：
+  - 同步到 `p5en_0` / `p5en_1` 前确认两台机器无其他 GPU compute 进程；
+  - `p5en_0` 上 `make -j8` 通过，`make install` 安装到
+    `/home/ubuntu/.venvs/deepep-danyang-cu13`；
+  - 已复制 `ep.abi3.so` 到 `p5en_1` venv；
+  - import/API smoke 通过：`launch_dispatch_descriptor_enqueue_d2h` 仍存在，
+    `build_reference_dispatch_plan` 和旧 `launch_dispatch` 已不存在。
+- 下一步不再新增旁路 correctness；直接处理 dispatch 主链路阻塞：
+  1. 把 staging record 去掉，sender 从 V2 JIT route/slot 直接生成 payload command；
+  2. receiver 直接写 expanded layout/metadata，删除 `materialize_records` 中间层；
+  3. 用 GPU-side count/offset 或预分配输出减少 D2H total-count 同步；
+  4. CQ completion wait 和 proxy drain 并行化。

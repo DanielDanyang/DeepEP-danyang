@@ -14,9 +14,7 @@
 #include "v2_efa/efa_adapter.hpp"
 #include "v2_efa/runtime.hpp"
 #include "v2_efa/transfer_cmd.hpp"
-#include "v2_efa/transfer_cmd_plan.hpp"
 #include "v2_efa/transfer_d2h_queue.cuh"
-#include "v2_efa/transfer_layout.hpp"
 #include "v2_efa/verbs_sink.hpp"
 
 #if UCCL_V2_EFA_HAS_VERBS
@@ -99,127 +97,6 @@ nb::dict route_to_dict(const v2::ExpertRoute& route) {
   return out;
 }
 
-nb::dict dispatch_segment_to_dict(const v2::DispatchSegmentDescriptor& segment) {
-  nb::dict out;
-  out["dst_scaleout_rank"] = segment.dst_scaleout_rank;
-  out["dst_scaleup_lane"] = segment.dst_scaleup_lane;
-  out["expert_id"] = segment.expert_id;
-  out["count"] = segment.count;
-  out["src_token_begin"] = segment.src_token_begin;
-  out["src_token_index_offset"] = segment.src_token_index_offset;
-  out["topk_slot"] = segment.topk_slot;
-  out["expanded_slot_begin"] = segment.expanded_slot_begin;
-  out["payload_bytes"] = segment.payload_bytes;
-  out["scale_bytes"] = segment.scale_bytes;
-  out["flags"] = segment.flags;
-  return out;
-}
-
-nb::dict dispatch_batch_to_dict(const v2::DispatchExpertBatch& batch) {
-  nb::dict out;
-  out["dst_scaleout_rank"] = batch.dst_scaleout_rank;
-  out["dst_scaleup_lane"] = batch.dst_scaleup_lane;
-  out["expert_id"] = batch.expert_id;
-  out["first_segment"] = batch.first_segment;
-  out["num_segments"] = batch.num_segments;
-  out["total_tokens"] = batch.total_tokens;
-  return out;
-}
-
-nb::dict dispatch_plan_to_dict(const v2::DispatchPlan& plan) {
-  nb::list segments;
-  for (const auto& segment : plan.segments) {
-    segments.append(dispatch_segment_to_dict(segment));
-  }
-  nb::list batches;
-  for (const auto& batch : plan.batches) {
-    batches.append(dispatch_batch_to_dict(batch));
-  }
-  nb::dict out;
-  out["segments"] = segments;
-  out["batches"] = batches;
-  return out;
-}
-
-nb::dict combine_segment_to_dict(const v2::CombineSegmentDescriptor& segment) {
-  nb::dict out;
-  out["dst_original_rank"] = segment.dst_original_rank;
-  out["dst_scaleout_rank"] = segment.dst_scaleout_rank;
-  out["dst_scaleup_lane"] = segment.dst_scaleup_lane;
-  out["src_scaleout_rank"] = segment.src_scaleout_rank;
-  out["expert_id"] = segment.expert_id;
-  out["count"] = segment.count;
-  out["expanded_slot_begin"] = segment.expanded_slot_begin;
-  out["expanded_slot_index_offset"] = segment.expanded_slot_index_offset;
-  out["topk_slot"] = segment.topk_slot;
-  out["reduced_token_slot"] = segment.reduced_token_slot;
-  out["payload_bytes"] = segment.payload_bytes;
-  out["flags"] = segment.flags;
-  return out;
-}
-
-nb::dict combine_batch_to_dict(const v2::CombineExpertBatch& batch) {
-  nb::dict out;
-  out["dst_original_rank"] = batch.dst_original_rank;
-  out["dst_scaleout_rank"] = batch.dst_scaleout_rank;
-  out["dst_scaleup_lane"] = batch.dst_scaleup_lane;
-  out["src_scaleout_rank"] = batch.src_scaleout_rank;
-  out["expert_id"] = batch.expert_id;
-  out["first_segment"] = batch.first_segment;
-  out["num_segments"] = batch.num_segments;
-  out["total_tokens"] = batch.total_tokens;
-  return out;
-}
-
-nb::dict combine_plan_to_dict(const v2::CombinePlan& plan) {
-  nb::list segments;
-  for (const auto& segment : plan.segments) {
-    segments.append(combine_segment_to_dict(segment));
-  }
-  nb::list batches;
-  for (const auto& batch : plan.batches) {
-    batches.append(combine_batch_to_dict(batch));
-  }
-  nb::dict out;
-  out["segments"] = segments;
-  out["batches"] = batches;
-  return out;
-}
-
-nb::dict dispatch_transfer_layout_to_dict(
-    const v2::DispatchTransferLayout& layout) {
-  nb::dict out;
-  out["local_payload_base"] = layout.local_payload_base;
-  out["remote_payload_base"] = layout.remote_payload_base;
-  out["remote_signal_base"] = layout.remote_signal_base;
-  out["src_token_stride"] = layout.src_token_stride;
-  out["expanded_slot_stride"] = layout.expanded_slot_stride;
-  out["batch_payload_stride"] = layout.batch_payload_stride;
-  out["source_rank_stride"] = layout.source_rank_stride;
-  out["source_signal_stride"] = layout.source_signal_stride;
-  out["signal_stride"] = layout.signal_stride;
-  out["token_record_bytes"] = layout.token_record_bytes;
-  out["record_payload_offset"] = layout.record_payload_offset;
-  out["record_src_global_offset"] = layout.record_src_global_offset;
-  out["record_topk_idx_offset"] = layout.record_topk_idx_offset;
-  out["record_topk_weight_offset"] = layout.record_topk_weight_offset;
-  out["record_topk_weight_bytes"] = layout.record_topk_weight_bytes;
-  return out;
-}
-
-nb::dict combine_transfer_layout_to_dict(
-    const v2::CombineTransferLayout& layout) {
-  nb::dict out;
-  out["local_payload_base"] = layout.local_payload_base;
-  out["remote_payload_base"] = layout.remote_payload_base;
-  out["remote_signal_base"] = layout.remote_signal_base;
-  out["expanded_slot_stride"] = layout.expanded_slot_stride;
-  out["reduced_token_stride"] = layout.reduced_token_stride;
-  out["batch_payload_stride"] = layout.batch_payload_stride;
-  out["signal_stride"] = layout.signal_stride;
-  return out;
-}
-
 nb::dict transfer_cmd_to_dict(const v2::V2TransferCmd& cmd) {
   nb::dict out;
   out["kind"] = cmd.kind;
@@ -265,24 +142,6 @@ nb::dict jit_launch_plan_to_dict(const v2::V2EfaJitLaunchPlan& plan) {
   out["num_scaleout_warps"] = plan.num_scaleout_warps;
   out["num_forward_warps"] = plan.num_forward_warps;
   out["num_payload_warps"] = plan.num_payload_warps;
-  return out;
-}
-
-nb::list transfer_cmds_to_list(const v2::V2TransferCmdPlan& plan) {
-  nb::list out;
-  for (const auto& cmd : plan.commands) {
-    out.append(transfer_cmd_to_dict(cmd));
-  }
-  return out;
-}
-
-std::vector<int64_t> sequence_to_i64_vector(const nb::sequence& values) {
-  std::vector<int64_t> out;
-  const auto num_values = static_cast<size_t>(nb::len(values));
-  out.reserve(num_values);
-  for (size_t i = 0; i < num_values; ++i) {
-    out.push_back(nb::cast<int64_t>(values[i]));
-  }
   return out;
 }
 
@@ -968,176 +827,6 @@ NB_MODULE(ep, m) {
            [](const v2::V2EfaRuntime& self, int expert_id) {
              return route_to_dict(self.route_expert(expert_id));
            })
-      .def("build_reference_dispatch_plan",
-           [](const v2::V2EfaRuntime& self, nb::sequence topk_idx_flat,
-              int num_tokens, int payload_bytes, int scale_bytes,
-              bool has_topk_weight) {
-             if (static_cast<size_t>(nb::len(topk_idx_flat)) !=
-                 static_cast<size_t>(num_tokens * self.config().num_topk)) {
-               throw std::invalid_argument(
-                   "topk_idx_flat length must equal num_tokens * num_topk");
-             }
-             auto topk = sequence_to_i64_vector(topk_idx_flat);
-             return dispatch_plan_to_dict(self.build_reference_dispatch_plan(
-                 topk.data(), num_tokens, payload_bytes, scale_bytes,
-                 has_topk_weight));
-           })
-      .def("build_reference_roundtrip_plan",
-           [](const v2::V2EfaRuntime& self, nb::sequence topk_idx_flat,
-              int num_tokens, int dispatch_payload_bytes, int scale_bytes,
-              int combine_payload_bytes, bool has_topk_weight) {
-             if (static_cast<size_t>(nb::len(topk_idx_flat)) !=
-                 static_cast<size_t>(num_tokens * self.config().num_topk)) {
-               throw std::invalid_argument(
-                   "topk_idx_flat length must equal num_tokens * num_topk");
-             }
-             auto topk = sequence_to_i64_vector(topk_idx_flat);
-             const auto dispatch_plan = self.build_reference_dispatch_plan(
-                 topk.data(), num_tokens, dispatch_payload_bytes, scale_bytes,
-                 has_topk_weight);
-             const auto combine_plan =
-                 self.build_reference_combine_plan_from_dispatch(
-                     dispatch_plan, combine_payload_bytes);
-             nb::dict out;
-             out["dispatch"] = dispatch_plan_to_dict(dispatch_plan);
-             out["combine"] = combine_plan_to_dict(combine_plan);
-             return out;
-           })
-      .def("build_reference_transfer_roundtrip_plan",
-           [](const v2::V2EfaRuntime& self, nb::sequence topk_idx_flat,
-              int num_tokens, int dispatch_payload_bytes, int scale_bytes,
-              int combine_payload_bytes, bool has_topk_weight) {
-             if (static_cast<size_t>(nb::len(topk_idx_flat)) !=
-                 static_cast<size_t>(num_tokens * self.config().num_topk)) {
-               throw std::invalid_argument(
-                   "topk_idx_flat length must equal num_tokens * num_topk");
-             }
-             auto topk = sequence_to_i64_vector(topk_idx_flat);
-             const auto dispatch_plan = self.build_reference_dispatch_plan(
-                 topk.data(), num_tokens, dispatch_payload_bytes, scale_bytes,
-                 has_topk_weight);
-             const auto combine_plan =
-                 self.build_reference_combine_plan_from_dispatch(
-                     dispatch_plan, combine_payload_bytes);
-             const auto dispatch_layout =
-                 v2::make_contiguous_dispatch_transfer_layout(
-                     dispatch_plan,
-                     static_cast<uint32_t>(dispatch_payload_bytes),
-                     static_cast<uint32_t>(dispatch_payload_bytes));
-             const auto combine_layout =
-                 v2::make_contiguous_combine_transfer_layout(
-                     combine_plan,
-                     static_cast<uint32_t>(combine_payload_bytes),
-                     static_cast<uint32_t>(combine_payload_bytes));
-             const auto dispatch_commands =
-                 v2::build_dispatch_transfer_cmd_plan(dispatch_plan,
-                                                      dispatch_layout);
-             const auto combine_commands =
-                 v2::build_combine_transfer_cmd_plan(combine_plan,
-                                                     combine_layout);
-             nb::dict out;
-             out["dispatch"] = dispatch_plan_to_dict(dispatch_plan);
-             out["combine"] = combine_plan_to_dict(combine_plan);
-             out["dispatch_layout"] =
-                 dispatch_transfer_layout_to_dict(dispatch_layout);
-             out["combine_layout"] =
-                 combine_transfer_layout_to_dict(combine_layout);
-             out["dispatch_commands"] = transfer_cmds_to_list(dispatch_commands);
-             out["combine_commands"] = transfer_cmds_to_list(combine_commands);
-             return out;
-           })
-      .def("build_dispatch_jit_plan",
-           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
-              int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
-              bool cached_mode, bool deterministic, bool do_cpu_sync,
-              int smem_bytes, const std::string& uccl_include_path) {
-             return jit_launch_plan_to_dict(self.build_dispatch_jit_plan(
-                 num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
-                 has_topk_weight, cached_mode, deterministic, do_cpu_sync,
-                 smem_bytes, uccl_include_path));
-           },
-           nb::arg("num_max_tokens_per_rank"),
-           nb::arg("num_channels_per_sm") = 1,
-           nb::arg("scale_bytes") = 0,
-           nb::arg("has_topk_weight") = true,
-           nb::arg("cached_mode") = false,
-           nb::arg("deterministic") = false,
-           nb::arg("do_cpu_sync") = false,
-           nb::arg("smem_bytes") = 228 * 1024,
-           nb::arg("uccl_include_path") = "")
-      .def("compile_dispatch_jit",
-           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
-              int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
-              bool cached_mode, bool deterministic, bool do_cpu_sync,
-              int smem_bytes, const std::string& uccl_include_path) {
-             const auto plan = self.build_dispatch_jit_plan(
-                 num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
-                 has_topk_weight, cached_mode, deterministic, do_cpu_sync,
-                 smem_bytes, uccl_include_path);
-             v2::compile_v2_efa_jit_plan(plan);
-             return jit_launch_plan_to_dict(plan);
-           },
-           nb::arg("num_max_tokens_per_rank"),
-           nb::arg("num_channels_per_sm") = 1,
-           nb::arg("scale_bytes") = 0,
-           nb::arg("has_topk_weight") = true,
-           nb::arg("cached_mode") = false,
-           nb::arg("deterministic") = false,
-           nb::arg("do_cpu_sync") = false,
-           nb::arg("smem_bytes") = 228 * 1024,
-           nb::arg("uccl_include_path") = "")
-      .def("build_combine_jit_plan",
-           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
-              int num_channels, int payload_bytes, bool use_expanded_layout,
-              bool allow_multiple_reduction, int smem_bytes,
-              const std::string& uccl_include_path) {
-             return jit_launch_plan_to_dict(self.build_combine_jit_plan(
-                 num_max_tokens_per_rank, num_channels, payload_bytes,
-                 use_expanded_layout, allow_multiple_reduction, smem_bytes,
-                 uccl_include_path));
-           },
-           nb::arg("num_max_tokens_per_rank"),
-           nb::arg("num_channels") = 1,
-           nb::arg("payload_bytes") = 0,
-           nb::arg("use_expanded_layout") = true,
-           nb::arg("allow_multiple_reduction") = true,
-           nb::arg("smem_bytes") = 228 * 1024,
-           nb::arg("uccl_include_path") = "")
-      .def("compile_combine_jit",
-           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
-              int num_channels, int payload_bytes, bool use_expanded_layout,
-              bool allow_multiple_reduction, int smem_bytes,
-              const std::string& uccl_include_path) {
-             const auto plan = self.build_combine_jit_plan(
-                 num_max_tokens_per_rank, num_channels, payload_bytes,
-                 use_expanded_layout, allow_multiple_reduction, smem_bytes,
-                 uccl_include_path);
-             v2::compile_v2_efa_jit_plan(plan);
-             return jit_launch_plan_to_dict(plan);
-           },
-           nb::arg("num_max_tokens_per_rank"),
-           nb::arg("num_channels") = 1,
-           nb::arg("payload_bytes") = 0,
-           nb::arg("use_expanded_layout") = true,
-           nb::arg("allow_multiple_reduction") = true,
-           nb::arg("smem_bytes") = 228 * 1024,
-           nb::arg("uccl_include_path") = "")
-      .def("build_dispatch_enqueue_d2h_jit_plan",
-           [](const v2::V2EfaRuntime& self,
-              const std::string& uccl_include_path) {
-             return jit_launch_plan_to_dict(
-                 self.build_dispatch_enqueue_d2h_jit_plan(uccl_include_path));
-           },
-           nb::arg("uccl_include_path") = "")
-      .def("compile_dispatch_enqueue_d2h_jit",
-           [](const v2::V2EfaRuntime& self,
-              const std::string& uccl_include_path) {
-             const auto plan =
-                 self.build_dispatch_enqueue_d2h_jit_plan(uccl_include_path);
-             v2::compile_v2_efa_jit_plan(plan);
-             return jit_launch_plan_to_dict(plan);
-           },
-           nb::arg("uccl_include_path") = "")
       .def("compile_dispatch_descriptor_enqueue_d2h_jit",
            [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
               int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
@@ -1145,48 +834,6 @@ NB_MODULE(ep, m) {
               int smem_bytes, const std::string& uccl_include_path) {
              const auto plan =
                  self.build_dispatch_descriptor_enqueue_d2h_jit_plan(
-                     num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
-                     has_topk_weight, cached_mode, deterministic, do_cpu_sync,
-                     smem_bytes, uccl_include_path);
-             v2::compile_v2_efa_jit_plan(plan);
-             return jit_launch_plan_to_dict(plan);
-           },
-           nb::arg("num_max_tokens_per_rank"),
-           nb::arg("num_channels_per_sm") = 1,
-           nb::arg("scale_bytes") = 0,
-           nb::arg("has_topk_weight") = true,
-           nb::arg("cached_mode") = false,
-           nb::arg("deterministic") = false,
-           nb::arg("do_cpu_sync") = false,
-           nb::arg("smem_bytes") = 228 * 1024,
-           nb::arg("uccl_include_path") = "")
-      .def("build_dispatch_direct_enqueue_d2h_jit_plan",
-           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
-              int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
-              bool cached_mode, bool deterministic, bool do_cpu_sync,
-              int smem_bytes, const std::string& uccl_include_path) {
-             return jit_launch_plan_to_dict(
-                 self.build_dispatch_direct_enqueue_d2h_jit_plan(
-                     num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
-                     has_topk_weight, cached_mode, deterministic, do_cpu_sync,
-                     smem_bytes, uccl_include_path));
-           },
-           nb::arg("num_max_tokens_per_rank"),
-           nb::arg("num_channels_per_sm") = 1,
-           nb::arg("scale_bytes") = 0,
-           nb::arg("has_topk_weight") = true,
-           nb::arg("cached_mode") = false,
-           nb::arg("deterministic") = false,
-           nb::arg("do_cpu_sync") = false,
-           nb::arg("smem_bytes") = 228 * 1024,
-           nb::arg("uccl_include_path") = "")
-      .def("compile_dispatch_direct_enqueue_d2h_jit",
-           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
-              int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
-              bool cached_mode, bool deterministic, bool do_cpu_sync,
-              int smem_bytes, const std::string& uccl_include_path) {
-             const auto plan =
-                 self.build_dispatch_direct_enqueue_d2h_jit_plan(
                      num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
                      has_topk_weight, cached_mode, deterministic, do_cpu_sync,
                      smem_bytes, uccl_include_path);
@@ -1248,22 +895,6 @@ NB_MODULE(ep, m) {
            },
            nb::arg("num_max_tokens_per_rank"),
            nb::arg("uccl_include_path") = "")
-      .def("build_combine_enqueue_d2h_jit_plan",
-           [](const v2::V2EfaRuntime& self,
-              const std::string& uccl_include_path) {
-             return jit_launch_plan_to_dict(
-                 self.build_combine_enqueue_d2h_jit_plan(uccl_include_path));
-           },
-           nb::arg("uccl_include_path") = "")
-      .def("compile_combine_enqueue_d2h_jit",
-           [](const v2::V2EfaRuntime& self,
-              const std::string& uccl_include_path) {
-             const auto plan =
-                 self.build_combine_enqueue_d2h_jit_plan(uccl_include_path);
-             v2::compile_v2_efa_jit_plan(plan);
-             return jit_launch_plan_to_dict(plan);
-           },
-           nb::arg("uccl_include_path") = "")
       .def("compile_combine_descriptor_enqueue_d2h_jit",
            [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
               int num_channels, int payload_bytes, bool use_expanded_layout,
@@ -1304,87 +935,6 @@ NB_MODULE(ep, m) {
            nb::arg("allow_multiple_reduction") = true,
            nb::arg("smem_bytes") = 0,
            nb::arg("uccl_include_path") = "")
-      .def("launch_dispatch_descriptors",
-           [](const v2::V2EfaRuntime& self, std::uintptr_t topk_idx_ptr,
-              std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
-              std::uintptr_t counters_ptr, int num_tokens,
-              int num_max_tokens_per_rank, int num_channels_per_sm,
-              int scale_bytes, bool has_topk_weight, bool cached_mode,
-              bool deterministic, bool do_cpu_sync, int smem_bytes,
-              const std::string& uccl_include_path,
-              std::uintptr_t cuda_stream_ptr) {
-             self.launch_dispatch_descriptors(
-                 topk_idx_ptr, segments_ptr, batches_ptr, counters_ptr,
-                 num_tokens, num_max_tokens_per_rank, num_channels_per_sm,
-                 scale_bytes, has_topk_weight, cached_mode, deterministic,
-                 do_cpu_sync, smem_bytes, uccl_include_path, cuda_stream_ptr);
-           },
-           nb::arg("topk_idx_ptr"),
-           nb::arg("segments_ptr"),
-           nb::arg("batches_ptr"),
-           nb::arg("counters_ptr"),
-           nb::arg("num_tokens"),
-           nb::arg("num_max_tokens_per_rank"),
-           nb::arg("num_channels_per_sm") = 1,
-           nb::arg("scale_bytes") = 0,
-           nb::arg("has_topk_weight") = true,
-           nb::arg("cached_mode") = false,
-           nb::arg("deterministic") = false,
-           nb::arg("do_cpu_sync") = false,
-           nb::arg("smem_bytes") = 228 * 1024,
-           nb::arg("uccl_include_path") = "",
-           nb::arg("cuda_stream_ptr") = 0)
-      .def("launch_dispatch_enqueue_d2h",
-           [](const v2::V2EfaRuntime& self, std::uintptr_t segments_ptr,
-              std::uintptr_t batches_ptr, int num_batches,
-              std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
-              std::uintptr_t tail_ptr, int queue_capacity,
-              std::uint64_t local_payload_base,
-              std::uint64_t remote_payload_base,
-              std::uint64_t remote_signal_base, std::uint32_t src_token_stride,
-              std::uint32_t expanded_slot_stride,
-              std::uint32_t batch_payload_stride,
-              std::uint32_t source_rank_stride,
-              std::uint32_t source_signal_stride,
-              std::uint32_t token_record_bytes,
-              std::uint32_t signal_stride,
-              const std::string& uccl_include_path,
-              std::uintptr_t cuda_stream_ptr) {
-             v2::DispatchTransferLayout layout;
-             layout.local_payload_base = local_payload_base;
-             layout.remote_payload_base = remote_payload_base;
-             layout.remote_signal_base = remote_signal_base;
-             layout.src_token_stride = src_token_stride;
-             layout.expanded_slot_stride = expanded_slot_stride;
-             layout.batch_payload_stride = batch_payload_stride;
-             layout.source_rank_stride = source_rank_stride;
-             layout.source_signal_stride = source_signal_stride;
-             layout.token_record_bytes = token_record_bytes;
-             layout.signal_stride = signal_stride;
-             self.launch_dispatch_enqueue_d2h(
-                 segments_ptr, batches_ptr, num_batches, commands_ptr,
-                 head_ptr, tail_ptr, queue_capacity, layout,
-                 uccl_include_path, cuda_stream_ptr);
-           },
-           nb::arg("segments_ptr"),
-           nb::arg("batches_ptr"),
-           nb::arg("num_batches"),
-           nb::arg("commands_ptr") = 0,
-           nb::arg("head_ptr") = 0,
-           nb::arg("tail_ptr") = 0,
-           nb::arg("queue_capacity") = 0,
-           nb::arg("local_payload_base") = 0,
-           nb::arg("remote_payload_base") = 0,
-           nb::arg("remote_signal_base") = 0,
-           nb::arg("src_token_stride") = 0,
-           nb::arg("expanded_slot_stride") = 0,
-           nb::arg("batch_payload_stride") = 0,
-           nb::arg("source_rank_stride") = 0,
-           nb::arg("source_signal_stride") = 0,
-           nb::arg("token_record_bytes") = 0,
-           nb::arg("signal_stride") = sizeof(std::uint32_t),
-           nb::arg("uccl_include_path") = "",
-           nb::arg("cuda_stream_ptr") = 0)
       .def("launch_dispatch_descriptor_enqueue_d2h",
            [](const v2::V2EfaRuntime& self, std::uintptr_t topk_idx_ptr,
               std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
@@ -1427,68 +977,6 @@ NB_MODULE(ep, m) {
            nb::arg("segments_ptr"),
            nb::arg("batches_ptr"),
            nb::arg("counters_ptr"),
-           nb::arg("num_tokens"),
-           nb::arg("num_max_tokens_per_rank"),
-           nb::arg("num_channels_per_sm") = 1,
-           nb::arg("scale_bytes") = 0,
-           nb::arg("has_topk_weight") = true,
-           nb::arg("cached_mode") = false,
-           nb::arg("deterministic") = false,
-           nb::arg("do_cpu_sync") = false,
-           nb::arg("smem_bytes") = 228 * 1024,
-           nb::arg("commands_ptr"),
-           nb::arg("head_ptr"),
-           nb::arg("tail_ptr"),
-           nb::arg("queue_capacity"),
-           nb::arg("local_payload_base"),
-           nb::arg("remote_payload_base"),
-           nb::arg("remote_signal_base"),
-           nb::arg("src_token_stride"),
-           nb::arg("expanded_slot_stride"),
-           nb::arg("batch_payload_stride"),
-           nb::arg("source_rank_stride") = 0,
-           nb::arg("source_signal_stride") = 0,
-           nb::arg("token_record_bytes") = 0,
-           nb::arg("signal_stride") = sizeof(std::uint32_t),
-           nb::arg("uccl_include_path") = "",
-           nb::arg("cuda_stream_ptr") = 0)
-      .def("launch_dispatch_direct_enqueue_d2h",
-           [](const v2::V2EfaRuntime& self, std::uintptr_t topk_idx_ptr,
-              int num_tokens, int num_max_tokens_per_rank,
-              int num_channels_per_sm, int scale_bytes, bool has_topk_weight,
-              bool cached_mode, bool deterministic, bool do_cpu_sync,
-              int smem_bytes, std::uintptr_t commands_ptr,
-              std::uintptr_t head_ptr, std::uintptr_t tail_ptr,
-              int queue_capacity, std::uint64_t local_payload_base,
-              std::uint64_t remote_payload_base,
-              std::uint64_t remote_signal_base, std::uint32_t src_token_stride,
-              std::uint32_t expanded_slot_stride,
-              std::uint32_t batch_payload_stride,
-              std::uint32_t source_rank_stride,
-              std::uint32_t source_signal_stride,
-              std::uint32_t token_record_bytes,
-              std::uint32_t signal_stride,
-              const std::string& uccl_include_path,
-              std::uintptr_t cuda_stream_ptr) {
-             v2::DispatchTransferLayout layout;
-             layout.local_payload_base = local_payload_base;
-             layout.remote_payload_base = remote_payload_base;
-             layout.remote_signal_base = remote_signal_base;
-             layout.src_token_stride = src_token_stride;
-             layout.expanded_slot_stride = expanded_slot_stride;
-             layout.batch_payload_stride = batch_payload_stride;
-             layout.source_rank_stride = source_rank_stride;
-             layout.source_signal_stride = source_signal_stride;
-             layout.token_record_bytes = token_record_bytes;
-             layout.signal_stride = signal_stride;
-             self.launch_dispatch_direct_enqueue_d2h(
-                 topk_idx_ptr, num_tokens, num_max_tokens_per_rank,
-                 num_channels_per_sm, scale_bytes, has_topk_weight,
-                 cached_mode, deterministic, do_cpu_sync, smem_bytes,
-                 commands_ptr, head_ptr, tail_ptr, queue_capacity, layout,
-                 uccl_include_path, cuda_stream_ptr);
-           },
-           nb::arg("topk_idx_ptr"),
            nb::arg("num_tokens"),
            nb::arg("num_max_tokens_per_rank"),
            nb::arg("num_channels_per_sm") = 1,
@@ -1736,80 +1224,6 @@ NB_MODULE(ep, m) {
            nb::arg("num_max_tokens_per_rank"),
            nb::arg("uccl_include_path") = "",
            nb::arg("cuda_stream_ptr") = 0)
-      .def("launch_combine_descriptors",
-           [](const v2::V2EfaRuntime& self,
-              std::uintptr_t dispatch_segments_ptr,
-              std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
-              std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
-              std::uintptr_t counters_ptr, int num_max_tokens_per_rank,
-              int num_channels, int payload_bytes, bool use_expanded_layout,
-              bool allow_multiple_reduction, int smem_bytes,
-              const std::string& uccl_include_path,
-              std::uintptr_t cuda_stream_ptr) {
-             self.launch_combine_descriptors(
-                 dispatch_segments_ptr, dispatch_batches_ptr,
-                 num_dispatch_batches, segments_ptr, batches_ptr, counters_ptr,
-                 num_max_tokens_per_rank, num_channels, payload_bytes,
-                 use_expanded_layout, allow_multiple_reduction, smem_bytes,
-                 uccl_include_path, cuda_stream_ptr);
-           },
-           nb::arg("dispatch_segments_ptr"),
-           nb::arg("dispatch_batches_ptr"),
-           nb::arg("num_dispatch_batches"),
-           nb::arg("segments_ptr"),
-           nb::arg("batches_ptr"),
-           nb::arg("counters_ptr"),
-           nb::arg("num_max_tokens_per_rank"),
-           nb::arg("num_channels") = 1,
-           nb::arg("payload_bytes") = 0,
-           nb::arg("use_expanded_layout") = true,
-           nb::arg("allow_multiple_reduction") = true,
-           nb::arg("smem_bytes") = 228 * 1024,
-           nb::arg("uccl_include_path") = "",
-           nb::arg("cuda_stream_ptr") = 0)
-      .def("launch_combine_enqueue_d2h",
-           [](const v2::V2EfaRuntime& self, std::uintptr_t segments_ptr,
-              std::uintptr_t batches_ptr, int num_batches,
-              std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
-              std::uintptr_t tail_ptr, int queue_capacity,
-              std::uint64_t local_payload_base,
-              std::uint64_t remote_payload_base,
-              std::uint64_t remote_signal_base,
-              std::uint32_t expanded_slot_stride,
-              std::uint32_t reduced_token_stride,
-              std::uint32_t batch_payload_stride,
-              std::uint32_t signal_stride,
-              const std::string& uccl_include_path,
-              std::uintptr_t cuda_stream_ptr) {
-             v2::CombineTransferLayout layout;
-             layout.local_payload_base = local_payload_base;
-             layout.remote_payload_base = remote_payload_base;
-             layout.remote_signal_base = remote_signal_base;
-             layout.expanded_slot_stride = expanded_slot_stride;
-             layout.reduced_token_stride = reduced_token_stride;
-             layout.batch_payload_stride = batch_payload_stride;
-             layout.signal_stride = signal_stride;
-             self.launch_combine_enqueue_d2h(
-                 segments_ptr, batches_ptr, num_batches, commands_ptr,
-                 head_ptr, tail_ptr, queue_capacity, layout,
-                 uccl_include_path, cuda_stream_ptr);
-           },
-           nb::arg("segments_ptr"),
-           nb::arg("batches_ptr"),
-           nb::arg("num_batches"),
-           nb::arg("commands_ptr"),
-           nb::arg("head_ptr"),
-           nb::arg("tail_ptr"),
-           nb::arg("queue_capacity"),
-           nb::arg("local_payload_base"),
-           nb::arg("remote_payload_base"),
-           nb::arg("remote_signal_base"),
-           nb::arg("expanded_slot_stride"),
-           nb::arg("reduced_token_stride"),
-           nb::arg("batch_payload_stride"),
-           nb::arg("signal_stride") = sizeof(std::uint32_t),
-           nb::arg("uccl_include_path") = "",
-           nb::arg("cuda_stream_ptr") = 0)
       .def("launch_combine_descriptor_enqueue_d2h",
            [](const v2::V2EfaRuntime& self,
               std::uintptr_t dispatch_segments_ptr,
@@ -1929,9 +1343,7 @@ NB_MODULE(ep, m) {
            nb::arg("batch_payload_stride") = 0,
            nb::arg("signal_stride") = sizeof(std::uint32_t),
            nb::arg("uccl_include_path") = "",
-           nb::arg("cuda_stream_ptr") = 0)
-      .def("launch_dispatch", &v2::V2EfaRuntime::launch_dispatch)
-      .def("launch_combine", &v2::V2EfaRuntime::launch_combine);
+           nb::arg("cuda_stream_ptr") = 0);
 
   m.def("v2_descriptor_sizes", []() {
     nb::dict out;

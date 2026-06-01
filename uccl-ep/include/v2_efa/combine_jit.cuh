@@ -135,33 +135,6 @@ __device__ __forceinline__ void enqueue_combine_d2h(
 
 template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
           int kNumTopk, int kHidden>
-__global__ void v2_efa_combine_descriptor_kernel(
-    const DispatchSegmentDescriptor* dispatch_segments,
-    const DispatchExpertBatch* dispatch_batches, int num_dispatch_batches,
-    CombineSegmentDescriptor* segments, CombineExpertBatch* batches,
-    uint32_t* counters, int dst_original_rank, int payload_bytes,
-    int max_segments, int max_batches) {
-  // Device-side reference generator. The production V2 kernel will derive
-  // equivalent descriptors from token_metadata_at_forward/channel_linked_list;
-  // this form is useful for roundtrip validation against dispatch descriptors.
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-  (void)kNumScaleoutRanks;
-  (void)kNumScaleupRanks;
-  (void)kNumExperts;
-  (void)kNumTopk;
-  (void)kHidden;
-
-  (void)detail::build_combine_descriptors<kNumScaleoutRanks, kNumScaleupRanks,
-                                          kNumExperts, kNumTopk, kHidden>(
-      dispatch_segments, dispatch_batches, num_dispatch_batches, segments,
-      batches, counters, dst_original_rank, payload_bytes, max_segments,
-      max_batches);
-}
-
-template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
-          int kNumTopk, int kHidden>
 __global__ void v2_efa_combine_descriptor_enqueue_d2h_kernel(
     const DispatchSegmentDescriptor* dispatch_segments,
     const DispatchExpertBatch* dispatch_batches, int num_dispatch_batches,
@@ -292,61 +265,6 @@ __global__ void v2_efa_combine_forward_metadata_enqueue_d2h_kernel(
   counters[kDescriptorCounterBatches] = num_batches;
   counters[kDescriptorCounterOverflow] = 0;
   detail::enqueue_combine_d2h(segments, batches, num_batches, queue, layout);
-}
-
-template <int kInstance>
-__global__ void v2_efa_combine_enqueue_transfer_kernel(
-    const CombineSegmentDescriptor* segments, const CombineExpertBatch* batches,
-    int num_batches, V2TransferQueueView queue, CombineTransferLayout layout) {
-  // Preferred native V2 command-ring path. Signal commands are emitted after
-  // all payload commands for the same semantic batch.
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-  (void)kInstance;
-
-  for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-    const auto& batch = batches[batch_idx];
-    for (int i = 0; i < batch.num_segments; ++i) {
-      const auto segment_idx =
-          static_cast<uint32_t>(batch.first_segment + i);
-      enqueue_v2_transfer_cmd(
-          queue, make_v2_combine_payload_cmd(
-                     segments[segment_idx], segment_idx,
-                     static_cast<uint32_t>(batch_idx), layout));
-    }
-    enqueue_v2_transfer_cmd(
-        queue, make_v2_combine_signal_cmd(
-                   batch, static_cast<uint32_t>(batch_idx), layout));
-  }
-}
-
-template <int kInstance>
-__global__ void v2_efa_combine_enqueue_d2h_kernel(
-    const CombineSegmentDescriptor* segments, const CombineExpertBatch* batches,
-    int num_batches, V2TransferD2HQueueView queue,
-    CombineTransferLayout layout) {
-  // Production-facing scaffold: write compact V2 commands directly into a D2H
-  // ring compatible with the retained CPU proxy model.
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-  (void)kInstance;
-
-  for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-    const auto& batch = batches[batch_idx];
-    for (int i = 0; i < batch.num_segments; ++i) {
-      const auto segment_idx =
-          static_cast<uint32_t>(batch.first_segment + i);
-      enqueue_v2_transfer_d2h(
-          queue, make_v2_combine_payload_cmd(
-                     segments[segment_idx], segment_idx,
-                     static_cast<uint32_t>(batch_idx), layout));
-    }
-    enqueue_v2_transfer_d2h(
-        queue, make_v2_combine_signal_cmd(
-                   batch, static_cast<uint32_t>(batch_idx), layout));
-  }
 }
 
 }  // namespace uccl::v2_efa

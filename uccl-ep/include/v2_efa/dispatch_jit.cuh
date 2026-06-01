@@ -179,28 +179,6 @@ __device__ __forceinline__ void enqueue_dispatch_d2h(
 
 template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
           int kNumTopk, int kHiddenBytes>
-__global__ void v2_efa_dispatch_descriptor_kernel(
-    const int64_t* topk_idx, DispatchSegmentDescriptor* segments,
-    DispatchExpertBatch* batches, uint32_t* counters, int num_tokens,
-    int scaleout_rank, int scaleup_rank, int scale_bytes,
-    bool has_topk_weight, int max_segments, int max_batches) {
-  // Device-side reference generator. It intentionally mirrors the CPU
-  // reference planner before we parallelize descriptor construction inside the
-  // real DeepEP V2 JIT dispatch path.
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-  (void)scaleout_rank;
-  (void)scaleup_rank;
-
-  (void)detail::build_dispatch_descriptors<kNumScaleoutRanks, kNumScaleupRanks,
-                                           kNumExperts, kNumTopk, kHiddenBytes>(
-      topk_idx, segments, batches, counters, num_tokens, scale_bytes,
-      has_topk_weight, max_segments, max_batches);
-}
-
-template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
-          int kNumTopk, int kHiddenBytes>
 __global__ void v2_efa_dispatch_descriptor_enqueue_d2h_kernel(
     const int64_t* topk_idx, DispatchSegmentDescriptor* segments,
     DispatchExpertBatch* batches, uint32_t* counters, int num_tokens,
@@ -221,77 +199,6 @@ __global__ void v2_efa_dispatch_descriptor_enqueue_d2h_kernel(
     return;
   }
   detail::enqueue_dispatch_d2h(segments, batches, max_batches, queue, layout);
-}
-
-template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
-          int kNumTopk, int kHiddenBytes>
-__global__ void v2_efa_dispatch_direct_enqueue_d2h_kernel(
-    const int64_t* topk_idx, int num_tokens, int scaleout_rank,
-    V2TransferD2HQueueView queue, DispatchTransferLayout layout) {
-  constexpr int kWorldSize = kNumScaleoutRanks * kNumScaleupRanks;
-  static_assert(kWorldSize > 0, "invalid V2 EFA topology");
-  static_assert(kNumExperts % kWorldSize == 0,
-                "num experts must be divisible by world size");
-  constexpr int kExpertsPerRank = kNumExperts / kWorldSize;
-  const int linear_count = num_tokens * kNumTopk;
-  const int global_thread = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-  const int global_stride = static_cast<int>(gridDim.x * blockDim.x);
-
-  for (int linear = global_thread; linear < linear_count; linear += global_stride) {
-    const int token = linear / kNumTopk;
-    const int topk_slot = linear - token * kNumTopk;
-    const int expert = static_cast<int>(__ldg(topk_idx + linear));
-    if (expert < 0 || expert >= kNumExperts) {
-      continue;
-    }
-
-    const int owner_rank = expert / kExpertsPerRank;
-    const int dst_scaleout_rank = owner_rank / kNumScaleupRanks;
-    const int dst_scaleup_lane = owner_rank % kNumScaleupRanks;
-    (void)scaleout_rank;
-    const uint32_t dst_global_rank =
-        static_cast<uint32_t>(dst_scaleout_rank * kNumScaleupRanks +
-                              dst_scaleup_lane);
-    const uint64_t source_payload_base =
-        layout.remote_payload_base +
-        static_cast<uint64_t>(layout.source_rank) * layout.source_rank_stride;
-    const uint64_t source_signal_base =
-        layout.remote_signal_base +
-        static_cast<uint64_t>(layout.source_rank) * layout.source_signal_stride;
-    const uint32_t token_bytes =
-        layout.token_record_bytes != 0
-            ? layout.token_record_bytes
-            : static_cast<uint32_t>(kHiddenBytes);
-
-    const auto local_offset =
-        layout.local_payload_base +
-        static_cast<uint64_t>(token) * layout.src_token_stride;
-    const auto remote_offset =
-        source_payload_base +
-        static_cast<uint64_t>(token) * layout.expanded_slot_stride;
-    enqueue_v2_transfer_d2h(
-        queue, make_v2_transfer_cmd(
-                   V2TransferCmdKind::kDispatchPayload,
-                   dst_global_rank,
-                   layout.efa_lane,
-                   static_cast<uint32_t>(linear),
-                   static_cast<uint32_t>(linear),
-                   token_bytes,
-                   /*signal_value=*/0, local_offset, remote_offset));
-    enqueue_v2_transfer_d2h(
-        queue, make_v2_transfer_cmd(
-                   V2TransferCmdKind::kDispatchSignal,
-                   dst_global_rank,
-                   layout.efa_lane,
-                   static_cast<uint32_t>(linear),
-                   static_cast<uint32_t>(linear),
-                   sizeof(uint32_t),
-                   /*signal_value=*/1,
-                   /*local_offset=*/0,
-                   source_signal_base +
-                       static_cast<uint64_t>(linear) * layout.signal_stride));
-    (void)topk_slot;
-  }
 }
 
 template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumTopk,
@@ -625,76 +532,6 @@ __global__ void v2_efa_dispatch_expand_records_kernel(
       expanded_topk_weights[expanded_idx * kNumTopk + slot] =
           recv_topk_weights[row * kNumTopk + slot];
     }
-  }
-}
-
-template <int kInstance>
-__global__ void v2_efa_dispatch_enqueue_transfer_kernel(
-    const DispatchSegmentDescriptor* segments,
-    const DispatchExpertBatch* batches, int num_batches,
-    V2TransferQueueView queue, DispatchTransferLayout layout) {
-  // Preferred native V2 command-ring path. It writes 16-byte V2TransferCmd
-  // entries directly into the same-width FIFO slot used by the retained proxy.
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-  (void)kInstance;
-
-  for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-    const auto& batch = batches[batch_idx];
-    for (int i = 0; i < batch.num_segments; ++i) {
-      const auto segment_idx =
-          static_cast<uint32_t>(batch.first_segment + i);
-      auto segment = segments[segment_idx];
-      segment.expanded_slot_begin += batch.reserved;
-      enqueue_v2_transfer_cmd(
-          queue, make_v2_dispatch_payload_cmd(
-                     segment, segment_idx,
-                     static_cast<uint32_t>(batch_idx), layout));
-    }
-    enqueue_v2_transfer_cmd(
-        queue, make_v2_dispatch_signal_cmd(
-                   batch, static_cast<uint32_t>(batch_idx), layout));
-  }
-  for (uint32_t target_rank = 0; target_rank < layout.num_ranks;
-       ++target_rank) {
-    enqueue_v2_transfer_cmd(queue,
-                            make_v2_dispatch_done_cmd(target_rank, layout));
-  }
-}
-
-template <int kInstance>
-__global__ void v2_efa_dispatch_enqueue_d2h_kernel(
-    const DispatchSegmentDescriptor* segments,
-    const DispatchExpertBatch* batches, int num_batches,
-    V2TransferD2HQueueView queue, DispatchTransferLayout layout) {
-  // Production-facing scaffold: write compact V2 commands directly into a D2H
-  // ring compatible with the retained CPU proxy model.
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
-    return;
-  }
-  (void)kInstance;
-
-  for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-    const auto& batch = batches[batch_idx];
-    for (int i = 0; i < batch.num_segments; ++i) {
-      const auto segment_idx =
-          static_cast<uint32_t>(batch.first_segment + i);
-      auto segment = segments[segment_idx];
-      segment.expanded_slot_begin += batch.reserved;
-      enqueue_v2_transfer_d2h(
-          queue, make_v2_dispatch_payload_cmd(
-                     segment, segment_idx,
-                     static_cast<uint32_t>(batch_idx), layout));
-    }
-    enqueue_v2_transfer_d2h(
-        queue, make_v2_dispatch_signal_cmd(
-                   batch, static_cast<uint32_t>(batch_idx), layout));
-  }
-  for (uint32_t target_rank = 0; target_rank < layout.num_ranks;
-       ++target_rank) {
-    enqueue_v2_transfer_d2h(
-        queue, make_v2_dispatch_done_cmd(target_rank, layout));
   }
 }
 
