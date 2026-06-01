@@ -1736,7 +1736,7 @@ class ElasticBuffer:
     ) -> V2TransportHandle:
         sizes = ep.v2_descriptor_sizes()
         max_segments = max(1, int(num_tokens * self.num_topk))
-        max_batches = max(1, int(self.num_experts * self.num_ranks))
+        max_batches = max(1, int(self.num_experts))
         segments = torch.empty((max_segments * int(sizes["dispatch_segment"]),),
                                dtype=torch.uint8, device=topk_idx.device)
         batches = torch.empty((max_batches * int(sizes["dispatch_batch"]),),

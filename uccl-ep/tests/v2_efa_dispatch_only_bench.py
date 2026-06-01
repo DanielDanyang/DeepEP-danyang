@@ -21,6 +21,8 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--window-mb", type=int, default=512)
+    parser.add_argument("--remote-pair", action="store_true")
+    parser.add_argument("--do-expand", action="store_true")
     args = parser.parse_args()
 
     repo_root = os.environ.get(
@@ -38,6 +40,7 @@ def main() -> None:
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     world = dist.get_world_size()
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
     deep_ep.init_deep_ep_jit(
         os.path.join(repo_root, "deep_ep"),
         os.environ.get("CUDA_HOME", "/usr/local/cuda"),
@@ -46,6 +49,8 @@ def main() -> None:
 
     assert args.experts % world == 0
     assert args.topk <= args.experts // world
+    if args.remote_pair:
+        assert world % 2 == 0 and local_world * 2 == world
     buf = ElasticBuffer(
         dist.group.WORLD,
         num_bytes=args.window_mb << 20,
@@ -56,7 +61,7 @@ def main() -> None:
     buf.init_native_v2_efa_transport(num_bytes=args.window_mb << 20, num_lanes=1)
 
     x = torch.randn((args.tokens, args.hidden), dtype=torch.bfloat16, device="cuda")
-    dst_rank = (rank + 1) % world
+    dst_rank = (rank + local_world) % world if args.remote_pair else (rank + 1) % world
     expert_begin = dst_rank * (args.experts // world)
     topk_idx = torch.arange(
         expert_begin,
@@ -75,6 +80,7 @@ def main() -> None:
             num_max_tokens_per_rank=args.tokens,
             num_sms=args.sms,
             do_cpu_sync=True,
+            do_expand=args.do_expand,
         )
         assert int(handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()) == args.tokens * args.topk
     torch.cuda.synchronize()
@@ -91,6 +97,7 @@ def main() -> None:
             num_max_tokens_per_rank=args.tokens,
             num_sms=args.sms,
             do_cpu_sync=True,
+            do_expand=args.do_expand,
         )
     torch.cuda.synchronize()
     dist.barrier()
@@ -102,7 +109,8 @@ def main() -> None:
     if rank == 0:
         print(
             f"dispatch-only EP{world} tokens={args.tokens} hidden={args.hidden} topk={args.topk} "
-            f"sms={args.sms} avg_us={avg * 1e6:.2f} "
+            f"sms={args.sms} remote_pair={args.remote_pair} do_expand={args.do_expand} "
+            f"avg_us={avg * 1e6:.2f} "
             f"payload_GBps={_gbps(payload_bytes, avg):.2f} "
             f"record_GBps={_gbps(record_bytes, avg):.2f} stats={stats}",
             flush=True,

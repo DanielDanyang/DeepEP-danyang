@@ -2228,3 +2228,45 @@ README 风格 EP8x2 性能：
   - `dispatch` 还没有真正 fork DeepEP V2 `hybrid_dispatch.cuh` 主循环；
   - local/self path 仍暂时走 EFA command，后续应恢复 V2 local/NVLink 语义；
   - EP8x2 / EP16 dispatch-only correctness 和 BW 还没有跑。
+
+## 2026-06-01 dispatch EP8x2 correctness 与 remote-pair bench
+
+- 清理 dispatch batch 容量：
+  - native V2 dispatch batch 是按 expert 生成的 semantic batch；
+  - `dst_rank/lane` 由 expert id 推导，不需要再按 `experts * ranks`
+    预留 batch；
+  - 将 Python dispatch path 与 C++ `max_expert_batches()` 的上限收紧为
+    `num_experts`，减少 receiver signal table 和 JIT scan 范围。
+- 新增 `uccl-ep/tests/v2_efa_dispatch_correctness.py`：
+  - 支持普通 ring route 和 `--remote-pair`；
+  - `--remote-pair` 下每个 local rank 只发到另一台机器相同 local rank；
+  - 验证 normal dispatch 与 `do_expand=True` 的 payload、weight、
+    `recv_src_metadata`、expert/token prefix。
+- 服务器验证：
+  - 运行前检查 `p5en_0` / `p5en_1`，两边均无 compute process；
+  - `p5en_0` `make -j8 && make install` 通过，并同步 `ep.abi3.so` 到
+    `p5en_1` venv；
+  - EP2 correctness:
+    - `tokens=8 hidden=16 sms=8`
+    - `dispatch_correctness_ok EP2 ...`
+    - rank0 stats: `drained_commands=2, posted_writes=1, posted_signals=1,
+      posted_bytes=516`；
+  - EP16 / 2 节点 x 8 rank correctness:
+    - `tokens=8 hidden=16 sms=8 --remote-pair`
+    - `dispatch_correctness_ok EP16 ...`
+    - rank0 stats: `drained_commands=2, posted_writes=1, posted_signals=1,
+      posted_bytes=516`。
+- remote-pair dispatch-only bench：
+  - `tokens=1024 hidden=1024 experts=16 topk=1 sms=8 iters=5`:
+    `avg_us=5081.58 payload_GBps=0.41 record_GBps=0.42`,
+    stats `posted_bytes=2129924`；
+  - `tokens=8192 hidden=7168 experts=16 topk=1 sms=8 iters=2 window=4096MB`:
+    `avg_us=94106.46 payload_GBps=1.25 record_GBps=1.25`,
+    stats `posted_bytes=117702660`。
+- 结论：
+  - dispatch data path 已经能在 EP16 remote-pair 下正确跑 normal 与 expanded
+    receiver layout；
+  - 性能仍远低于 EFA 纯 GIN/P2P microbench，也低于早先单 rank 大包结果；
+  - 当前瓶颈更像 native scaffold 的同步/CPU proxy/completion/receiver materialize
+    串行路径，而不是 payload command 数量，因为每 rank 已经只有 1 个大 payload
+    write + 1 个 signal。

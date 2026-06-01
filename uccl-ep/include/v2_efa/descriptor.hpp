@@ -106,9 +106,10 @@ inline int64_t max_expert_batches(int num_experts, int num_scaleout_ranks,
   validate_non_negative("num_experts", num_experts);
   validate_non_negative("num_scaleout_ranks", num_scaleout_ranks);
   validate_non_negative("num_scaleup_ranks", num_scaleup_ranks);
-  return static_cast<int64_t>(num_experts) *
-         static_cast<int64_t>(num_scaleout_ranks) *
-         static_cast<int64_t>(num_scaleup_ranks);
+  // Native V2 dispatch batches are semantic expert batches.  The destination
+  // rank/lane is derived from the expert id, so multiplying by topology would
+  // allocate unreachable batch slots and inflate the receiver signal table.
+  return static_cast<int64_t>(num_experts);
 }
 
 }  // namespace uccl::v2_efa
