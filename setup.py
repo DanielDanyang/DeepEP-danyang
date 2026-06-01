@@ -93,6 +93,7 @@ if __name__ == '__main__':
     # TODO: make NVSHMEM and legacy optional
     nvshmem_root_dir = find_pkgs.find_nvshmem_root()
     nccl_root_dir = find_pkgs.find_nccl_root()
+    cuda_root_dir = os.getenv('CUDA_HOME', '/usr/local/cuda')
 
     # `128,2417` is used to suppress warnings of `fmt`
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
@@ -100,7 +101,7 @@ if __name__ == '__main__':
     sources = ['csrc/python_api.cpp', 'csrc/kernels/legacy/layout.cu', 'csrc/kernels/legacy/intranode.cu']
     include_dirs = [f'{current_dir}/deep_ep/include',
                     f'{current_dir}/third-party/fmt/include',
-                    '/usr/local/cuda/include/cccl']
+                    f'{cuda_root_dir}/include/cccl']
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = ['-lcuda']
@@ -120,6 +121,7 @@ if __name__ == '__main__':
     # ``libnccl.so.2`` only, so resolve the real name dynamically.
     sources.extend(['csrc/kernels/backend/nccl.cu'])
     include_dirs.extend([f'{nccl_root_dir}/include'])
+    library_dirs.extend([f'{nccl_root_dir}/lib'])
     nccl_lib = get_nccl_lib_name(nccl_root_dir)
     extra_link_args.extend([f'-l:{nccl_lib}', f'-Wl,-rpath,{nccl_root_dir}/lib'])
 

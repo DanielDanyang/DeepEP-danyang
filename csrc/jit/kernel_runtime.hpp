@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/cuda/CUDAContext.h>
+#include <tuple>
 
 #include <deep_ep/common/exception.cuh>
 
@@ -29,13 +30,20 @@ public:
         // Find the only symbol
         // TODO: use kernel enumeration for newer drivers
         const std::vector<std::string> illegal_names = {"vprintf", "__instantiate_kernel", "__internal", "__assertfail"};
-        const auto [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
+        auto [exit_code, symbols] = call_external_command(fmt::format("{} -symbols {}", cuobjdump_path.c_str(), cubin_path.c_str()));
+        const bool use_readelf = exit_code != 0;
+        if (use_readelf)
+            std::tie(exit_code, symbols) = call_external_command(fmt::format("readelf -sW {}", cubin_path.c_str()));
         EP_HOST_ASSERT(exit_code == 0);
         std::istringstream iss(symbols);
         std::vector<std::string> symbol_names;
         for (std::string line; std::getline(iss, line); ) {
-            if (line.find("STT_FUNC") == 0 and line.find("STO_ENTRY") != std::string::npos and
-                std::none_of(illegal_names.begin(), illegal_names.end(),
+            const bool is_kernel_symbol = use_readelf ?
+                (line.find(" FUNC ") != std::string::npos and
+                 line.find(" GLOBAL ") != std::string::npos and
+                 line.find(" UND ") == std::string::npos) :
+                (line.find("STT_FUNC") == 0 and line.find("STO_ENTRY") != std::string::npos);
+            if (is_kernel_symbol and std::none_of(illegal_names.begin(), illegal_names.end(),
                 [&](const auto name) { return line.find(name) != std::string::npos; })) {
                 const auto last_space = line.rfind(' ');
                 symbol_names.push_back(line.substr(last_space + 1));
