@@ -376,6 +376,71 @@ device enqueue EFA proxy descriptors
 
 ## 九步开发计划
 
+### 距离完成还差什么（2026-06-01）
+
+当前 `uccl-ep` 已经不再是最早那套 V1 静态 kernel 改皮的 public path，但还没有达到
+“真正 native V2”的完成线。现在的状态应按下面三个层次判断。
+
+已经过门槛的部分：
+
+- V1 public/static data plane 已从 native V2 build/source hygiene 中移除；旧
+  `internode/intranode/layout` 不能再被无意编进 extension。
+- `V2EfaRuntime`、V2-only Python wrapper、JIT plan、16B `V2TransferCmd`、D2H queue、
+  host proxy scaffold、EFA sink adapter 已能编译。
+- D2H queue 的 publish/ready/ack 协议已修正：GPU 用 32-bit header 原子 publish，
+  host 只 ack 实际连续 ready end，避免 leaked slot、TOCTOU drop、非原子 kind data race
+  和 overflow 后误处理 stale slot。
+- `token_metadata_at_forward` / `channel_linked_list` 已改成 V2-like 多 channel 形状，
+  并由 CUDA/JIT metadata kernel 填充，不再由 Python loop 直接写。
+- 真实 EFA verbs sink 已接入最小路径；EP1x2 smoke 已验证 dispatch/combine 都能产生
+  payload + signal command，并跨节点写入 peer RDMA window。
+
+完成 native V2 前的硬阻塞：
+
+1. **真实 fork DeepEP V2 dispatch JIT 主路径。**
+   当前 direct enqueue kernel 仍是 sidecar 过渡层。必须进入真实
+   `hybrid_dispatch.cuh` scaleout path，把 GIN notify/tail/payload call site 替换为
+   V2TransferCmd enqueue，而不是在 semantic dispatch 之后补一条 RDMA overlay。
+
+2. **receiver 端直接生成官方 V2 expanded layout。**
+   现在 remote slot 仍接近 `token * expanded_slot_stride` 的临时映射，ordering 和输出主要
+   由 semantic bridge 保证。最终必须在 receiver epilogue 里直接写 expanded payload、
+   `recv_src_metadata`、`dst_buffer_slot_idx`、psum/count metadata，并删除 public
+   `dispatch()` 里的 RDMA window overlay。
+
+3. **真实 native reduced-combine。**
+   combine 必须完整解析官方 V2 `token_metadata_at_forward`、`channel_linked_list` 和
+   psum metadata，支持 topk>1、多 remote contributor、同 token 多贡献 reduce。当前只在
+   简单唯一 remote contributor 场景 overlay payload，多 contributor 仍依赖 semantic
+   fallback，这还不是 native V2 combine。
+
+4. **cached dispatch/combine 走官方 V2 handle/cache。**
+   cached path 不能从 semantic tensors 或 transitional descriptor 重新推导。需要复用
+   dispatch 产生的官方 V2 forward metadata、linked-list、slot assignment 和 reduced
+   combine metadata。
+
+5. **把过渡 mapped queue/drain 收敛成生产 proxy substrate。**
+   保留 V1 的 CPU proxy/FIFO/EFA post 方法，但只 decode `V2TransferCmd`。需要完成多
+   queue/channel/NIC/lane 映射、CQ/backpressure、signal scratch completion barrier、
+   endpoint table 生命周期和 coalescing 统计，删除只服务 host reference 的临时路径。
+
+6. **per-expert / low-latency semantic batching 移植到 V2。**
+   不能退回“大块 memcpy 一次传完”的路线。dispatch/combine descriptor 要按
+   `(dst_rank, lane, expert)` 和 V2 slot/link metadata 聚合，让 EFA proxy 发的是
+   V2 语义 batch，而不是 V1 packed token staging。
+
+完成判定：
+
+- 源码中没有生产路径依赖 `_semantic_dispatch_data`、`_semantic_combine_data`、
+  V1 packed staging、旧 `TransferCmd` semantic decode 或 RDMA overlay。
+- EP1x2、单机 EP8、双机 EP8x2/EP16 correctness 都通过，覆盖 `topk>1`、
+  `do_expand=true/false`、cached dispatch、cached combine、多 remote contributor
+  reduced-combine。
+- README-style EP16 benchmark 能输出 dispatch/combine bottleneck bw，并用 command 数、
+  平均 payload、coalescing rate、CQ/post rate、NIC/rail traffic 解释性能；若达不到 SM90
+  README 量级，需要给出是 V2 kernel、proxy posting、EFA 小消息还是 aws-ofi/GPU-init
+  上界造成的证据。
+
 ### 1. 删除旧数据面
 
 - 从 build 中移除 `internode.cu`、`intranode.cu`、`layout.cu`。
@@ -485,6 +550,10 @@ device enqueue EFA proxy descriptors
   head/tail/ack 思路和 128-bit slot 宽度，但 readiness byte 是 `V2TransferCmd.kind`，
   不依赖旧 `TransferCmd.cmd_type`。host reference 已覆盖 submit -> poll -> EFA post
   -> ack -> advance tail。
+- D2H queue publish/ack 已修正成 32-bit header 协议：device 写完整 command 后用
+  `atomicExch` publish header，host acquire 读取 header，并只 ack 当前连续 ready end。
+  这修掉了 leaked slot 永久卡死、poll/ack TOCTOU 丢 command、`kind` 非原子 data race、
+  enqueue overflow 后 tail 前进导致 stale slot 被处理等问题。
 - `dispatch_jit.cuh` / `combine_jit.cuh` 已新增直接写 `V2TransferD2HQueueView` 的
   enqueue kernel scaffold。下一步是把这个 view 映射到 retained CPU proxy 的真实
   pinned D2H queue，并让 proxy poll loop 只消费 V2 command。
