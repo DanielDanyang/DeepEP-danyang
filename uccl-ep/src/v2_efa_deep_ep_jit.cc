@@ -268,6 +268,47 @@ void launch_v2_efa_dispatch_forward_metadata_plan(
       num_recv_tokens, rows_per_channel, scaleup_rank, do_expand));
 }
 
+void launch_v2_efa_dispatch_receiver_metadata_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t recv_topk_idx_ptr,
+    std::uintptr_t recv_src_global_ptr, std::uintptr_t recv_counts_per_rank_ptr,
+    std::uintptr_t recv_src_metadata_ptr,
+    std::uintptr_t dst_buffer_slot_idx_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+    std::uintptr_t expert_counts_aligned_ptr,
+    std::uintptr_t expert_counts_scratch_ptr,
+    std::uintptr_t next_expanded_scratch_ptr, int num_recv_tokens,
+    int num_source_tokens, int num_max_tokens_per_rank, int rank,
+    int expert_alignment, bool do_expand, std::uintptr_t cuda_stream_ptr) {
+  if (num_recv_tokens < 0 || num_source_tokens < 0 ||
+      num_max_tokens_per_rank <= 0 || rank < 0 || expert_alignment <= 0) {
+    throw std::invalid_argument(
+        "invalid V2 EFA dispatch receiver metadata launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config,
+      checked_ptr<const int64_t>(recv_topk_idx_ptr, "recv_topk_idx"),
+      checked_ptr<const int32_t>(recv_src_global_ptr, "recv_src_global"),
+      checked_ptr<const int32_t>(recv_counts_per_rank_ptr,
+                                 "recv_counts_per_rank"),
+      checked_ptr<int32_t>(recv_src_metadata_ptr, "recv_src_metadata"),
+      checked_ptr<int32_t>(dst_buffer_slot_idx_ptr, "dst_buffer_slot_idx"),
+      checked_ptr<int32_t>(psum_num_recv_tokens_per_scaleup_rank_ptr,
+                           "psum_num_recv_tokens_per_scaleup_rank"),
+      checked_ptr<int32_t>(psum_num_recv_tokens_per_expert_ptr,
+                           "psum_num_recv_tokens_per_expert"),
+      checked_ptr<int32_t>(expert_counts_aligned_ptr,
+                           "expert_counts_aligned"),
+      checked_ptr<int32_t>(expert_counts_scratch_ptr, "expert_counts_scratch"),
+      checked_ptr<int32_t>(next_expanded_scratch_ptr,
+                           "next_expanded_scratch"),
+      num_recv_tokens, num_source_tokens, num_max_tokens_per_rank, rank,
+      expert_alignment, do_expand));
+}
+
 void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t dispatch_segments_ptr,
     std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
@@ -462,6 +503,32 @@ void V2EfaRuntime::launch_dispatch_forward_metadata(
       plan, recv_topk_idx_ptr, recv_src_metadata_ptr,
       token_metadata_at_forward_ptr, channel_linked_list_ptr, num_recv_tokens,
       rows_per_channel, cfg.scaleup_rank, do_expand, cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_dispatch_receiver_metadata(
+    std::uintptr_t recv_topk_idx_ptr, std::uintptr_t recv_src_global_ptr,
+    std::uintptr_t recv_counts_per_rank_ptr,
+    std::uintptr_t recv_src_metadata_ptr,
+    std::uintptr_t dst_buffer_slot_idx_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+    std::uintptr_t expert_counts_aligned_ptr,
+    std::uintptr_t expert_counts_scratch_ptr,
+    std::uintptr_t next_expanded_scratch_ptr, int num_recv_tokens,
+    int num_source_tokens, int num_max_tokens_per_rank, int expert_alignment,
+    bool do_expand, const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto& cfg = config();
+  const auto plan = build_dispatch_receiver_metadata_jit_plan(
+      num_max_tokens_per_rank, uccl_include_path);
+  launch_v2_efa_dispatch_receiver_metadata_plan(
+      plan, recv_topk_idx_ptr, recv_src_global_ptr, recv_counts_per_rank_ptr,
+      recv_src_metadata_ptr, dst_buffer_slot_idx_ptr,
+      psum_num_recv_tokens_per_scaleup_rank_ptr,
+      psum_num_recv_tokens_per_expert_ptr, expert_counts_aligned_ptr,
+      expert_counts_scratch_ptr, next_expanded_scratch_ptr, num_recv_tokens,
+      num_source_tokens, num_max_tokens_per_rank, cfg.rank, expert_alignment,
+      do_expand, cuda_stream_ptr);
 }
 
 void V2EfaRuntime::launch_combine_descriptor_enqueue_d2h(

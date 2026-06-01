@@ -330,6 +330,109 @@ __global__ void v2_efa_dispatch_forward_metadata_kernel(
   }
 }
 
+template <int kWorldSize, int kNumScaleupRanks, int kNumExperts, int kNumTopk>
+__global__ void v2_efa_dispatch_receiver_metadata_kernel(
+    const int64_t* recv_topk_idx, const int32_t* recv_src_global,
+    const int32_t* recv_counts_per_rank, int32_t* recv_src_metadata,
+    int32_t* dst_buffer_slot_idx, int32_t* psum_num_recv_tokens_per_scaleup_rank,
+    int32_t* psum_num_recv_tokens_per_expert, int32_t* expert_counts_aligned,
+    int32_t* expert_counts_scratch, int32_t* next_expanded_scratch,
+    int num_recv_tokens, int num_source_tokens, int num_max_tokens_per_rank,
+    int rank, int expert_alignment, bool do_expand) {
+  constexpr int kMetadataDims = 2 + kNumTopk;
+  static_assert(kWorldSize > 0, "invalid V2 receiver world size");
+  static_assert(kNumScaleupRanks > 0, "invalid V2 receiver scaleup ranks");
+  static_assert(kNumExperts % kWorldSize == 0,
+                "num experts must be divisible by world size");
+  constexpr int kNumLocalExperts = kNumExperts / kWorldSize;
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int stride = static_cast<int>(blockDim.x);
+
+  for (int expert = tid; expert < kNumLocalExperts; expert += stride) {
+    expert_counts_aligned[expert] = 0;
+    expert_counts_scratch[expert] = 0;
+    next_expanded_scratch[expert] = 0;
+    psum_num_recv_tokens_per_expert[expert] = 0;
+  }
+  for (int lane = tid; lane < kNumScaleupRanks; lane += stride) {
+    psum_num_recv_tokens_per_scaleup_rank[lane] = 0;
+  }
+  for (int idx = tid; idx < num_source_tokens * kNumTopk; idx += stride) {
+    dst_buffer_slot_idx[idx] = -1;
+  }
+  for (int row = tid; row < num_recv_tokens; row += stride) {
+    auto* metadata = recv_src_metadata + row * kMetadataDims;
+    metadata[0] = recv_src_global[row];
+    metadata[1] = 0;
+    for (int slot = 0; slot < kNumTopk; ++slot) {
+      metadata[2 + slot] = -1;
+    }
+  }
+  __syncthreads();
+
+  for (int row = tid; row < num_recv_tokens; row += stride) {
+    for (int slot = 0; slot < kNumTopk; ++slot) {
+      const int expert =
+          static_cast<int>(__ldg(recv_topk_idx + row * kNumTopk + slot));
+      if (expert >= 0 && expert < kNumLocalExperts) {
+        atomicAdd(expert_counts_scratch + expert, 1);
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    int running = 0;
+    for (int lane = 0; lane < kNumScaleupRanks; ++lane) {
+      for (int peer = lane; peer < kWorldSize; peer += kNumScaleupRanks) {
+        running += recv_counts_per_rank[peer];
+      }
+      psum_num_recv_tokens_per_scaleup_rank[lane] = running;
+    }
+
+    running = 0;
+    for (int expert = 0; expert < kNumLocalExperts; ++expert) {
+      const int raw = expert_counts_scratch[expert];
+      const int aligned =
+          ((raw + expert_alignment - 1) / expert_alignment) * expert_alignment;
+      const int expanded_begin =
+          ((running + expert_alignment - 1) / expert_alignment) *
+          expert_alignment;
+      expert_counts_aligned[expert] = aligned;
+      next_expanded_scratch[expert] = expanded_begin;
+      running = do_expand ? expanded_begin + raw : running + aligned;
+      psum_num_recv_tokens_per_expert[expert] = running;
+    }
+  }
+  __syncthreads();
+
+  for (int row = tid; row < num_recv_tokens; row += stride) {
+    auto* metadata = recv_src_metadata + row * kMetadataDims;
+    const int src_global = metadata[0];
+    const int src_rank = src_global / num_max_tokens_per_rank;
+    const int src_token = src_global - src_rank * num_max_tokens_per_rank;
+    int linked_slot = 0;
+
+    for (int slot = 0; slot < kNumTopk; ++slot) {
+      const int expert =
+          static_cast<int>(__ldg(recv_topk_idx + row * kNumTopk + slot));
+      if (expert < 0 || expert >= kNumLocalExperts) {
+        continue;
+      }
+      linked_slot = row * kNumTopk + slot;
+      if (do_expand) {
+        metadata[2 + slot] = atomicAdd(next_expanded_scratch + expert, 1);
+      }
+      if (src_rank == rank && src_token >= 0 && src_token < num_source_tokens) {
+        dst_buffer_slot_idx[src_token * kNumTopk + slot] =
+            rank * num_max_tokens_per_rank + row;
+      }
+    }
+    metadata[1] = linked_slot;
+  }
+}
+
 template <int kInstance>
 __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
     const DispatchSegmentDescriptor* segments,

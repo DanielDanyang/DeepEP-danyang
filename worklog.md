@@ -1,5 +1,62 @@
 # DeepEP / NCCL GIN Worklog
 
+## 2026-06-01 dispatch receiver metadata 下沉到 JIT
+
+- 目标：
+  - 继续削掉 native V2 dispatch receiver 侧的 Python 语义拼装；
+  - 让 `recv_src_metadata`、`dst_buffer_slot_idx`、`psum_num_recv_tokens_per_scaleup_rank`、
+    `psum_num_recv_tokens_per_expert`、aligned expert count 由 CUDA/JIT kernel 生成。
+- 代码改动：
+  - 新增 `v2_efa_dispatch_receiver_metadata_kernel`：
+    - 输入 semantic bridge 暂时仍提供的 `recv_topk_idx`、`recv_src_global`、
+      `recv_counts_per_rank`；
+    - 在一个 block 内并行初始化 metadata/counters；
+    - 用 atomic 统计 local expert raw count；
+    - 计算 aligned expert count、scaleup psum、expert psum；
+    - 为 `do_expand` 路径分配 expanded slot；
+    - 填充 owner rank 所需的 `dst_buffer_slot_idx`。
+  - 新增 JIT/runtime/nanobind/Python 入口：
+    - `build_v2_efa_dispatch_receiver_metadata_jit_plan`
+    - `V2EfaRuntime::build_dispatch_receiver_metadata_jit_plan`
+    - `V2EfaRuntime::launch_dispatch_receiver_metadata`
+    - `ElasticBuffer.launch_dispatch_receiver_metadata`
+  - `_build_v2_dispatch_metadata` 不再用 Python loop 扫 `recv_topk_idx` 和
+    `recv_src_global`，改为分配 tensor/scratch 后调用 receiver metadata JIT kernel。
+- 验证：
+  - 本地：
+    - `python -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py
+      uccl-ep/tests/v2_efa_connection_smoke.py uccl-ep/tests/v2_efa_elastic_smoke.py`
+      通过；
+    - `python uccl-ep/tests/v2_efa_source_hygiene_test.py` 通过；
+    - `c++ -std=c++17 -Iuccl-ep/include
+      uccl-ep/tests/v2_efa_dispatch_plan_test.cc uccl-ep/src/v2_efa_runtime.cc
+      -o /tmp/v2_efa_dispatch_plan_test && /tmp/v2_efa_dispatch_plan_test`
+      通过；
+    - `git diff --check -- uccl-ep` 通过。
+  - 远端：
+    - GPU 空闲检查：`p5en_0` / `p5en_1` 均无 compute app；
+    - 同步本轮 `uccl-ep` 改动到 EFS；
+    - `p5en_0` / `p5en_1` 均
+      `source /home/ubuntu/.venvs/deepep-danyang-cu13/bin/activate &&
+      cd /home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/uccl-ep &&
+      make -j8 install` 通过；
+    - EP1x2 `uccl-ep/tests/v2_efa_connection_smoke.py` 通过；
+    - rank0/rank1 dispatch stats 均为 `drained_commands=2`、`posted_writes=1`、
+      `posted_signals=1`、`posted_bytes=20`、`head=2`、`tail=2`；
+    - rank0/rank1 combine stats 均为 `drained_commands=2`、`posted_writes=1`、
+      `posted_signals=1`、`posted_bytes=20`、`head=2`、`tail=2`。
+- 观察：
+  - 单机 `v2_efa_elastic_smoke.py` 在未初始化 EFA connection 时仍会尝试 drain
+    `combine_d2h_queue`，失败为 `NoneType`；这是测试对 no-EFA path 的旧假设，不是本轮
+    JIT/binding 编译失败。
+- 仍未完成：
+  - `recv_topk_idx` / `recv_src_global` 仍来自 semantic all-to-all bridge；
+  - receiver payload 仍通过 RDMA window overlay 接回 public `recv_x`；
+  - metadata kernel 目前是一个 block 的过渡 epilogue，不是官方 `hybrid_dispatch.cuh`
+    receiver epilogue 的最终 parallel schedule；
+  - 下一步应 fork/inline 真实 `hybrid_dispatch.cuh` scaleout receiver path，使 payload
+    和 metadata 在同一个 V2 receiver epilogue 中落到 expanded layout。
+
 ## 2026-05-28 native V2 方向纠偏
 
 - 确认当前 `uccl-ep` 仍然是 V1/UCCL EP normal path 的派生实现，而不是 DeepEP V2

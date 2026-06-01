@@ -543,6 +543,19 @@ class ElasticBuffer:
             str(uccl_include_path),
         )
 
+    def compile_dispatch_receiver_metadata_jit(
+        self,
+        num_max_tokens_per_rank: Optional[int] = None,
+        uccl_include_path: str = "",
+    ):
+        tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        return self.runtime.compile_dispatch_receiver_metadata_jit(
+            tokens,
+            str(uccl_include_path),
+        )
+
     def build_combine_enqueue_d2h_jit_plan(self, uccl_include_path: str = ""):
         return self.runtime.build_combine_enqueue_d2h_jit_plan(str(uccl_include_path))
 
@@ -989,6 +1002,79 @@ class ElasticBuffer:
             int(num_max_tokens_per_rank),
             int(num_channels_per_sm),
             int(rows_per_channel),
+            bool(do_expand),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
+    def launch_dispatch_receiver_metadata(
+        self,
+        recv_topk_idx: torch.Tensor,
+        recv_src_global: torch.Tensor,
+        recv_counts_per_rank: torch.Tensor,
+        recv_src_metadata: torch.Tensor,
+        dst_buffer_slot_idx: torch.Tensor,
+        psum_num_recv_tokens_per_scaleup_rank: torch.Tensor,
+        psum_num_recv_tokens_per_expert: torch.Tensor,
+        expert_counts_aligned: torch.Tensor,
+        expert_counts_scratch: torch.Tensor,
+        next_expanded_scratch: torch.Tensor,
+        num_recv_tokens: int,
+        num_source_tokens: int,
+        num_max_tokens_per_rank: int,
+        expert_alignment: int,
+        do_expand: bool,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        _require_cuda_contiguous(recv_topk_idx, "recv_topk_idx")
+        _require_cuda_contiguous(recv_src_global, "recv_src_global")
+        _require_cuda_contiguous(recv_counts_per_rank, "recv_counts_per_rank")
+        _require_cuda_contiguous(recv_src_metadata, "recv_src_metadata")
+        _require_cuda_contiguous(dst_buffer_slot_idx, "dst_buffer_slot_idx")
+        _require_cuda_contiguous(
+            psum_num_recv_tokens_per_scaleup_rank,
+            "psum_num_recv_tokens_per_scaleup_rank",
+        )
+        _require_cuda_contiguous(
+            psum_num_recv_tokens_per_expert,
+            "psum_num_recv_tokens_per_expert",
+        )
+        _require_cuda_contiguous(expert_counts_aligned, "expert_counts_aligned")
+        _require_cuda_contiguous(expert_counts_scratch, "expert_counts_scratch")
+        _require_cuda_contiguous(next_expanded_scratch, "next_expanded_scratch")
+        if recv_topk_idx.dtype != torch.int64:
+            raise TypeError("recv_topk_idx must be torch.int64")
+        for name, tensor in (
+            ("recv_src_global", recv_src_global),
+            ("recv_counts_per_rank", recv_counts_per_rank),
+            ("recv_src_metadata", recv_src_metadata),
+            ("dst_buffer_slot_idx", dst_buffer_slot_idx),
+            ("psum_num_recv_tokens_per_scaleup_rank", psum_num_recv_tokens_per_scaleup_rank),
+            ("psum_num_recv_tokens_per_expert", psum_num_recv_tokens_per_expert),
+            ("expert_counts_aligned", expert_counts_aligned),
+            ("expert_counts_scratch", expert_counts_scratch),
+            ("next_expanded_scratch", next_expanded_scratch),
+        ):
+            if tensor.dtype != torch.int32:
+                raise TypeError(f"{name} must be torch.int32")
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_dispatch_receiver_metadata(
+            int(recv_topk_idx.data_ptr()),
+            int(recv_src_global.data_ptr()),
+            int(recv_counts_per_rank.data_ptr()),
+            int(recv_src_metadata.data_ptr()),
+            int(dst_buffer_slot_idx.data_ptr()),
+            int(psum_num_recv_tokens_per_scaleup_rank.data_ptr()),
+            int(psum_num_recv_tokens_per_expert.data_ptr()),
+            int(expert_counts_aligned.data_ptr()),
+            int(expert_counts_scratch.data_ptr()),
+            int(next_expanded_scratch.data_ptr()),
+            int(num_recv_tokens),
+            int(num_source_tokens),
+            int(num_max_tokens_per_rank),
+            int(expert_alignment),
             bool(do_expand),
             str(uccl_include_path),
             _cuda_stream_ptr(stream),
@@ -1866,49 +1952,33 @@ class ElasticBuffer:
         num_recv, num_topk = recv_topk_idx.shape
         num_local_experts = num_experts // self.num_ranks
         device = recv_topk_idx.device
-        psum_scaleup_values = []
-        running = 0
-        for lane in range(self.num_scaleup_ranks):
-            running += sum(recv_counts[lane::self.num_scaleup_ranks])
-            psum_scaleup_values.append(running)
-        psum_scaleup = torch.tensor(psum_scaleup_values, dtype=torch.int32, device=device)
+        recv_counts_tensor = torch.tensor(recv_counts, dtype=torch.int32, device=device)
+        metadata = torch.empty((num_recv, 2 + num_topk), dtype=torch.int32, device=device)
+        dst_slot = torch.empty(topk_idx.shape, dtype=torch.int32, device=device)
+        psum_scaleup = torch.empty((self.num_scaleup_ranks,), dtype=torch.int32, device=device)
+        psum_expert = torch.empty((num_local_experts,), dtype=torch.int32, device=device)
+        expert_counts_aligned = torch.empty((num_local_experts,), dtype=torch.int32, device=device)
+        expert_counts_scratch = torch.empty((num_local_experts,), dtype=torch.int32, device=device)
+        next_expanded_scratch = torch.empty((num_local_experts,), dtype=torch.int32, device=device)
 
-        expert_counts_raw = [(recv_topk_idx == i).sum().item() for i in range(num_local_experts)]
-        expert_counts = [_align(c, expert_alignment) for c in expert_counts_raw]
-        psum_values, running = [], 0
-        expanded_offsets = []
-        for raw, aligned in zip(expert_counts_raw, expert_counts):
-            expanded_offsets.append(_align(running, expert_alignment))
-            running = (_align(running, expert_alignment) + raw) if do_expand else (running + aligned)
-            psum_values.append(running)
-        psum_expert = torch.tensor(psum_values, dtype=torch.int32, device=device)
-
-        metadata = torch.full((num_recv, 2 + num_topk), -1, dtype=torch.int32, device=device)
-        metadata[:, 0] = recv_src_global.to(torch.int32)
-        metadata[:, 1] = 0
-        next_expanded = torch.tensor(expanded_offsets, dtype=torch.int32, device=device)
-        for i in range(num_recv):
-            for slot in range(num_topk):
-                expert = int(recv_topk_idx[i, slot].item())
-                if expert < 0:
-                    continue
-                metadata[i, 1] = i * num_topk + slot
-                if do_expand:
-                    dst = int(next_expanded[expert].item())
-                    metadata[i, 2 + slot] = dst
-                    next_expanded[expert] += 1
-
-        dst_slot = torch.full(topk_idx.shape, -1, dtype=torch.int32, device=device)
-        src_rank = (recv_src_global // num_max_tokens_per_rank).to(torch.long)
-        src_token = (recv_src_global % num_max_tokens_per_rank).to(torch.long)
-        for i in range(num_recv):
-            rank = int(src_rank[i].item())
-            if rank != self.rank_idx:
-                continue
-            token = int(src_token[i].item())
-            for slot in range(num_topk):
-                if recv_topk_idx[i, slot] >= 0:
-                    dst_slot[token, slot] = self.rank_idx * num_max_tokens_per_rank + i
+        self.launch_dispatch_receiver_metadata(
+            recv_topk_idx=recv_topk_idx,
+            recv_src_global=recv_src_global.to(torch.int32),
+            recv_counts_per_rank=recv_counts_tensor,
+            recv_src_metadata=metadata,
+            dst_buffer_slot_idx=dst_slot,
+            psum_num_recv_tokens_per_scaleup_rank=psum_scaleup,
+            psum_num_recv_tokens_per_expert=psum_expert,
+            expert_counts_aligned=expert_counts_aligned,
+            expert_counts_scratch=expert_counts_scratch,
+            next_expanded_scratch=next_expanded_scratch,
+            num_recv_tokens=num_recv,
+            num_source_tokens=int(topk_idx.shape[0]),
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            expert_alignment=expert_alignment,
+            do_expand=do_expand,
+        )
+        expert_counts = [int(v) for v in expert_counts_aligned.detach().cpu().tolist()]
         return metadata, dst_slot, psum_scaleup, psum_expert, expert_counts
 
     def _semantic_combine_data(

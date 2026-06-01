@@ -1220,6 +1220,26 @@ NB_MODULE(ep, m) {
            nb::arg("num_max_tokens_per_rank"),
            nb::arg("num_channels_per_sm") = 1,
            nb::arg("uccl_include_path") = "")
+      .def("build_dispatch_receiver_metadata_jit_plan",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              const std::string& uccl_include_path) {
+             return jit_launch_plan_to_dict(
+                 self.build_dispatch_receiver_metadata_jit_plan(
+                     num_max_tokens_per_rank, uccl_include_path));
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("uccl_include_path") = "")
+      .def("compile_dispatch_receiver_metadata_jit",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              const std::string& uccl_include_path) {
+             const auto plan =
+                 self.build_dispatch_receiver_metadata_jit_plan(
+                     num_max_tokens_per_rank, uccl_include_path);
+             v2::compile_v2_efa_jit_plan(plan);
+             return jit_launch_plan_to_dict(plan);
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("uccl_include_path") = "")
       .def("build_combine_enqueue_d2h_jit_plan",
            [](const v2::V2EfaRuntime& self,
               const std::string& uccl_include_path) {
@@ -1484,6 +1504,50 @@ NB_MODULE(ep, m) {
            nb::arg("num_max_tokens_per_rank"),
            nb::arg("num_channels_per_sm"),
            nb::arg("rows_per_channel"),
+           nb::arg("do_expand"),
+           nb::arg("uccl_include_path") = "",
+           nb::arg("cuda_stream_ptr") = 0)
+      .def("launch_dispatch_receiver_metadata",
+           [](const v2::V2EfaRuntime& self,
+              std::uintptr_t recv_topk_idx_ptr,
+              std::uintptr_t recv_src_global_ptr,
+              std::uintptr_t recv_counts_per_rank_ptr,
+              std::uintptr_t recv_src_metadata_ptr,
+              std::uintptr_t dst_buffer_slot_idx_ptr,
+              std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+              std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+              std::uintptr_t expert_counts_aligned_ptr,
+              std::uintptr_t expert_counts_scratch_ptr,
+              std::uintptr_t next_expanded_scratch_ptr,
+              int num_recv_tokens, int num_source_tokens,
+              int num_max_tokens_per_rank, int expert_alignment,
+              bool do_expand, const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             self.launch_dispatch_receiver_metadata(
+                 recv_topk_idx_ptr, recv_src_global_ptr,
+                 recv_counts_per_rank_ptr, recv_src_metadata_ptr,
+                 dst_buffer_slot_idx_ptr,
+                 psum_num_recv_tokens_per_scaleup_rank_ptr,
+                 psum_num_recv_tokens_per_expert_ptr,
+                 expert_counts_aligned_ptr, expert_counts_scratch_ptr,
+                 next_expanded_scratch_ptr, num_recv_tokens, num_source_tokens,
+                 num_max_tokens_per_rank, expert_alignment, do_expand,
+                 uccl_include_path, cuda_stream_ptr);
+           },
+           nb::arg("recv_topk_idx_ptr"),
+           nb::arg("recv_src_global_ptr"),
+           nb::arg("recv_counts_per_rank_ptr"),
+           nb::arg("recv_src_metadata_ptr"),
+           nb::arg("dst_buffer_slot_idx_ptr"),
+           nb::arg("psum_num_recv_tokens_per_scaleup_rank_ptr"),
+           nb::arg("psum_num_recv_tokens_per_expert_ptr"),
+           nb::arg("expert_counts_aligned_ptr"),
+           nb::arg("expert_counts_scratch_ptr"),
+           nb::arg("next_expanded_scratch_ptr"),
+           nb::arg("num_recv_tokens"),
+           nb::arg("num_source_tokens"),
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("expert_alignment"),
            nb::arg("do_expand"),
            nb::arg("uccl_include_path") = "",
            nb::arg("cuda_stream_ptr") = 0)
