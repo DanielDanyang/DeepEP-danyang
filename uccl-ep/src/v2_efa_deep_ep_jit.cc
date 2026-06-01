@@ -430,6 +430,7 @@ void V2EfaRuntime::launch_dispatch_enqueue_d2h(
     std::uintptr_t tail_ptr, int queue_capacity, DispatchTransferLayout layout,
     const std::string& uccl_include_path,
     std::uintptr_t cuda_stream_ptr) const {
+  layout.skip_scaleout_rank = config().scaleout_rank;
   const auto plan = build_dispatch_enqueue_d2h_jit_plan(uccl_include_path);
   launch_v2_efa_dispatch_enqueue_d2h_plan(
       plan, segments_ptr, batches_ptr, num_batches, commands_ptr, head_ptr,
@@ -458,6 +459,7 @@ void V2EfaRuntime::launch_dispatch_descriptor_enqueue_d2h(
     DispatchTransferLayout layout, const std::string& uccl_include_path,
     std::uintptr_t cuda_stream_ptr) const {
   const auto& cfg = config();
+  layout.skip_scaleout_rank = cfg.scaleout_rank;
   const auto plan = build_dispatch_descriptor_enqueue_d2h_jit_plan(
       num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
       has_topk_weight, cached_mode, deterministic, do_cpu_sync, smem_bytes,

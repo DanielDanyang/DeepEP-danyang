@@ -150,6 +150,9 @@ __device__ __forceinline__ void enqueue_dispatch_d2h(
     if (batch.num_segments <= 0 || batch.total_tokens <= 0) {
       continue;
     }
+    if (batch.dst_scaleout_rank == layout.skip_scaleout_rank) {
+      continue;
+    }
     for (int i = 0; i < batch.num_segments; ++i) {
       const auto segment_idx =
           static_cast<uint32_t>(batch.first_segment + i);

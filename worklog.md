@@ -125,6 +125,43 @@
   - 但 combine command 生成已经从“flatten metadata scan”推进到“linked-list indexed
     metadata replay”。
 
+## 2026-06-01 dispatch EFA path 切回 descriptor/batch enqueue
+
+- 目标：
+  - 当前 EFA dispatch 发送侧仍用 `v2_efa_dispatch_direct_enqueue_d2h_kernel`，按
+    `num_tokens * topk` 逐 token 生成 payload/signal；
+  - 这绕过了已经生成的 `DispatchSegmentDescriptor` / `DispatchExpertBatch`，不符合
+    per-expert semantic batching 方向；
+  - 本轮把 EFA path 切到 descriptor/batch enqueue，为后续按
+    `(dst_rank, lane, expert)` 合并小消息铺路。
+- 代码改动：
+  - `DispatchTransferLayout` 新增 `skip_scaleout_rank`；
+  - `detail::enqueue_dispatch_d2h` 会跳过目标 scaleout 等于本 rank scaleout 的 batch，
+    避免 descriptor path 对本节点流量也发 EFA command；
+  - `V2EfaRuntime::launch_dispatch_enqueue_d2h` 和
+    `launch_dispatch_descriptor_enqueue_d2h` 会把当前 `cfg.scaleout_rank` 写入 layout；
+  - Python `_launch_native_dispatch_transport` 在 EFA connection 存在时不再先
+    `launch_dispatch_descriptors` 再 direct enqueue，而是直接调用
+    `launch_dispatch_descriptor_enqueue_d2h_queue`；
+  - D2H queue capacity 改回按 descriptor worst-case 计算；
+  - dispatch layout 标记 `descriptor_batched=True`。旧 overlay 在 batched layout 下只保留
+    EP1x2 单 token smoke 可读性，避免继续按 `src_token * stride` 错读 batched remote
+    layout。
+- 验证：
+  - 本地 py_compile/source hygiene/C++ dispatch plan/diff check 通过；
+  - 远端 GPU 空闲检查通过；
+  - 首次同时在两台机器 `make install` 时 EFS 输出 `ep.abi3.so` 出现 stale file handle；
+    改为只在 `p5en_0` 链接并安装，然后复制 `.so` 到 `p5en_1` venv，问题消失；
+  - EP1x2 `uccl-ep/tests/v2_efa_connection_smoke.py` 通过；
+  - rank0/rank1 dispatch 和 combine stats 均保持
+    `drained_commands=2`、`posted_writes=1`、`posted_signals=1`、
+    `posted_bytes=20`、`head=2`、`tail=2`。
+- 仍未完成：
+  - batched descriptor remote layout 还没有真正接入 public receiver output；当前 public
+    output 仍主要由 semantic bridge 保证正确；
+  - 下一步需要把 receiver payload scatter/metadata epilogue 合并到真实 V2 JIT 主路径，
+    才能删除 RDMA window overlay 和 semantic all-to-all。
+
 ## 2026-05-28 native V2 方向纠偏
 
 - 确认当前 `uccl-ep` 仍然是 V1/UCCL EP normal path 的派生实现，而不是 DeepEP V2

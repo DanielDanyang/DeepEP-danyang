@@ -68,6 +68,7 @@ struct DispatchTransferLayout {
   uint32_t expanded_slot_stride = 0;
   uint32_t batch_payload_stride = 0;
   uint32_t signal_stride = sizeof(uint32_t);
+  int32_t skip_scaleout_rank = -1;
 };
 
 struct CombineTransferLayout {

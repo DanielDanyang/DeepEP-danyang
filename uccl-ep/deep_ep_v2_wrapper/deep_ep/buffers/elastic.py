@@ -697,6 +697,7 @@ class ElasticBuffer:
             "expanded_slot_stride": int(payload_bytes),
             "batch_payload_stride": batch_payload_stride,
             "signal_stride": 4,
+            "descriptor_batched": True,
             "src_payload_bytes": src_bytes,
             "remote_payload_bytes": remote_payload_bytes,
             "total_window_bytes": total_bytes,
@@ -1481,12 +1482,7 @@ class ElasticBuffer:
                               dtype=torch.uint8, device=topk_idx.device)
         counters = torch.zeros((3,), dtype=torch.int32, device=topk_idx.device)
         descriptor_queue_capacity = max_segments + max_batches + 1
-        direct_queue_capacity = int(num_tokens * self.num_topk * 2 + 1)
-        queue_capacity = _next_power_of_two(
-            direct_queue_capacity
-            if self._v2_efa_connection is not None
-            else descriptor_queue_capacity
-        )
+        queue_capacity = _next_power_of_two(descriptor_queue_capacity)
         queue = self.allocate_d2h_queue(queue_capacity)
         if self._v2_efa_connection is not None:
             layout = self._make_dispatch_window_layout(
@@ -1508,19 +1504,11 @@ class ElasticBuffer:
             }
         flat_topk_idx = topk_idx.reshape(-1)
         if self._v2_efa_connection is not None:
-            self.launch_dispatch_descriptors(
+            self.launch_dispatch_descriptor_enqueue_d2h_queue(
                 topk_idx=flat_topk_idx,
                 segments=segments,
                 batches=batches,
                 counters=counters,
-                num_tokens=num_tokens,
-                num_max_tokens_per_rank=num_max_tokens_per_rank,
-                scale_bytes=scale_bytes,
-                has_topk_weight=has_topk_weight,
-                do_cpu_sync=do_cpu_sync,
-            )
-            self.launch_dispatch_direct_enqueue_d2h_queue(
-                topk_idx=flat_topk_idx,
                 queue=queue,
                 layout=layout,
                 num_tokens=num_tokens,
@@ -1594,6 +1582,8 @@ class ElasticBuffer:
         if int(transport.dispatch_drain_stats.get("posted_writes", 0)) == 0:
             return
         layout = transport.dispatch_layout or {}
+        if bool(layout.get("descriptor_batched", False)) and int(recv_x.shape[0]) != 1:
+            return
         remote_payload_base = int(layout.get("remote_payload_base", 0))
         expanded_slot_stride = int(layout.get("expanded_slot_stride", payload_bytes))
         window = self._require_v2_efa_window(
