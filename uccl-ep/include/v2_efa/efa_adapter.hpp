@@ -279,11 +279,11 @@ template <uint32_t Capacity>
 inline size_t drain_v2_d2h_queue_to_efa_posts(
     HostV2TransferD2HQueue<Capacity>& queue, EfaPostSink& sink,
     bool ack_after_drain = true) {
-  uint64_t observed_head = 0;
-  const auto commands = queue.poll_ready(&observed_head);
+  uint64_t observed_ready_end = 0;
+  const auto commands = queue.poll_ready(&observed_ready_end);
   drain_v2_transfer_cmds_to_efa_posts(commands, sink);
   if (ack_after_drain) {
-    queue.ack_ready_until(observed_head);
+    queue.ack_ready_until(observed_ready_end);
   }
   return commands.size();
 }

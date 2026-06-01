@@ -1871,3 +1871,38 @@ README 风格 EP8x2 性能：
   - channel assignment 仍是 round-robin scaffold，不是官方 `hybrid_dispatch.cuh`
     receiver epilogue 的 tail/linked-list 协议；
   - 服务器已完成构建验证，但 correctness smoke 需等 GPU 再次空闲。
+
+## 2026-05-31 review: D2H queue publish/ack 修复
+
+- 复核外部 review 的 7 个 code-level finding：
+  - `CoalescingEfaPostSink` destructor throw 和 `pending_.bytes` overflow 在当前代码中已
+    处理；
+  - `reset_signal_scratch` 当前只在 `V2EfaConnectionHandle::poll_completions` 看到所有
+    outstanding signaled WR completion 后调用，暂未发现直接无 barrier reset 的调用点；
+  - D2H queue 的 publish / poll / ack 路径仍有实际风险，本轮修复。
+- 修复内容：
+  - device enqueue 现在先拒绝 invalid/empty `V2TransferCmd`，避免发布永远不会 ready 的
+    slot；
+  - GPU 发布 command 时用 32-bit header `atomicExch` 发布 kind/rank/lane/flags，不再用
+    非原子的 byte store 发布 kind；
+  - host poll 侧用 acquire 读取同一个 32-bit header 判断 ready；
+  - `poll_ready` 返回的是“本次实际连续 ready 的末尾”而不是瞬时 `head`；
+  - adapter / mapped queue / `ack_ready` 都只 ack 到这个 ready end，避免 poll 后、ack 前
+    新变 ready 的 command 被 silent drop。
+- 新增 C++ regression：
+  - 手工构造 `head=2`，slot0 ready、slot1 not-ready；
+  - poll 得到 slot0 后，在 ack 前发布 slot1；
+  - 验证 ack 只推进到 slot1，第二次 poll 仍能读出 slot1。
+- 验证：
+  - 本地 py_compile / source hygiene 通过；
+  - 本地 C++ dispatch plan test 通过；
+  - `git diff --check -- uccl-ep worklog.md` 通过。
+  - 远端：
+    - 同步到 EFS 后，`p5en_0` / `p5en_1` 均 `make -j8 install` 通过；
+    - EP1x2 `uccl-ep/tests/v2_efa_connection_smoke.py` 通过；
+    - rank0/rank1 dispatch stats 均为 `drained_commands=2`、`posted_writes=1`、
+      `posted_signals=1`、`posted_bytes=20`、`head=2`、`tail=2`；
+    - rank0/rank1 combine stats 均为 `drained_commands=2`、`posted_writes=1`、
+      `posted_signals=1`、`posted_bytes=20`、`head=2`、`tail=2`；
+    - smoke 的 native EFA window 从 4096B 调到 8192B，因为当前 combine layout 最小
+      需要 4160B。

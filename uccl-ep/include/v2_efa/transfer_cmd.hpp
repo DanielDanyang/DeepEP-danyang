@@ -85,6 +85,19 @@ V2_EFA_HOST_DEVICE inline bool is_v2_transfer_cmd(const V2TransferCmd& cmd) {
          cmd.kind <= static_cast<uint8_t>(V2TransferCmdKind::kCombineSignal);
 }
 
+V2_EFA_HOST_DEVICE inline uint32_t v2_transfer_cmd_header(
+    const V2TransferCmd& cmd) {
+  return static_cast<uint32_t>(cmd.kind) |
+         (static_cast<uint32_t>(cmd.target_rank) << 8) |
+         (static_cast<uint32_t>(cmd.target_lane) << 16) |
+         (static_cast<uint32_t>(cmd.flags) << 24);
+}
+
+V2_EFA_HOST_DEVICE inline uint8_t v2_transfer_kind_from_header(
+    uint32_t header) {
+  return static_cast<uint8_t>(header & 0xffu);
+}
+
 V2_EFA_HOST_DEVICE inline uint8_t v2_transfer_flags(V2TransferCmdKind kind) {
   switch (kind) {
     case V2TransferCmdKind::kDispatchPayload:
@@ -294,12 +307,17 @@ __device__ __forceinline__ uint32_t reserve_v2_transfer_cmd(
   }
 }
 
-__device__ __forceinline__ void enqueue_v2_transfer_cmd(
+__device__ __forceinline__ bool enqueue_v2_transfer_cmd(
     V2TransferQueueView queue, V2TransferCmd command) {
+  if (!is_v2_transfer_cmd(command)) {
+    return false;
+  }
   const auto slot = reserve_v2_transfer_cmd(queue);
   if (slot < queue.capacity) {
     queue.commands[slot] = command;
+    return true;
   }
+  return false;
 }
 #endif
 

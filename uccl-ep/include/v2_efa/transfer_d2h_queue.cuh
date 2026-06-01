@@ -57,7 +57,10 @@ struct alignas(128) V2TransferD2HQueue {
   }
 
   uint8_t volatile_load_kind(uint64_t idx) const {
-    return __atomic_load_n(&commands[idx & mask()].kind, __ATOMIC_ACQUIRE);
+    const auto header = __atomic_load_n(
+        reinterpret_cast<const uint32_t*>(&commands[idx & mask()]),
+        __ATOMIC_ACQUIRE);
+    return v2_transfer_kind_from_header(header);
   }
 
   V2TransferCmd& load_cmd_entry(uint64_t idx) {
@@ -69,7 +72,8 @@ struct alignas(128) V2TransferD2HQueue {
   }
 
   void volatile_clear_kind(uint64_t idx) {
-    __atomic_store_n(&commands[idx & mask()].kind, uint8_t{0},
+    __atomic_store_n(reinterpret_cast<uint32_t*>(&commands[idx & mask()]),
+                     uint32_t{0},
                      __ATOMIC_RELEASE);
   }
 
@@ -129,6 +133,9 @@ struct alignas(128) V2TransferD2HQueue {
 
   bool atomic_set_and_commit(const V2TransferCmd& command,
                              uint64_t* out_slot = nullptr) {
+    if (!is_v2_transfer_cmd(command)) {
+      return false;
+    }
     uint64_t slot = 0;
     while (true) {
       const auto h = __atomic_load_n(&head, __ATOMIC_RELAXED);
@@ -146,10 +153,11 @@ struct alignas(128) V2TransferD2HQueue {
 
     const auto idx = slot & mask();
     auto tmp = command;
-    const auto saved_kind = tmp.kind;
+    const auto saved_header = v2_transfer_cmd_header(tmp);
     tmp.kind = 0;
     commands[idx] = tmp;
-    __atomic_store_n(&commands[idx].kind, saved_kind, __ATOMIC_RELEASE);
+    __atomic_store_n(reinterpret_cast<uint32_t*>(&commands[idx]), saved_header,
+                     __ATOMIC_RELEASE);
     if (out_slot != nullptr) {
       *out_slot = slot;
     }
@@ -161,6 +169,9 @@ struct alignas(128) V2TransferD2HQueue {
 __device__ __forceinline__ bool enqueue_v2_transfer_d2h(
     V2TransferD2HQueueView queue, V2TransferCmd command,
     uint64_t* out_slot = nullptr) {
+  if (!is_v2_transfer_cmd(command)) {
+    return false;
+  }
   while (true) {
     const auto h = *reinterpret_cast<volatile uint64_t*>(queue.head);
     const auto t = *reinterpret_cast<volatile uint64_t*>(queue.tail);
@@ -179,11 +190,12 @@ __device__ __forceinline__ bool enqueue_v2_transfer_d2h(
     }
 
     const auto idx = static_cast<uint32_t>(h) & (queue.capacity - 1);
-    const auto saved_kind = command.kind;
+    const auto saved_header = v2_transfer_cmd_header(command);
     command.kind = 0;
     queue.commands[idx] = command;
     __threadfence_system();
-    *reinterpret_cast<volatile uint8_t*>(&queue.commands[idx].kind) = saved_kind;
+    atomicExch(reinterpret_cast<unsigned int*>(&queue.commands[idx]),
+               saved_header);
     if (out_slot != nullptr) {
       *out_slot = h;
     }
@@ -218,25 +230,27 @@ class HostV2TransferD2HQueue {
     return stats;
   }
 
-  std::vector<V2TransferCmd> poll_ready(uint64_t* observed_head = nullptr) const {
+  std::vector<V2TransferCmd> poll_ready(uint64_t* observed_ready_end = nullptr) const {
     std::vector<V2TransferCmd> out;
     const auto head = queue_.volatile_head();
     const auto tail = queue_.volatile_tail();
-    if (observed_head != nullptr) {
-      *observed_head = head;
-    }
     out.reserve(static_cast<size_t>(head - tail));
+    uint64_t ready_end = tail;
     for (uint64_t idx = tail; idx < head; ++idx) {
       if (queue_.volatile_load_kind(idx) == 0) {
         break;
       }
       out.push_back(queue_.load_cmd_entry(idx));
+      ready_end = idx + 1;
+    }
+    if (observed_ready_end != nullptr) {
+      *observed_ready_end = ready_end;
     }
     return out;
   }
 
-  void ack_ready_until(uint64_t observed_head) {
-    const auto head = observed_head;
+  void ack_ready_until(uint64_t observed_ready_end) {
+    const auto head = observed_ready_end;
     const auto tail = queue_.volatile_tail();
     for (uint64_t idx = tail; idx < head; ++idx) {
       if (queue_.volatile_load_kind(idx) == 0) {
@@ -248,7 +262,11 @@ class HostV2TransferD2HQueue {
     queue_.advance_tail_from_mask();
   }
 
-  void ack_ready() { ack_ready_until(queue_.volatile_head()); }
+  void ack_ready() {
+    uint64_t observed_ready_end = 0;
+    (void)poll_ready(&observed_ready_end);
+    ack_ready_until(observed_ready_end);
+  }
 
  private:
   V2TransferD2HQueue<Capacity> queue_;

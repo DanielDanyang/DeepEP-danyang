@@ -356,6 +356,34 @@ int main() {
   d2h_queue.ack_ready();
   assert(d2h_queue.queue().volatile_tail() == d2h_queue.queue().volatile_head());
 
+  HostV2TransferD2HQueue<16> partial_ready_queue;
+  auto first_cmd = dispatch_commands.commands[0];
+  auto second_cmd = dispatch_commands.commands[1];
+  auto& partial_ring = partial_ready_queue.queue();
+  partial_ring.commands[0] = first_cmd;
+  const auto first_header = v2_transfer_cmd_header(first_cmd);
+  __atomic_store_n(reinterpret_cast<uint32_t*>(&partial_ring.commands[0]),
+                   first_header, __ATOMIC_RELEASE);
+  auto hidden_second = second_cmd;
+  hidden_second.kind = 0;
+  partial_ring.commands[1] = hidden_second;
+  partial_ring.head = 2;
+  partial_ring.tail = 0;
+  uint64_t ready_end = 0;
+  const auto first_ready = partial_ready_queue.poll_ready(&ready_end);
+  assert(first_ready.size() == 1);
+  assert(ready_end == 1);
+  const auto second_header = v2_transfer_cmd_header(second_cmd);
+  __atomic_store_n(reinterpret_cast<uint32_t*>(&partial_ring.commands[1]),
+                   second_header, __ATOMIC_RELEASE);
+  partial_ready_queue.ack_ready_until(ready_end);
+  assert(partial_ring.volatile_tail() == 1);
+  const auto second_ready = partial_ready_queue.poll_ready(&ready_end);
+  assert(second_ready.size() == 1);
+  assert(second_ready[0].kind == second_cmd.kind);
+  partial_ready_queue.ack_ready_until(ready_end);
+  assert(partial_ring.volatile_tail() == partial_ring.volatile_head());
+
   HostV2TransferD2HQueue<16> adapter_d2h_queue;
   adapter_d2h_queue.submit(dispatch_commands.commands);
   RecordingEfaPostSink adapter_d2h_sink;

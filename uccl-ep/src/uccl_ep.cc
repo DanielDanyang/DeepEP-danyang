@@ -347,22 +347,26 @@ class MappedD2HQueueHandle {
   }
 
   std::vector<v2::V2TransferCmd> poll_ready(
-      uint64_t* observed_head = nullptr) const {
+      uint64_t* observed_ready_end = nullptr) const {
     std::vector<v2::V2TransferCmd> out;
     const auto h = head();
     const auto t = tail();
-    if (observed_head != nullptr) {
-      *observed_head = h;
-    }
     out.reserve(static_cast<size_t>(h - t));
+    uint64_t ready_end = t;
     for (uint64_t idx = t; idx < h; ++idx) {
       const auto slot = static_cast<uint32_t>(idx) & (capacity_ - 1);
-      const auto kind = __atomic_load_n(&commands_host_[slot].kind,
-                                        __ATOMIC_ACQUIRE);
+      const auto header = __atomic_load_n(
+          reinterpret_cast<const uint32_t*>(&commands_host_[slot]),
+          __ATOMIC_ACQUIRE);
+      const auto kind = v2::v2_transfer_kind_from_header(header);
       if (kind == 0) {
         break;
       }
       out.push_back(commands_host_[slot]);
+      ready_end = idx + 1;
+    }
+    if (observed_ready_end != nullptr) {
+      *observed_ready_end = ready_end;
     }
     return out;
   }
@@ -370,8 +374,8 @@ class MappedD2HQueueHandle {
   std::vector<v2::EfaPostOp> drain_ready_to_efa_posts(bool coalesce,
                                                       bool ack_after_drain) {
     v2::RecordingEfaPostSink recorder;
-    uint64_t observed_head = 0;
-    const auto commands = poll_ready(&observed_head);
+    uint64_t observed_ready_end = 0;
+    const auto commands = poll_ready(&observed_ready_end);
     if (coalesce) {
       v2::CoalescingEfaPostSink sink(&recorder);
       v2::drain_v2_transfer_cmds_to_efa_posts(commands, sink);
@@ -380,29 +384,36 @@ class MappedD2HQueueHandle {
       v2::drain_v2_transfer_cmds_to_efa_posts(commands, recorder);
     }
     if (ack_after_drain) {
-      ack_ready_until(observed_head);
+      ack_ready_until(observed_ready_end);
     }
     return recorder.ops;
   }
 
-  void ack_ready_until(uint64_t observed_head) {
-    const auto h = observed_head;
+  void ack_ready_until(uint64_t observed_ready_end) {
+    const auto h = observed_ready_end;
     auto t = tail();
     while (t < h) {
       const auto slot = static_cast<uint32_t>(t) & (capacity_ - 1);
-      const auto kind = __atomic_load_n(&commands_host_[slot].kind,
-                                        __ATOMIC_ACQUIRE);
+      const auto header = __atomic_load_n(
+          reinterpret_cast<const uint32_t*>(&commands_host_[slot]),
+          __ATOMIC_ACQUIRE);
+      const auto kind = v2::v2_transfer_kind_from_header(header);
       if (kind == 0) {
         break;
       }
-      __atomic_store_n(&commands_host_[slot].kind, uint8_t{0},
+      __atomic_store_n(reinterpret_cast<uint32_t*>(&commands_host_[slot]),
+                       uint32_t{0},
                        __ATOMIC_RELEASE);
       ++t;
     }
     __atomic_store_n(tail_host_, t, __ATOMIC_RELEASE);
   }
 
-  void ack_ready() { ack_ready_until(head()); }
+  void ack_ready() {
+    uint64_t observed_ready_end = 0;
+    (void)poll_ready(&observed_ready_end);
+    ack_ready_until(observed_ready_end);
+  }
 
  private:
   uint32_t capacity_ = 0;
@@ -560,8 +571,8 @@ class V2EfaConnectionHandle {
                        bool ack_after_drain = true) {
     ensure_connected();
     const auto before = sink_->stats();
-    uint64_t observed_head = 0;
-    const auto commands = queue.poll_ready(&observed_head);
+    uint64_t observed_ready_end = 0;
+    const auto commands = queue.poll_ready(&observed_ready_end);
     if (coalesce) {
       v2::CoalescingEfaPostSink coalesced(sink_.get());
       v2::drain_v2_transfer_cmds_to_efa_posts(commands, coalesced);
@@ -570,7 +581,7 @@ class V2EfaConnectionHandle {
       v2::drain_v2_transfer_cmds_to_efa_posts(commands, *sink_);
     }
     if (ack_after_drain) {
-      queue.ack_ready_until(observed_head);
+      queue.ack_ready_until(observed_ready_end);
     }
     const auto after = sink_->stats();
     outstanding_signaled_posts_ +=

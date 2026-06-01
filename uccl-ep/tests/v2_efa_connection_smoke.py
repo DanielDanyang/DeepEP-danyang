@@ -43,12 +43,12 @@ def main():
     group = dist.group.WORLD
     buf = ElasticBuffer(
         group,
-        num_bytes=4096,
+        num_bytes=8192,
         num_max_tokens_per_rank=4,
         hidden=16,
         num_topk=1,
     )
-    info = buf.init_native_v2_efa_transport(num_bytes=4096, num_lanes=1)
+    info = buf.init_native_v2_efa_transport(num_bytes=8192, num_lanes=1)
     assert buf.has_native_v2_efa_transport()
     print(
         f"rank={rank} device={info['device_name']} qpns={list(info['qpns'])} "
