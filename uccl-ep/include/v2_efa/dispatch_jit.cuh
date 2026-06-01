@@ -166,6 +166,11 @@ __device__ __forceinline__ void enqueue_dispatch_d2h(
         queue, make_v2_dispatch_signal_cmd(
                    batch, static_cast<uint32_t>(batch_idx), layout));
   }
+  for (uint32_t target_rank = 0; target_rank < layout.num_ranks;
+       ++target_rank) {
+    enqueue_v2_transfer_d2h(
+        queue, make_v2_dispatch_done_cmd(target_rank, layout));
+  }
 }
 
 #endif
@@ -528,36 +533,61 @@ __global__ void v2_efa_dispatch_signal_offsets_kernel(
     const uint8_t* window, int32_t* batch_counts, int32_t* batch_offsets,
     int32_t* recv_counts_per_rank, int32_t* total_recv_tokens,
     int num_sources, int max_batches, DispatchTransferLayout layout) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
+  if (blockIdx.x != 0) {
     return;
   }
   (void)kInstance;
 
-  int running = 0;
-  for (int source = 0; source < num_sources; ++source) {
-    int source_total = 0;
-    const uint64_t source_signal_base =
+  const int tid = static_cast<int>(threadIdx.x);
+  const int stride = static_cast<int>(blockDim.x);
+
+  for (int source = tid; source < num_sources; source += stride) {
+    const uint64_t done_offset =
         layout.remote_signal_base +
-        static_cast<uint64_t>(source) * layout.source_signal_stride;
-    for (int batch = 0; batch < max_batches; ++batch) {
-      const uint64_t signal_offset =
-          source_signal_base + static_cast<uint64_t>(batch) * layout.signal_stride;
-      const auto* count_ptr =
-          reinterpret_cast<const uint32_t*>(window + signal_offset);
-      const int count = static_cast<int>(*count_ptr);
-      const int idx = source * max_batches + batch;
-      batch_counts[idx] = count;
-      if (count > 0) {
-        batch_offsets[idx] = running;
-        running += count;
-        source_total += count;
-      } else {
-        batch_offsets[idx] = -1;
-      }
+        static_cast<uint64_t>(source) * layout.source_signal_stride +
+        static_cast<uint64_t>(max_batches) * layout.signal_stride;
+    const auto* done_ptr =
+        reinterpret_cast<const volatile uint32_t*>(window + done_offset);
+    while (*done_ptr == 0u) {
+#if defined(__CUDA_ARCH__)
+      __nanosleep(64);
+#endif
     }
-    recv_counts_per_rank[source] = source_total;
   }
-  total_recv_tokens[0] = running;
+  __syncthreads();
+
+  for (int linear = tid; linear < num_sources * max_batches;
+       linear += stride) {
+    const int batch = linear % max_batches;
+    const int source = linear / max_batches;
+    const uint64_t signal_offset =
+        layout.remote_signal_base +
+        static_cast<uint64_t>(source) * layout.source_signal_stride +
+        static_cast<uint64_t>(batch) * layout.signal_stride;
+    const auto* count_ptr =
+        reinterpret_cast<const volatile uint32_t*>(window + signal_offset);
+    batch_counts[linear] = static_cast<int>(*count_ptr);
+    batch_offsets[linear] = -1;
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    int running = 0;
+    for (int source = 0; source < num_sources; ++source) {
+      int source_total = 0;
+      for (int batch = 0; batch < max_batches; ++batch) {
+        const int idx = source * max_batches + batch;
+        const int count = batch_counts[idx];
+        if (count > 0) {
+          batch_offsets[idx] = running;
+          running += count;
+          source_total += count;
+        }
+      }
+      recv_counts_per_rank[source] = source_total;
+    }
+    total_recv_tokens[0] = running;
+  }
 }
 
 template <int kNumTopk, int kHiddenBytes>
@@ -623,6 +653,11 @@ __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
         queue, make_v2_dispatch_signal_cmd(
                    batch, static_cast<uint32_t>(batch_idx), layout));
   }
+  for (uint32_t target_rank = 0; target_rank < layout.num_ranks;
+       ++target_rank) {
+    enqueue_v2_transfer_cmd(queue,
+                            make_v2_dispatch_done_cmd(target_rank, layout));
+  }
 }
 
 template <int kInstance>
@@ -652,6 +687,11 @@ __global__ void v2_efa_dispatch_enqueue_d2h_kernel(
     enqueue_v2_transfer_d2h(
         queue, make_v2_dispatch_signal_cmd(
                    batch, static_cast<uint32_t>(batch_idx), layout));
+  }
+  for (uint32_t target_rank = 0; target_rank < layout.num_ranks;
+       ++target_rank) {
+    enqueue_v2_transfer_d2h(
+        queue, make_v2_dispatch_done_cmd(target_rank, layout));
   }
 }
 

@@ -77,8 +77,10 @@ struct DispatchTransferLayout {
   uint32_t record_topk_weight_offset = 0;
   uint32_t record_topk_weight_bytes = 0;
   uint32_t num_scaleup_ranks = 0;
+  uint32_t num_ranks = 0;
   uint32_t source_rank = 0;
   uint32_t efa_lane = 0;
+  uint32_t max_batches = 0;
   int32_t skip_scaleout_rank = -1;
 };
 
@@ -299,6 +301,24 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_signal_cmd(
       /*local_offset=*/0,
       source_signal_base +
           static_cast<uint64_t>(batch_idx) * layout.signal_stride);
+}
+
+V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_done_cmd(
+    uint32_t target_rank, const DispatchTransferLayout& layout) {
+  const uint64_t source_signal_base =
+      layout.remote_signal_base +
+      static_cast<uint64_t>(layout.source_rank) * layout.source_signal_stride;
+  return make_v2_transfer_cmd(
+      V2TransferCmdKind::kDispatchSignal,
+      target_rank,
+      layout.efa_lane,
+      /*descriptor_index=*/0,
+      layout.max_batches,
+      sizeof(uint32_t),
+      /*signal_value=*/1,
+      /*local_offset=*/0,
+      source_signal_base +
+          static_cast<uint64_t>(layout.max_batches) * layout.signal_stride);
 }
 
 V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_combine_payload_cmd(

@@ -2321,3 +2321,39 @@ README 风格 EP8x2 性能：
     `v2_efa_dispatch_only_bench.py --tokens 8192 ... --master_port=29680`
     相关进程；
   - 不再进行服务器构建、测试、benchmark 或 profiling，等待服务器空闲后再继续。
+
+## 2026-06-01 dispatch 去 post barrier 的本地实现
+
+- 根据 review 先做了本地代码修改，尚未服务器验证（服务器上已有其他用户任务）：
+  1. 移除 dispatch transport 里的 post-RDMA `dist.barrier()`：
+     - 原来 sender completion 后再用 CPU/Gloo barrier 作为 receiver-ready 代理；
+     - 现在 `post_barrier_ms` 计为 `0.0`，receiver readiness 改由 GPU signal
+       wait 负责。
+  2. 新增 per-source dispatch done signal：
+     - 每个 source rank 在 enqueue 完本轮所有 non-empty batch payload/count 后，
+       对所有 target rank 写一个 done word；
+     - done word 位于该 source signal row 的最后一个 slot；
+     - signal row 从 `max_batches * 4` 扩为 `(max_batches + 1) * 4` 后再对齐。
+  3. 修改 `v2_efa_dispatch_signal_offsets_kernel`：
+     - 不再直接读 signal table 后依赖 CPU barrier；
+     - 先用 GPU threads spin-wait 每个 source 的 done word；
+     - 再由 256 threads 并行读取 `(source, batch)` count table；
+     - 当前 prefix offset 仍由 thread0 串行生成，后续再做真正并行 scan。
+  4. `_wait_native_v2_efa_completions()` 去掉 `time.sleep(0.0005)`：
+     - CQ polling 改成 tight spin，避免每轮至少睡 0.5ms。
+- 关键设计原因：
+  - 不能让 receiver 对所有 batch count 做非零 wait，因为空 batch 合法且永远为 0；
+  - 所以引入 done signal，表示“该 source 本轮所有 count/payload command 已经
+    enqueue 并在 sender 侧完成等待后可被 receiver 观察”；
+  - 这保留了 V2 semantic batch 的稀疏 count 表，同时去掉每 iteration 的 post CPU
+    barrier。
+- 本地检查：
+  - `python3 -m py_compile` 通过；
+  - `git diff --check -- uccl-ep` 通过。
+- 待服务器空闲后必须验证：
+  - `make -j8 && make install`；
+  - EP2 correctness；
+  - EP16 remote-pair correctness；
+  - EP16 small bench timing，重点看 `post_barrier_ms` 是否为 0、
+    `completion_wait_ms` 是否下降、`signal_offsets_ms` 是否没有因 spin wait 异常增大；
+  - 再跑 README-size dispatch-only bench。

@@ -709,7 +709,10 @@ class ElasticBuffer:
         remote_payload_bytes = int(self.num_ranks) * source_rank_stride
         remote_payload_base = src_bytes
         remote_signal_base = _align(remote_payload_base + remote_payload_bytes, 64)
-        source_signal_stride = _align(int(max_batches) * 4, 64)
+        # The last slot is a per-source "done" marker. Receivers spin on it on
+        # GPU before reading the batch count table, replacing the old post-RDMA
+        # CPU barrier.
+        source_signal_stride = _align((int(max_batches) + 1) * 4, 64)
         total_bytes = _align(remote_signal_base + int(self.num_ranks) * source_signal_stride, 64)
         self._require_v2_efa_window(total_bytes)
         return {
@@ -730,6 +733,7 @@ class ElasticBuffer:
             "record_topk_weight_bytes": int(record_topk_weight_bytes),
             "descriptor_batched": True,
             "max_batches": int(max_batches),
+            "done_signal_index": int(max_batches),
             "src_payload_bytes": src_bytes,
             "remote_payload_bytes": remote_payload_bytes,
             "total_window_bytes": total_bytes,
@@ -1757,7 +1761,7 @@ class ElasticBuffer:
         batches = torch.empty((max_batches * int(sizes["dispatch_batch"]),),
                               dtype=torch.uint8, device=topk_idx.device)
         counters = torch.zeros((3,), dtype=torch.int32, device=topk_idx.device)
-        descriptor_queue_capacity = max_segments + max_batches + 1
+        descriptor_queue_capacity = max_segments + max_batches + int(self.num_ranks) + 1
         queue_capacity = _next_power_of_two(descriptor_queue_capacity)
         queue = self.allocate_d2h_queue(queue_capacity)
         if self._v2_efa_connection is not None:
@@ -1836,9 +1840,7 @@ class ElasticBuffer:
             wait_begin = time.perf_counter()
             self._wait_native_v2_efa_completions(dispatch_drain_stats)
             timings["completion_wait_ms"] = (time.perf_counter() - wait_begin) * 1000.0
-            barrier_begin = time.perf_counter()
-            dist.barrier(group=self.group)
-            timings["post_barrier_ms"] = (time.perf_counter() - barrier_begin) * 1000.0
+            timings["post_barrier_ms"] = 0.0
         timings["transport_total_ms"] = (time.perf_counter() - transport_begin) * 1000.0
         return V2TransportHandle(
             dispatch_segments=segments,
@@ -1870,7 +1872,6 @@ class ElasticBuffer:
             seen += int(self._v2_efa_connection.poll_completions(max(1, expected - seen)))
             if seen >= expected:
                 return
-            time.sleep(0.0005)
         raise TimeoutError(f"timed out waiting for {expected} V2 EFA completions, saw {seen}")
 
     def _native_dispatch_batch_counts_from_window(
