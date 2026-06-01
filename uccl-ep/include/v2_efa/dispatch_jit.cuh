@@ -326,7 +326,7 @@ __global__ void v2_efa_dispatch_forward_metadata_kernel(
       metadata[2 + kNumTopk + topk_slot] =
           do_expand ? src_metadata[2 + topk_slot] : token_row;
     }
-    linked[scaleup_rank] = token_row;
+    linked[scaleup_rank] = flat_row;
   }
 }
 

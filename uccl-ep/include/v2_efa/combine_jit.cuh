@@ -214,13 +214,14 @@ __global__ void v2_efa_combine_forward_metadata_enqueue_d2h_kernel(
   }
 
   for (int row = 0; row < num_forward_rows; ++row) {
-    const auto metadata = token_metadata_at_forward + row * kMetadataDims;
     const auto linked = channel_linked_list + row * kNumScaleupRanks;
     for (int lane = 0; lane < kNumScaleupRanks; ++lane) {
-      const int linked_token_row = linked[lane];
-      if (linked_token_row < 0) {
+      const int linked_metadata_row = linked[lane];
+      if (linked_metadata_row < 0 || linked_metadata_row >= num_forward_rows) {
         continue;
       }
+      const auto metadata =
+          token_metadata_at_forward + linked_metadata_row * kMetadataDims;
       const int src_global = metadata[0];
       if (src_global < 0) {
         continue;

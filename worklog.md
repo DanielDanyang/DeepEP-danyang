@@ -97,6 +97,34 @@
   - combine segment 的 `expert_id` 仍是 placeholder；
   - reduced-combine 多 contributor reduce 仍没有真正落到 native V2 receiver epilogue。
 
+## 2026-06-01 linked-list 值改为 metadata row id
+
+- 目标：
+  - 上一版 combine enqueue 已检查 `channel_linked_list`，但 metadata 仍按当前 row 读取；
+  - 本轮让 linked-list 的值真正决定读取哪一行 forward metadata，更接近官方 V2
+    `channel_linked_list` 驱动 combine replay 的语义。
+- 代码改动：
+  - `v2_efa_dispatch_forward_metadata_kernel` 现在把
+    `channel_linked_list[row, scaleup_rank]` 写成 `flat_row`，也就是当前
+    `token_metadata_at_forward` 的 metadata row id；
+  - `v2_efa_combine_forward_metadata_enqueue_d2h_kernel` 不再用 outer loop 的 row 直接读
+    metadata，而是读取 `linked_metadata_row = channel_linked_list[row, lane]`，再用该值索引
+    `token_metadata_at_forward`；
+  - 对 linked-list 越界或 `-1` sentinel 做跳过处理。
+- 验证：
+  - 本地 py_compile/source hygiene/C++ dispatch plan/diff check 通过；
+  - 远端 GPU 空闲检查通过；
+  - `p5en_0` / `p5en_1` 均 `make -j8 install` 通过；
+  - EP1x2 `uccl-ep/tests/v2_efa_connection_smoke.py` 通过；
+  - rank0/rank1 dispatch 和 combine stats 均保持
+    `drained_commands=2`、`posted_writes=1`、`posted_signals=1`、
+    `posted_bytes=20`、`head=2`、`tail=2`。
+- 仍未完成：
+  - linked-list 仍是 transitional round-robin metadata kernel 生成，不是官方
+    `hybrid_dispatch.cuh` receiver forwarding path 原生生成；
+  - 但 combine command 生成已经从“flatten metadata scan”推进到“linked-list indexed
+    metadata replay”。
+
 ## 2026-05-28 native V2 方向纠偏
 
 - 确认当前 `uccl-ep` 仍然是 V1/UCCL EP normal path 的派生实现，而不是 DeepEP V2
