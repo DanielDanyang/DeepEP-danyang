@@ -345,10 +345,11 @@ void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
 
 void launch_v2_efa_combine_forward_metadata_enqueue_d2h_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t forward_metadata_ptr,
-    std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
-    std::uintptr_t counters_ptr, int num_forward_rows, int scaleout_rank,
-    int num_max_tokens_per_rank, int payload_bytes, int max_segments,
-    int max_batches, std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+    std::uintptr_t channel_linked_list_ptr, std::uintptr_t segments_ptr,
+    std::uintptr_t batches_ptr, std::uintptr_t counters_ptr,
+    int num_forward_rows, int scaleout_rank, int num_max_tokens_per_rank,
+    int payload_bytes, int max_segments, int max_batches,
+    std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
     std::uintptr_t tail_ptr, int queue_capacity, CombineTransferLayout layout,
     std::uintptr_t cuda_stream_ptr) {
   if (num_forward_rows < 0 || num_max_tokens_per_rank <= 0 ||
@@ -367,6 +368,8 @@ void launch_v2_efa_combine_forward_metadata_enqueue_d2h_plan(
   check_jit_launch_result(deep_ep::jit::launch_kernel(
       runtime->kernel, config,
       checked_ptr<const int32_t>(forward_metadata_ptr, "forward_metadata"),
+      checked_ptr<const int32_t>(channel_linked_list_ptr,
+                                 "channel_linked_list"),
       checked_ptr<CombineSegmentDescriptor>(segments_ptr, "segments"),
       checked_ptr<CombineExpertBatch>(batches_ptr, "batches"),
       checked_ptr<uint32_t>(counters_ptr, "counters"), num_forward_rows,
@@ -560,7 +563,8 @@ void V2EfaRuntime::launch_combine_descriptor_enqueue_d2h(
 }
 
 void V2EfaRuntime::launch_combine_forward_metadata_enqueue_d2h(
-    std::uintptr_t forward_metadata_ptr, std::uintptr_t segments_ptr,
+    std::uintptr_t forward_metadata_ptr,
+    std::uintptr_t channel_linked_list_ptr, std::uintptr_t segments_ptr,
     std::uintptr_t batches_ptr, std::uintptr_t counters_ptr,
     int num_forward_rows, int num_max_tokens_per_rank, int num_channels,
     int payload_bytes, bool use_expanded_layout,
@@ -575,9 +579,9 @@ void V2EfaRuntime::launch_combine_forward_metadata_enqueue_d2h(
       use_expanded_layout, allow_multiple_reduction, smem_bytes,
       uccl_include_path);
   launch_v2_efa_combine_forward_metadata_enqueue_d2h_plan(
-      plan, forward_metadata_ptr, segments_ptr, batches_ptr, counters_ptr,
-      num_forward_rows, cfg.scaleout_rank, num_max_tokens_per_rank,
-      payload_bytes,
+      plan, forward_metadata_ptr, channel_linked_list_ptr, segments_ptr,
+      batches_ptr, counters_ptr, num_forward_rows, cfg.scaleout_rank,
+      num_max_tokens_per_rank, payload_bytes,
       static_cast<int>(max_dispatch_segments(num_max_tokens_per_rank,
                                              cfg.num_topk)),
       static_cast<int>(max_dispatch_segments(num_max_tokens_per_rank,

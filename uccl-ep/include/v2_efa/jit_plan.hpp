@@ -516,7 +516,7 @@ build_v2_efa_combine_forward_metadata_enqueue_d2h_jit_plan(
   }
 
   V2EfaJitLaunchPlan plan;
-  plan.name = "v2_efa_combine_forward_metadata_enqueue_d2h";
+  plan.name = "v2_efa_combine_forward_metadata_linked_enqueue_d2h";
   plan.grid_dim_x = 1;
   plan.grid_dim_y = 1;
   plan.num_threads = 32;
@@ -529,6 +529,7 @@ build_v2_efa_combine_forward_metadata_enqueue_d2h_jit_plan(
   source << "#include <deep_ep/impls/"
          << (config.num_scaleout_ranks == 1 ? "combine" : "hybrid_combine")
          << ".cuh>\n"
+         << "// UCCL V2 EFA combine forward metadata ABI: linked-list input v1\n"
          << "#include "
          << quote_include(config.uccl_include_path, "v2_efa/combine_jit.cuh")
          << "\n\n"

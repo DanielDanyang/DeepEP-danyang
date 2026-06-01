@@ -57,6 +57,46 @@
   - 下一步应 fork/inline 真实 `hybrid_dispatch.cuh` scaleout receiver path，使 payload
     和 metadata 在同一个 V2 receiver epilogue 中落到 expanded layout。
 
+## 2026-06-01 combine command 生成改为消费 channel linked-list
+
+- 目标：
+  - 让 native V2 combine enqueue 不再只 flatten 扫
+    `token_metadata_at_forward`；
+  - command 顺序至少跟随 V2 handle 中的 `channel_linked_list` / lane schedule。
+- 代码改动：
+  - `v2_efa_combine_forward_metadata_enqueue_d2h_kernel` 新增
+    `channel_linked_list` 输入；
+  - kernel 现在按 `row -> lane -> topk_slot` 遍历：
+    - 先从 `channel_linked_list[row, lane]` 判断该 lane 是否有 token；
+    - 再检查 `token_metadata_at_forward[row, 2 + topk_slot] == lane`；
+    - 用 `token_metadata_at_forward[row, 2 + topk + topk_slot]` 作为 V2 source slot；
+    - 最后生成 `CombineSegmentDescriptor` 和 16B `V2TransferCmd`；
+  - Python `launch_combine_forward_metadata_enqueue_d2h_queue` 现在必须传入
+    `channel_linked_list`；
+  - `_launch_native_combine_transport` 直接消费 handle 中的
+    `token_metadata_at_forward` + `channel_linked_list`；
+  - 删除未使用的 Python `_build_combine_descriptors_from_forward_metadata`，避免继续保留
+    CPU/Python descriptor fallback。
+- JIT cache 修复：
+  - 第一次远端 smoke 失败，表现为 combine `drained_commands=0`；
+  - 原因是 `combine_jit.cuh` 的 kernel 参数签名变了，但 JIT plan 名称/source identity
+    没变，可能复用了旧 cubin；
+  - 已将 plan name 改为
+    `v2_efa_combine_forward_metadata_linked_enqueue_d2h`，并在 source 中加入 ABI 注释，
+    强制 JIT 重新编译新签名。
+- 验证：
+  - 本地 py_compile/source hygiene/C++ dispatch plan/diff check 通过；
+  - 远端 GPU 空闲检查通过；
+  - `p5en_0` / `p5en_1` 均 `make -j8 install` 通过；
+  - EP1x2 `uccl-ep/tests/v2_efa_connection_smoke.py` 重新通过；
+  - rank0/rank1 combine stats 恢复为 `drained_commands=2`、`posted_writes=1`、
+    `posted_signals=1`、`posted_bytes=20`、`head=2`、`tail=2`。
+- 仍未完成：
+  - linked-list 本身仍由 transitional dispatch forward metadata kernel 生成，不是官方
+    `hybrid_dispatch.cuh` tail/linked-list 协议；
+  - combine segment 的 `expert_id` 仍是 placeholder；
+  - reduced-combine 多 contributor reduce 仍没有真正落到 native V2 receiver epilogue。
+
 ## 2026-05-28 native V2 方向纠偏
 
 - 确认当前 `uccl-ep` 仍然是 V1/UCCL EP normal path 的派生实现，而不是 DeepEP V2

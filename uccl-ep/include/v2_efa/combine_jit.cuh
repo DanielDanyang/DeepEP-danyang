@@ -188,6 +188,7 @@ template <int kNumScaleoutRanks, int kNumScaleupRanks, int kNumExperts,
           int kNumTopk, int kHidden>
 __global__ void v2_efa_combine_forward_metadata_enqueue_d2h_kernel(
     const int32_t* token_metadata_at_forward,
+    const int32_t* channel_linked_list,
     CombineSegmentDescriptor* segments, CombineExpertBatch* batches,
     uint32_t* counters, int num_forward_rows, int scaleout_rank,
     int num_max_tokens_per_rank, int payload_bytes, int max_segments,
@@ -195,8 +196,8 @@ __global__ void v2_efa_combine_forward_metadata_enqueue_d2h_kernel(
     CombineTransferLayout layout) {
   // Transitional native V2 combine path: parse the V2-like multi-channel
   // forward metadata carried in the handle and generate V2TransferCmd directly
-  // on device. The final version should also walk channel_linked_list to match
-  // the official V2 scheduling order.
+  // on device. It walks channel_linked_list so the command order follows the
+  // V2 handle's channel/lane schedule instead of a host-side flattened scan.
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
@@ -214,65 +215,75 @@ __global__ void v2_efa_combine_forward_metadata_enqueue_d2h_kernel(
 
   for (int row = 0; row < num_forward_rows; ++row) {
     const auto metadata = token_metadata_at_forward + row * kMetadataDims;
-    const int src_global = metadata[0];
-    if (src_global < 0) {
-      continue;
-    }
-    const int dst_original_rank = src_global / num_max_tokens_per_rank;
-    const int dst_scaleout_rank = dst_original_rank / kNumScaleupRanks;
-    const int dst_scaleup_lane = dst_original_rank % kNumScaleupRanks;
-    if (dst_scaleout_rank == scaleout_rank) {
-      continue;
-    }
-
-    const int first_segment = num_segments;
-    if (num_batches >= max_batches) {
-      counters[kDescriptorCounterSegments] = num_segments;
-      counters[kDescriptorCounterBatches] = num_batches;
-      counters[kDescriptorCounterOverflow] = 1;
-      return;
-    }
-    auto& batch = batches[num_batches];
-    batch.dst_original_rank = dst_original_rank;
-    batch.dst_scaleout_rank = dst_scaleout_rank;
-    batch.dst_scaleup_lane = dst_scaleup_lane;
-    batch.src_scaleout_rank = scaleout_rank;
-    batch.expert_id = 0;
-    batch.first_segment = first_segment;
-    batch.num_segments = 0;
-    batch.total_tokens = 0;
-    batch.reserved = 0;
-
-    for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
-      const int source_slot = metadata[2 + kNumTopk + topk_slot];
-      if (source_slot < 0) {
+    const auto linked = channel_linked_list + row * kNumScaleupRanks;
+    for (int lane = 0; lane < kNumScaleupRanks; ++lane) {
+      const int linked_token_row = linked[lane];
+      if (linked_token_row < 0) {
         continue;
       }
-      if (num_segments >= max_segments) {
+      const int src_global = metadata[0];
+      if (src_global < 0) {
+        continue;
+      }
+      const int dst_original_rank = src_global / num_max_tokens_per_rank;
+      const int dst_scaleout_rank = dst_original_rank / kNumScaleupRanks;
+      const int dst_scaleup_lane = dst_original_rank % kNumScaleupRanks;
+      if (dst_scaleout_rank == scaleout_rank) {
+        continue;
+      }
+
+      const int first_segment = num_segments;
+      if (num_batches >= max_batches) {
         counters[kDescriptorCounterSegments] = num_segments;
         counters[kDescriptorCounterBatches] = num_batches;
         counters[kDescriptorCounterOverflow] = 1;
         return;
       }
-      auto& segment = segments[num_segments++];
-      segment.dst_original_rank = dst_original_rank;
-      segment.dst_scaleout_rank = dst_scaleout_rank;
-      segment.dst_scaleup_lane = dst_scaleup_lane;
-      segment.src_scaleout_rank = scaleout_rank;
-      segment.expert_id = 0;
-      segment.count = 1;
-      segment.expanded_slot_begin = source_slot;
-      segment.expanded_slot_index_offset = -1;
-      segment.topk_slot = topk_slot;
-      segment.reduced_token_slot = src_global % num_max_tokens_per_rank;
-      segment.payload_bytes = payload_bytes;
-      segment.flags = static_cast<uint32_t>(DescriptorFlags::kReduce);
-      batch.num_segments += 1;
-      batch.total_tokens += 1;
-    }
+      auto& batch = batches[num_batches];
+      batch.dst_original_rank = dst_original_rank;
+      batch.dst_scaleout_rank = dst_scaleout_rank;
+      batch.dst_scaleup_lane = dst_scaleup_lane;
+      batch.src_scaleout_rank = scaleout_rank;
+      batch.expert_id = 0;
+      batch.first_segment = first_segment;
+      batch.num_segments = 0;
+      batch.total_tokens = 0;
+      batch.reserved = 0;
 
-    if (batch.num_segments > 0) {
-      num_batches += 1;
+      for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
+        if (metadata[2 + topk_slot] != lane) {
+          continue;
+        }
+        const int source_slot = metadata[2 + kNumTopk + topk_slot];
+        if (source_slot < 0) {
+          continue;
+        }
+        if (num_segments >= max_segments) {
+          counters[kDescriptorCounterSegments] = num_segments;
+          counters[kDescriptorCounterBatches] = num_batches;
+          counters[kDescriptorCounterOverflow] = 1;
+          return;
+        }
+        auto& segment = segments[num_segments++];
+        segment.dst_original_rank = dst_original_rank;
+        segment.dst_scaleout_rank = dst_scaleout_rank;
+        segment.dst_scaleup_lane = dst_scaleup_lane;
+        segment.src_scaleout_rank = scaleout_rank;
+        segment.expert_id = 0;
+        segment.count = 1;
+        segment.expanded_slot_begin = source_slot;
+        segment.expanded_slot_index_offset = -1;
+        segment.topk_slot = topk_slot;
+        segment.reduced_token_slot = src_global % num_max_tokens_per_rank;
+        segment.payload_bytes = payload_bytes;
+        segment.flags = static_cast<uint32_t>(DescriptorFlags::kReduce);
+        batch.num_segments += 1;
+        batch.total_tokens += 1;
+      }
+
+      if (batch.num_segments > 0) {
+        num_batches += 1;
+      }
     }
   }
 

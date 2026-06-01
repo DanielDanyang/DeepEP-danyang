@@ -1688,6 +1688,7 @@ NB_MODULE(ep, m) {
       .def("launch_combine_forward_metadata_enqueue_d2h",
            [](const v2::V2EfaRuntime& self,
               std::uintptr_t forward_metadata_ptr,
+              std::uintptr_t channel_linked_list_ptr,
               std::uintptr_t segments_ptr, std::uintptr_t batches_ptr,
               std::uintptr_t counters_ptr, int num_forward_rows,
               int num_max_tokens_per_rank, int num_channels, int payload_bytes,
@@ -1712,13 +1713,15 @@ NB_MODULE(ep, m) {
              layout.batch_payload_stride = batch_payload_stride;
              layout.signal_stride = signal_stride;
              self.launch_combine_forward_metadata_enqueue_d2h(
-                 forward_metadata_ptr, segments_ptr, batches_ptr, counters_ptr,
-                 num_forward_rows, num_max_tokens_per_rank, num_channels,
-                 payload_bytes, use_expanded_layout, allow_multiple_reduction,
-                 smem_bytes, commands_ptr, head_ptr, tail_ptr, queue_capacity,
-                 layout, uccl_include_path, cuda_stream_ptr);
+                 forward_metadata_ptr, channel_linked_list_ptr, segments_ptr,
+                 batches_ptr, counters_ptr, num_forward_rows,
+                 num_max_tokens_per_rank, num_channels, payload_bytes,
+                 use_expanded_layout, allow_multiple_reduction, smem_bytes,
+                 commands_ptr, head_ptr, tail_ptr, queue_capacity, layout,
+                 uccl_include_path, cuda_stream_ptr);
            },
            nb::arg("forward_metadata_ptr"),
+           nb::arg("channel_linked_list_ptr"),
            nb::arg("segments_ptr"),
            nb::arg("batches_ptr"),
            nb::arg("counters_ptr"),

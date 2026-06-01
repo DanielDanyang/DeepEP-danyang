@@ -1214,6 +1214,7 @@ class ElasticBuffer:
     def launch_combine_forward_metadata_enqueue_d2h_queue(
         self,
         forward_metadata: torch.Tensor,
+        channel_linked_list: torch.Tensor,
         segments: torch.Tensor,
         batches: torch.Tensor,
         counters: torch.Tensor,
@@ -1230,11 +1231,14 @@ class ElasticBuffer:
         stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         _require_cuda_contiguous(forward_metadata, "forward_metadata")
+        _require_cuda_contiguous(channel_linked_list, "channel_linked_list")
         _require_cuda_contiguous(segments, "segments")
         _require_cuda_contiguous(batches, "batches")
         _require_cuda_contiguous(counters, "counters")
         if forward_metadata.dtype != torch.int32:
             raise TypeError("forward_metadata must be torch.int32")
+        if channel_linked_list.dtype != torch.int32:
+            raise TypeError("channel_linked_list must be torch.int32")
         rows = int(forward_metadata.shape[0] if num_forward_rows is None else num_forward_rows)
         max_tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
         if payload_bytes == 0:
@@ -1243,6 +1247,7 @@ class ElasticBuffer:
             uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
         self.runtime.launch_combine_forward_metadata_enqueue_d2h(
             int(forward_metadata.data_ptr()),
+            int(channel_linked_list.data_ptr()),
             int(segments.data_ptr()),
             int(batches.data_ptr()),
             int(counters.data_ptr()),
@@ -1612,8 +1617,9 @@ class ElasticBuffer:
             return
         sizes = ep.v2_descriptor_sizes()
         forward_metadata = handle.token_metadata_at_forward
+        channel_linked_list = handle.channel_linked_list
         if forward_metadata is None:
-            forward_metadata = self._build_forward_metadata_tensors(
+            forward_metadata, channel_linked_list = self._build_forward_metadata_tensors(
                 torch.full(
                     (handle.recv_src_metadata.shape[0], handle.topk_idx.shape[1]),
                     -1,
@@ -1624,7 +1630,9 @@ class ElasticBuffer:
                 handle.do_expand,
                 handle.num_experts,
                 handle.num_max_tokens_per_rank,
-            )[0]
+            )
+        if channel_linked_list is None:
+            raise RuntimeError("dispatch handle is missing V2 channel_linked_list")
         num_forward_rows = int(forward_metadata.numel() // forward_metadata.shape[-1])
         max_segments = max(1, int(num_forward_rows * handle.topk_idx.shape[1]))
         max_batches = max(1, max_segments)
@@ -1644,6 +1652,7 @@ class ElasticBuffer:
         self._stage_tensor_bytes_to_v2_window(x, int(layout["local_payload_base"]))
         self.launch_combine_forward_metadata_enqueue_d2h_queue(
             forward_metadata=forward_metadata,
+            channel_linked_list=channel_linked_list.reshape(-1, channel_linked_list.shape[-1]),
             segments=segments,
             batches=batches,
             counters=counters,
@@ -1666,96 +1675,6 @@ class ElasticBuffer:
         transport.num_combine_segments = num_segments
         transport.num_combine_batches = num_batches
         transport.combine_drain_stats = combine_drain_stats
-
-    def _build_combine_descriptors_from_forward_metadata(
-        self,
-        x: torch.Tensor,
-        handle: EPHandle,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        payload_bytes = int(x.shape[1] * x.element_size())
-        segment_words = 12
-        batch_words = 10
-        segments = []
-        batches = []
-        batch_for_dst = {}
-
-        def add_segment(dst_rank: int, src_scaleout_rank: int, source_slot: int,
-                        topk_slot: int, reduced_token_slot: int) -> None:
-            dst_scaleout_rank = int(dst_rank) // self.num_scaleup_ranks
-            dst_scaleup_lane = int(dst_rank) % self.num_scaleup_ranks
-            key = (int(dst_rank), dst_scaleout_rank, dst_scaleup_lane)
-            if key not in batch_for_dst:
-                batch_for_dst[key] = len(batches)
-                batches.append([
-                    int(dst_rank), dst_scaleout_rank, dst_scaleup_lane,
-                    self.scaleout_rank_idx, 0, len(segments), 0, 0, 0, 0,
-                ])
-            batch_idx = batch_for_dst[key]
-            batches[batch_idx][6] += 1
-            batches[batch_idx][7] += 1
-            segments.append([
-                int(dst_rank), dst_scaleout_rank, dst_scaleup_lane,
-                int(src_scaleout_rank), 0, 1, int(source_slot), -1,
-                int(topk_slot), int(reduced_token_slot), payload_bytes,
-                1 << 3,
-            ])
-
-        forward_metadata = handle.token_metadata_at_forward
-        if forward_metadata is None:
-            forward_metadata = self._build_forward_metadata_tensors(
-                torch.full(
-                    (handle.recv_src_metadata.shape[0], handle.topk_idx.shape[1]),
-                    -1,
-                    dtype=handle.topk_idx.dtype,
-                    device=handle.topk_idx.device,
-                ),
-                handle.recv_src_metadata,
-                handle.do_expand,
-                handle.num_experts,
-                handle.num_max_tokens_per_rank,
-            )[0]
-        forward_rows = forward_metadata.reshape(-1, forward_metadata.shape[-1])
-        for row in range(int(forward_rows.shape[0])):
-            token_global = int(forward_rows[row, 0].item())
-            if token_global < 0:
-                continue
-            dst_rank = token_global // int(handle.num_max_tokens_per_rank)
-            src_scaleout_rank = dst_rank // self.num_scaleup_ranks
-            if src_scaleout_rank == self.scaleout_rank_idx:
-                continue
-            reduced_token_slot = token_global % int(handle.num_max_tokens_per_rank)
-            if handle.do_expand:
-                for topk_slot in range(int(handle.topk_idx.shape[1])):
-                    source_slot = int(forward_rows[row, 2 + handle.topk_idx.shape[1] + topk_slot].item())
-                    if source_slot >= 0:
-                        add_segment(dst_rank, src_scaleout_rank, source_slot,
-                                    topk_slot, reduced_token_slot)
-            else:
-                add_segment(dst_rank, src_scaleout_rank, row, 0, reduced_token_slot)
-
-        if not segments:
-            segments = [[0] * segment_words]
-        if not batches:
-            batches = [[0] * batch_words]
-
-        segments_tensor = torch.tensor(
-            [word for segment in segments for word in segment],
-            dtype=torch.int32,
-            device=x.device,
-        ).view(torch.uint8)
-        batches_tensor = torch.tensor(
-            [word for batch in batches for word in batch],
-            dtype=torch.int32,
-            device=x.device,
-        ).view(torch.uint8)
-        counters = torch.tensor(
-            [0 if segments == [[0] * segment_words] else len(segments),
-             0 if batches == [[0] * batch_words] else len(batches),
-             0],
-            dtype=torch.int32,
-            device=x.device,
-        )
-        return segments_tensor, batches_tensor, counters
 
     def _build_forward_metadata_tensors(
         self,
