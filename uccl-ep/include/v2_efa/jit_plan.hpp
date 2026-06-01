@@ -131,7 +131,7 @@ inline V2EfaJitLaunchPlan build_v2_efa_dispatch_descriptor_enqueue_d2h_jit_plan(
   plan.name = "v2_efa_dispatch_descriptor_enqueue_d2h";
   plan.grid_dim_x = 1;
   plan.grid_dim_y = 1;
-  plan.num_threads = 32;
+  plan.num_threads = 256;
   plan.smem_bytes = 0;
   plan.cluster_dim = 1;
   plan.cooperative = false;

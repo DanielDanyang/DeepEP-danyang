@@ -41,23 +41,35 @@ __device__ __forceinline__ DispatchDescriptorBuildResult build_dispatch_descript
   constexpr int kExpertsPerRank = kNumExperts / kWorldSize;
 
   const auto flags = make_dispatch_flags(scale_bytes, has_topk_weight);
-  int num_segments = 0;
-  int num_batches = 0;
-  int compact_slot_cursor = 0;
   DispatchDescriptorBuildResult result;
+  const int tid = static_cast<int>(threadIdx.x);
+  const int stride = static_cast<int>(blockDim.x);
 
-  for (int i = 0; i < max_batches; ++i) {
+  if (tid == 0) {
+    counters[kDescriptorCounterSegments] = 0;
+    counters[kDescriptorCounterBatches] = 0;
+    counters[kDescriptorCounterOverflow] = max_batches < kNumExperts ? 1 : 0;
+  }
+  for (int i = tid; i < max_batches; i += stride) {
     batches[i] = DispatchExpertBatch{};
   }
+  __syncthreads();
+  if (counters[kDescriptorCounterOverflow] != 0) {
+    result.overflow = 1;
+    return result;
+  }
 
-  for (int expert = 0; expert < kNumExperts; ++expert) {
+  for (int expert = tid; expert < kNumExperts; expert += stride) {
     const int owner_rank = expert / kExpertsPerRank;
     const int dst_scaleout_rank = owner_rank / kNumScaleupRanks;
     const int dst_scaleup_lane = owner_rank % kNumScaleupRanks;
 
-    int first_segment = num_segments;
     int total_tokens = 0;
-    int current_segment = -1;
+    int num_expert_segments = 0;
+    int last_src_token_begin = -1;
+    int last_count = 0;
+    int last_topk_slot = -1;
+    int last_expanded_slot_begin = -1;
 
     for (int token = 0; token < num_tokens; ++token) {
       for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
@@ -68,78 +80,105 @@ __device__ __forceinline__ DispatchDescriptorBuildResult build_dispatch_descript
         }
 
         const int expanded_slot = total_tokens++;
-        bool can_extend = false;
-        if (current_segment >= first_segment) {
-          auto& last = segments[current_segment];
-          can_extend = last.src_token_index_offset < 0 &&
-                       last.topk_slot == topk_slot &&
-                       last.src_token_begin + last.count == token &&
-                       last.expanded_slot_begin + last.count == expanded_slot &&
-                       last.payload_bytes == kHiddenBytes &&
-                       last.scale_bytes == scale_bytes && last.flags == flags;
+        const bool can_extend =
+            last_src_token_begin >= 0 && last_topk_slot == topk_slot &&
+            last_src_token_begin + last_count == token &&
+            last_expanded_slot_begin + last_count == expanded_slot;
+        if (!can_extend) {
+          ++num_expert_segments;
+          last_src_token_begin = token;
+          last_count = 1;
+          last_topk_slot = topk_slot;
+          last_expanded_slot_begin = expanded_slot;
+        } else {
+          ++last_count;
         }
-
-        if (can_extend) {
-          segments[current_segment].count += 1;
-          continue;
-        }
-
-        if (num_segments >= max_segments) {
-          counters[kDescriptorCounterSegments] = num_segments;
-          counters[kDescriptorCounterBatches] = num_batches;
-          counters[kDescriptorCounterOverflow] = 1;
-          result.num_segments = num_segments;
-          result.num_batches = num_batches;
-          result.overflow = 1;
-          return result;
-        }
-
-        current_segment = num_segments++;
-        auto& segment = segments[current_segment];
-        segment.dst_scaleout_rank = dst_scaleout_rank;
-        segment.dst_scaleup_lane = dst_scaleup_lane;
-        segment.expert_id = expert;
-        segment.count = 1;
-        segment.src_token_begin = token;
-        segment.src_token_index_offset = -1;
-        segment.topk_slot = topk_slot;
-        segment.expanded_slot_begin = expanded_slot;
-        segment.payload_bytes = kHiddenBytes;
-        segment.scale_bytes = scale_bytes;
-        segment.flags = flags;
       }
     }
 
-    if (total_tokens == 0) {
-      continue;
-    }
-    if (num_batches >= max_batches) {
-      counters[kDescriptorCounterSegments] = num_segments;
-      counters[kDescriptorCounterBatches] = num_batches;
-      counters[kDescriptorCounterOverflow] = 1;
-      result.num_segments = num_segments;
-      result.num_batches = num_batches;
-      result.overflow = 1;
-      return result;
-    }
-
-    auto& batch = batches[num_batches++];
+    auto& batch = batches[expert];
     batch.dst_scaleout_rank = dst_scaleout_rank;
     batch.dst_scaleup_lane = dst_scaleup_lane;
     batch.expert_id = expert;
-    batch.first_segment = first_segment;
-    batch.num_segments = num_segments - first_segment;
+    batch.first_segment = 0;
+    batch.num_segments = num_expert_segments;
     batch.total_tokens = total_tokens;
-    batch.reserved = compact_slot_cursor;
-    compact_slot_cursor += total_tokens;
+    batch.reserved = 0;
   }
+  __syncthreads();
 
-  counters[kDescriptorCounterSegments] = num_segments;
-  counters[kDescriptorCounterBatches] = num_batches;
-  counters[kDescriptorCounterOverflow] = 0;
-  result.num_segments = num_segments;
-  result.num_batches = num_batches;
-  result.overflow = 0;
+  if (tid == 0) {
+    int segment_cursor = 0;
+    int compact_slot_cursor = 0;
+    for (int expert = 0; expert < kNumExperts; ++expert) {
+      auto& batch = batches[expert];
+      batch.first_segment = segment_cursor;
+      batch.reserved = compact_slot_cursor;
+      segment_cursor += batch.num_segments;
+      compact_slot_cursor += batch.total_tokens;
+    }
+    counters[kDescriptorCounterSegments] = segment_cursor;
+    counters[kDescriptorCounterBatches] = kNumExperts;
+    counters[kDescriptorCounterOverflow] = segment_cursor > max_segments ? 1 : 0;
+  }
+  __syncthreads();
+
+  if (counters[kDescriptorCounterOverflow] == 0) {
+    for (int expert = tid; expert < kNumExperts; expert += stride) {
+      const auto& batch = batches[expert];
+      if (batch.total_tokens <= 0 || batch.num_segments <= 0) {
+        continue;
+      }
+
+      int write_segment = batch.first_segment;
+      int total_tokens = 0;
+      int current_segment = -1;
+      for (int token = 0; token < num_tokens; ++token) {
+        for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
+          const auto routed_expert = static_cast<int>(
+              topk_idx[token * kNumTopk + topk_slot]);
+          if (routed_expert != expert) {
+            continue;
+          }
+
+          const int expanded_slot = total_tokens++;
+          bool can_extend = false;
+          if (current_segment >= batch.first_segment) {
+            auto& last = segments[current_segment];
+            can_extend = last.src_token_index_offset < 0 &&
+                         last.topk_slot == topk_slot &&
+                         last.src_token_begin + last.count == token &&
+                         last.expanded_slot_begin + last.count == expanded_slot &&
+                         last.payload_bytes == kHiddenBytes &&
+                         last.scale_bytes == scale_bytes && last.flags == flags;
+          }
+          if (can_extend) {
+            segments[current_segment].count += 1;
+            continue;
+          }
+
+          current_segment = write_segment++;
+          auto& segment = segments[current_segment];
+          segment.dst_scaleout_rank = batch.dst_scaleout_rank;
+          segment.dst_scaleup_lane = batch.dst_scaleup_lane;
+          segment.expert_id = expert;
+          segment.count = 1;
+          segment.src_token_begin = token;
+          segment.src_token_index_offset = -1;
+          segment.topk_slot = topk_slot;
+          segment.expanded_slot_begin = expanded_slot;
+          segment.payload_bytes = kHiddenBytes;
+          segment.scale_bytes = scale_bytes;
+          segment.flags = flags;
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  result.num_segments = static_cast<int>(counters[kDescriptorCounterSegments]);
+  result.num_batches = static_cast<int>(counters[kDescriptorCounterBatches]);
+  result.overflow = static_cast<int>(counters[kDescriptorCounterOverflow]);
   return result;
 }
 
@@ -168,8 +207,34 @@ __device__ __forceinline__ void enqueue_dispatch_d2h(
   }
   for (uint32_t target_rank = 0; target_rank < layout.num_ranks;
        ++target_rank) {
+    uint32_t expected_count = 0;
+    for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+      const auto& batch = batches[batch_idx];
+      const uint32_t batch_target_rank =
+          static_cast<uint32_t>(batch.dst_scaleout_rank) *
+              layout.num_scaleup_ranks +
+          static_cast<uint32_t>(batch.dst_scaleup_lane);
+      if (batch_target_rank == target_rank && batch.total_tokens > 0) {
+        expected_count += static_cast<uint32_t>(batch.total_tokens);
+      }
+    }
     enqueue_v2_transfer_d2h(
-        queue, make_v2_dispatch_done_cmd(target_rank, layout));
+        queue, make_v2_dispatch_done_cmd(target_rank, expected_count, layout));
+  }
+}
+
+template <int kBytes>
+__device__ __forceinline__ void copy_payload_16b(uint8_t* dst,
+                                                const uint8_t* src) {
+  constexpr int kVecBytes = 16;
+  constexpr int kNumVec = kBytes / kVecBytes;
+  auto* dst_vec = reinterpret_cast<uint4*>(dst);
+  const auto* src_vec = reinterpret_cast<const uint4*>(src);
+  for (int i = 0; i < kNumVec; ++i) {
+    dst_vec[i] = src_vec[i];
+  }
+  for (int byte = kNumVec * kVecBytes; byte < kBytes; ++byte) {
+    dst[byte] = src[byte];
   }
 }
 
@@ -185,7 +250,7 @@ __global__ void v2_efa_dispatch_descriptor_enqueue_d2h_kernel(
     int scaleout_rank, int scaleup_rank, int scale_bytes,
     bool has_topk_weight, int max_segments, int max_batches,
     V2TransferD2HQueueView queue, DispatchTransferLayout layout) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
+  if (blockIdx.x != 0) {
     return;
   }
   (void)scaleout_rank;
@@ -195,7 +260,7 @@ __global__ void v2_efa_dispatch_descriptor_enqueue_d2h_kernel(
       kNumScaleoutRanks, kNumScaleupRanks, kNumExperts, kNumTopk, kHiddenBytes>(
       topk_idx, segments, batches, counters, num_tokens, scale_bytes,
       has_topk_weight, max_segments, max_batches);
-  if (result.overflow != 0) {
+  if (threadIdx.x != 0 || result.overflow != 0) {
     return;
   }
   detail::enqueue_dispatch_d2h(segments, batches, max_batches, queue, layout);
@@ -404,9 +469,7 @@ __global__ void v2_efa_dispatch_materialize_records_kernel(
     const auto* record = window + record_offset;
     auto* dst_payload = recv_x + static_cast<uint64_t>(out_row) * kHiddenBytes;
     const auto* src_payload = record + layout.record_payload_offset;
-    for (int byte = 0; byte < kHiddenBytes; ++byte) {
-      dst_payload[byte] = src_payload[byte];
-    }
+    detail::copy_payload_16b<kHiddenBytes>(dst_payload, src_payload);
 
     const auto src_global_ptr = reinterpret_cast<const int32_t*>(
         record + layout.record_src_global_offset);
@@ -440,64 +503,70 @@ __global__ void v2_efa_dispatch_signal_offsets_kernel(
     const uint8_t* window, int32_t* batch_counts, int32_t* batch_offsets,
     int32_t* recv_counts_per_rank, int32_t* total_recv_tokens,
     int num_sources, int max_batches, DispatchTransferLayout layout) {
-  if (blockIdx.x != 0) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
   (void)kInstance;
 
-  const int tid = static_cast<int>(threadIdx.x);
-  const int stride = static_cast<int>(blockDim.x);
-
-  for (int source = tid; source < num_sources; source += stride) {
+  int running = 0;
+  for (int source = 0; source < num_sources; ++source) {
     const uint64_t done_offset =
         layout.remote_signal_base +
         static_cast<uint64_t>(source) * layout.source_signal_stride +
         static_cast<uint64_t>(max_batches) * layout.signal_stride;
     const auto* done_ptr =
         reinterpret_cast<const volatile uint32_t*>(window + done_offset);
-    while (*done_ptr == 0u) {
+    uint32_t done_value = 0;
+    while ((done_value = *done_ptr) == 0u) {
 #if defined(__CUDA_ARCH__)
       __nanosleep(64);
 #endif
     }
-  }
-  __syncthreads();
+    const int expected = static_cast<int>(done_value - 1u);
+    int visible = 0;
+    do {
+      visible = 0;
+      for (int batch = 0; batch < max_batches; ++batch) {
+        const uint64_t signal_offset =
+            layout.remote_signal_base +
+            static_cast<uint64_t>(source) * layout.source_signal_stride +
+            static_cast<uint64_t>(batch) * layout.signal_stride;
+        const auto* count_ptr =
+            reinterpret_cast<const volatile uint32_t*>(window + signal_offset);
+        visible += static_cast<int>(*count_ptr);
+      }
+      if (visible < expected) {
 #if defined(__CUDA_ARCH__)
-  __threadfence_system();
+        __nanosleep(64);
+#endif
+      }
+    } while (visible < expected);
+
+#if defined(__CUDA_ARCH__)
+    __threadfence_system();
 #endif
 
-  for (int linear = tid; linear < num_sources * max_batches;
-       linear += stride) {
-    const int batch = linear % max_batches;
-    const int source = linear / max_batches;
-    const uint64_t signal_offset =
-        layout.remote_signal_base +
-        static_cast<uint64_t>(source) * layout.source_signal_stride +
-        static_cast<uint64_t>(batch) * layout.signal_stride;
-    const auto* count_ptr =
-        reinterpret_cast<const volatile uint32_t*>(window + signal_offset);
-    batch_counts[linear] = static_cast<int>(*count_ptr);
-    batch_offsets[linear] = -1;
-  }
-  __syncthreads();
-
-  if (tid == 0) {
-    int running = 0;
-    for (int source = 0; source < num_sources; ++source) {
-      int source_total = 0;
-      for (int batch = 0; batch < max_batches; ++batch) {
-        const int idx = source * max_batches + batch;
-        const int count = batch_counts[idx];
-        if (count > 0) {
-          batch_offsets[idx] = running;
-          running += count;
-          source_total += count;
-        }
+    int source_total = 0;
+    for (int batch = 0; batch < max_batches; ++batch) {
+      const int idx = source * max_batches + batch;
+      const uint64_t signal_offset =
+          layout.remote_signal_base +
+          static_cast<uint64_t>(source) * layout.source_signal_stride +
+          static_cast<uint64_t>(batch) * layout.signal_stride;
+      const auto* count_ptr =
+          reinterpret_cast<const volatile uint32_t*>(window + signal_offset);
+      const int count = static_cast<int>(*count_ptr);
+      batch_counts[idx] = count;
+      batch_offsets[idx] = -1;
+      if (count > 0) {
+        batch_offsets[idx] = running;
+        running += count;
+        source_total += count;
       }
-      recv_counts_per_rank[source] = source_total;
     }
-    total_recv_tokens[0] = running;
+    recv_counts_per_rank[source] = source_total;
   }
+  total_recv_tokens[0] = running;
 }
 
 template <int kNumTopk, int kHiddenBytes>
@@ -524,9 +593,7 @@ __global__ void v2_efa_dispatch_expand_records_kernel(
         recv_x + static_cast<uint64_t>(row) * kHiddenBytes;
     auto* dst_payload =
         expanded_x + static_cast<uint64_t>(expanded_idx) * kHiddenBytes;
-    for (int byte = 0; byte < kHiddenBytes; ++byte) {
-      dst_payload[byte] = src_payload[byte];
-    }
+    detail::copy_payload_16b<kHiddenBytes>(dst_payload, src_payload);
     if (has_topk_weight && recv_topk_weights != nullptr &&
         expanded_topk_weights != nullptr) {
       expanded_topk_weights[expanded_idx * kNumTopk + slot] =

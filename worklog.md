@@ -2473,3 +2473,109 @@ README 风格 EP8x2 性能：
   2. receiver 直接写 expanded layout/metadata，删除 `materialize_records` 中间层；
   3. 用 GPU-side count/offset 或预分配输出减少 D2H total-count 同步；
   4. CQ completion wait 和 proxy drain 并行化。
+
+## 2026-06-01 dispatch 主路径继续收敛
+
+- 继续按“不写 fallback / 临时 correctness 路径”的要求，只改当前 dispatch 主路径：
+  `v2_efa_dispatch_descriptor_enqueue_d2h_kernel` -> `V2TransferCmd` ->
+  EFA sink。
+- 修正 EFA signal 可见性：
+  - dispatch done signal 不再只写常量 `1`，而是写 `expected_count + 1`；
+  - receiver 看到 done 后会继续读取该 source 的 per-expert count table，直到
+    count 总和达到 expected count；
+  - 这样可以处理 EFA/PCIe 可见性或写入到达顺序导致的 “done 先可见、count 后可见”
+    情况，避免 receiver 把 `total_recv` 错读为 0。
+- receiver payload copy 改成 16B vector copy：
+  - `materialize_records` 和 `expand_records` 从 byte loop 改为 `uint4` copy；
+  - 这不是 fallback，只是当前 receiver 主路径的数据搬运实现。
+- 服务器验证结果：
+  - EP16 remote-pair correctness 通过：
+    `dispatch_correctness_ok EP16 tokens=8 hidden=16 remote_pair=True`
+  - small bench：
+    `tokens=1024 hidden=1024 experts=16 topk=1 sms=8`
+    `avg_us=4252.69 payload_GBps=0.49 record_GBps=0.50`
+    timing:
+    `stage_and_pre_barrier_ms=1.20`,
+    `descriptor_enqueue_ms=1.24`,
+    `completion_wait_ms=0.19`,
+    `signal_offsets_ms=0.24`,
+    `materialize_records_ms=0.17`,
+    `metadata_ms=0.29`。
+  - README-size dispatch-only bench：
+    `tokens=8192 hidden=7168 experts=16 topk=1 sms=8`
+    `avg_us=22935.58 payload_GBps=5.12 record_GBps=5.13`
+    timing:
+    `stage_and_pre_barrier_ms=3.52`,
+    `descriptor_enqueue_ms=8.51`,
+    `completion_wait_ms=5.19`,
+    `signal_offsets_ms=0.21`,
+    `materialize_records_ms=1.91`,
+    `metadata_ms=1.10`。
+- 结论：
+  - vector copy 解决了大包 receiver materialize 的主要浪费，从约 `23.87ms`
+    降到约 `1.91ms`；
+  - 当前第一阻塞已经变成 sender descriptor enqueue 单线程扫描和单 lane
+    EFA payload write。
+
+## 2026-06-01 dispatch descriptor 并行化开发
+
+- 已把 `build_dispatch_descriptors()` 从 thread0 串行扫
+  `experts * tokens * topk` 改成 block 内 256 线程按 expert 并行扫描。
+- batch 语义保持 native V2：
+  - 一个 expert 对应一个 semantic batch slot；
+  - `reserved` 是按 expert 顺序计算出的 expanded/compact payload prefix；
+  - segment 仍描述 `dst_rank/lane, expert_id, src_token range,
+    expanded_slot range, count, payload_bytes`；
+  - 不引入 V1 packed staging、不引入 reference/loopback/direct enqueue 旁路。
+- 当前本地检查通过：
+  - `python3 -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+  - `git diff --check -- uccl-ep worklog.md`
+- 待服务器空闲验证：
+  - 重新 build/install；
+  - EP16 dispatch correctness；
+  - EP16 dispatch-only small bench；
+  - README-size dispatch-only bench，重点确认 `descriptor_enqueue_ms` 是否从
+    `8.5ms` 明显下降。
+
+### 服务器验证结果
+
+- 首次验证暴露一个主路径 bug：
+  - 外层 descriptor enqueue kernel 还保留旧的 `threadIdx.x != 0 return`；
+  - 新 builder 内部使用 `__syncthreads()`，只有 thread0 进入会触发 illegal memory
+    access；
+  - 已修正为整个 block 进入 builder，只有 thread0 在 builder 完成后执行最终
+    `enqueue_dispatch_d2h()`。
+- EP16 remote-pair correctness 通过：
+  - `dispatch_correctness_ok EP16 tokens=8 hidden=16 remote_pair=True`
+  - stats: `drained_commands=18, posted_writes=1, posted_signals=17,
+    posted_bytes=580`。
+- small bench：
+  - `tokens=1024 hidden=1024 experts=16 topk=1 sms=8`
+  - `avg_us=3246.82 payload_GBps=0.65 record_GBps=0.66`
+  - timing:
+    - `stage_and_pre_barrier_ms=0.49`
+    - `descriptor_enqueue_ms=0.65`
+    - `completion_wait_ms=0.25`
+    - `signal_offsets_ms=1.99`
+    - `materialize_records_ms=0.18`
+    - `metadata_ms=0.28`
+  - 对比上次：`avg_us 4252.69 -> 3246.82`，
+    `descriptor_enqueue_ms 1.24 -> 0.65`。
+- README-size dispatch-only bench：
+  - `tokens=8192 hidden=7168 experts=16 topk=1 sms=8`
+  - `avg_us=16939.89 payload_GBps=6.93 record_GBps=6.95`
+  - timing:
+    - `stage_and_pre_barrier_ms=3.02`
+    - `descriptor_enqueue_ms=3.63`
+    - `completion_wait_ms=5.28`
+    - `signal_offsets_ms=0.20`
+    - `materialize_records_ms=1.90`
+    - `metadata_ms=0.86`
+  - 对比上次：`avg_us 22935.58 -> 16939.89`，
+    `payload_GBps 5.12 -> 6.93`，
+    `descriptor_enqueue_ms 8.51 -> 3.63`。
+- 当前新的核心阻塞：
+  - `completion_wait_ms ~5.3ms` 仍然接近单 lane/单 payload write 的 EFA 传输时间；
+  - 若要继续接近 README SM90 EP16，需要把 dispatch payload 按 V2 semantic
+    batch/slot 分到多 EFA lane/NIC，而不是所有 remote payload 都落在
+    `layout.efa_lane == 0` 的单通道上。

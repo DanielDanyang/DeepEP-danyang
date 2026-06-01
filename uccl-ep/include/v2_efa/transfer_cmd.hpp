@@ -304,7 +304,8 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_signal_cmd(
 }
 
 V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_done_cmd(
-    uint32_t target_rank, const DispatchTransferLayout& layout) {
+    uint32_t target_rank, uint32_t expected_count,
+    const DispatchTransferLayout& layout) {
   const uint64_t source_signal_base =
       layout.remote_signal_base +
       static_cast<uint64_t>(layout.source_rank) * layout.source_signal_stride;
@@ -315,7 +316,7 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_done_cmd(
       /*descriptor_index=*/0,
       layout.max_batches,
       sizeof(uint32_t),
-      /*signal_value=*/1,
+      /*signal_value=*/expected_count + 1u,
       /*local_offset=*/0,
       source_signal_base +
           static_cast<uint64_t>(layout.max_batches) * layout.signal_stride);
