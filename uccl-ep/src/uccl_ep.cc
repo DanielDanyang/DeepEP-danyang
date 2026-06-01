@@ -1586,6 +1586,78 @@ NB_MODULE(ep, m) {
            nb::arg("do_expand"),
            nb::arg("uccl_include_path") = "",
            nb::arg("cuda_stream_ptr") = 0)
+      .def("launch_dispatch_materialize_records",
+           [](const v2::V2EfaRuntime& self, std::uintptr_t window_ptr,
+              std::uintptr_t batch_counts_ptr,
+              std::uintptr_t batch_offsets_ptr, std::uintptr_t recv_x_ptr,
+              std::uintptr_t recv_topk_idx_ptr,
+              std::uintptr_t recv_topk_weights_ptr,
+              std::uintptr_t recv_src_global_ptr, int max_batches,
+              int num_max_tokens_per_rank, std::uint64_t local_payload_base,
+              std::uint64_t remote_payload_base,
+              std::uint64_t remote_signal_base, std::uint32_t src_token_stride,
+              std::uint32_t expanded_slot_stride,
+              std::uint32_t batch_payload_stride,
+              std::uint32_t source_rank_stride,
+              std::uint32_t source_signal_stride,
+              std::uint32_t token_record_bytes,
+              std::uint32_t record_payload_offset,
+              std::uint32_t record_src_global_offset,
+              std::uint32_t record_topk_idx_offset,
+              std::uint32_t record_topk_weight_offset,
+              std::uint32_t record_topk_weight_bytes,
+              std::uint32_t signal_stride, bool has_topk_weight,
+              const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             v2::DispatchTransferLayout layout;
+             layout.local_payload_base = local_payload_base;
+             layout.remote_payload_base = remote_payload_base;
+             layout.remote_signal_base = remote_signal_base;
+             layout.src_token_stride = src_token_stride;
+             layout.expanded_slot_stride = expanded_slot_stride;
+             layout.batch_payload_stride = batch_payload_stride;
+             layout.source_rank_stride = source_rank_stride;
+             layout.source_signal_stride = source_signal_stride;
+             layout.token_record_bytes = token_record_bytes;
+             layout.record_payload_offset = record_payload_offset;
+             layout.record_src_global_offset = record_src_global_offset;
+             layout.record_topk_idx_offset = record_topk_idx_offset;
+             layout.record_topk_weight_offset = record_topk_weight_offset;
+             layout.record_topk_weight_bytes = record_topk_weight_bytes;
+             layout.signal_stride = signal_stride;
+             self.launch_dispatch_materialize_records(
+                 window_ptr, batch_counts_ptr, batch_offsets_ptr, recv_x_ptr,
+                 recv_topk_idx_ptr, recv_topk_weights_ptr,
+                 recv_src_global_ptr, max_batches, num_max_tokens_per_rank,
+                 layout, has_topk_weight, uccl_include_path, cuda_stream_ptr);
+           },
+           nb::arg("window_ptr"),
+           nb::arg("batch_counts_ptr"),
+           nb::arg("batch_offsets_ptr"),
+           nb::arg("recv_x_ptr"),
+           nb::arg("recv_topk_idx_ptr"),
+           nb::arg("recv_topk_weights_ptr"),
+           nb::arg("recv_src_global_ptr"),
+           nb::arg("max_batches"),
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("local_payload_base"),
+           nb::arg("remote_payload_base"),
+           nb::arg("remote_signal_base"),
+           nb::arg("src_token_stride"),
+           nb::arg("expanded_slot_stride"),
+           nb::arg("batch_payload_stride"),
+           nb::arg("source_rank_stride"),
+           nb::arg("source_signal_stride"),
+           nb::arg("token_record_bytes"),
+           nb::arg("record_payload_offset"),
+           nb::arg("record_src_global_offset"),
+           nb::arg("record_topk_idx_offset"),
+           nb::arg("record_topk_weight_offset"),
+           nb::arg("record_topk_weight_bytes"),
+           nb::arg("signal_stride"),
+           nb::arg("has_topk_weight"),
+           nb::arg("uccl_include_path") = "",
+           nb::arg("cuda_stream_ptr") = 0)
       .def("launch_combine_descriptors",
            [](const v2::V2EfaRuntime& self,
               std::uintptr_t dispatch_segments_ptr,

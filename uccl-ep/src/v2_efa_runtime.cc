@@ -264,6 +264,24 @@ V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_receiver_metadata_jit_plan(
   return build_v2_efa_dispatch_receiver_metadata_jit_plan(jit_config);
 }
 
+V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_materialize_records_jit_plan(
+    int num_max_tokens_per_rank, const std::string& uccl_include_path) const {
+  V2EfaDispatchJitConfig jit_config;
+  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
+  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
+  jit_config.num_experts = config_.num_experts;
+  jit_config.num_topk = config_.num_topk;
+  jit_config.hidden = std::max(1, config_.hidden);
+  jit_config.elem_bytes = std::max(1, config_.elem_bytes);
+  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
+  jit_config.num_channels_per_sm = 1;
+  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
+  jit_config.scaleout_rank = config_.scaleout_rank;
+  jit_config.scaleup_rank = config_.scaleup_rank;
+  jit_config.uccl_include_path = uccl_include_path;
+  return build_v2_efa_dispatch_materialize_records_jit_plan(jit_config);
+}
+
 V2EfaJitLaunchPlan
 V2EfaRuntime::build_combine_descriptor_enqueue_d2h_jit_plan(
     int num_max_tokens_per_rank, int num_channels, int payload_bytes,

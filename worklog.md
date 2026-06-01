@@ -2121,3 +2121,27 @@ README 风格 EP8x2 性能：
   - dispatch Python path 仍会调用 `_semantic_dispatch_data` 和 overlay；
   - descriptor 仍是当前 per-expert scaffold，还没有真正 fork 官方
     `hybrid_dispatch.cuh` 的 scaleout/forward 主循环。
+
+## 2026-06-01 dispatch receiver materialize JIT scaffold
+
+- 新增 `v2_efa_dispatch_materialize_records_kernel`：
+  - 输入 RDMA window、`batch_counts`、`batch_offsets`；
+  - 按 `source_rank_stride` / `batch_payload_stride` / `expanded_slot_stride`
+    从 receiver 本地 EFA window 读取 dispatch token record；
+  - 直接写出 `recv_x`、本地化后的 `recv_topk_idx`、可选 `recv_topk_weights`、
+    `recv_src_global`。
+- 新增 runtime/JIT/binding/Python wrapper：
+  - `build_v2_efa_dispatch_materialize_records_jit_plan`
+  - `launch_v2_efa_dispatch_materialize_records_plan`
+  - `V2EfaRuntime::launch_dispatch_materialize_records`
+  - `ElasticBuffer.launch_dispatch_materialize_records`
+- 当前状态：
+  - kernel/binding 已编译通过，但还没有接入 `dispatch()` 主路径；
+  - 下一步需要从 receiver signal 区生成 `batch_counts` / `batch_offsets`，调用
+    materialize kernel 后再喂给已有 receiver metadata / forward metadata kernel；
+  - 再下一步才能删除 `_semantic_dispatch_data` 和 overlay。
+- 验证：
+  - 本地 `python3 -m py_compile .../elastic.py` 通过；
+  - 本地 C++ dispatch plan test 通过；
+  - 服务器空闲检查通过后同步到 EFS；
+  - `p5en_0` 上 `make -j8` 通过，确认新增 nanobind/JIT symbol 编译可过。

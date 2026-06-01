@@ -309,6 +309,35 @@ void launch_v2_efa_dispatch_receiver_metadata_plan(
       expert_alignment, do_expand));
 }
 
+void launch_v2_efa_dispatch_materialize_records_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t window_ptr,
+    std::uintptr_t batch_counts_ptr, std::uintptr_t batch_offsets_ptr,
+    std::uintptr_t recv_x_ptr, std::uintptr_t recv_topk_idx_ptr,
+    std::uintptr_t recv_topk_weights_ptr, std::uintptr_t recv_src_global_ptr,
+    int num_sources, int max_batches, int num_max_tokens_per_rank,
+    int num_experts, int rank, DispatchTransferLayout layout,
+    bool has_topk_weight, std::uintptr_t cuda_stream_ptr) {
+  if (num_sources <= 0 || max_batches <= 0 || num_max_tokens_per_rank <= 0 ||
+      num_experts <= 0 || rank < 0) {
+    throw std::invalid_argument(
+        "invalid V2 EFA dispatch materialize-records launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config,
+      checked_ptr<const uint8_t>(window_ptr, "window"),
+      checked_ptr<const int32_t>(batch_counts_ptr, "batch_counts"),
+      checked_ptr<const int32_t>(batch_offsets_ptr, "batch_offsets"),
+      checked_ptr<uint8_t>(recv_x_ptr, "recv_x"),
+      checked_ptr<int64_t>(recv_topk_idx_ptr, "recv_topk_idx"),
+      reinterpret_cast<float*>(recv_topk_weights_ptr),
+      checked_ptr<int32_t>(recv_src_global_ptr, "recv_src_global"),
+      num_sources, max_batches, num_max_tokens_per_rank, num_experts, rank,
+      layout, has_topk_weight));
+}
+
 void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t dispatch_segments_ptr,
     std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
@@ -541,6 +570,24 @@ void V2EfaRuntime::launch_dispatch_receiver_metadata(
       expert_counts_scratch_ptr, next_expanded_scratch_ptr, num_recv_tokens,
       num_source_tokens, num_max_tokens_per_rank, cfg.rank, expert_alignment,
       do_expand, cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_dispatch_materialize_records(
+    std::uintptr_t window_ptr, std::uintptr_t batch_counts_ptr,
+    std::uintptr_t batch_offsets_ptr, std::uintptr_t recv_x_ptr,
+    std::uintptr_t recv_topk_idx_ptr, std::uintptr_t recv_topk_weights_ptr,
+    std::uintptr_t recv_src_global_ptr, int max_batches,
+    int num_max_tokens_per_rank, DispatchTransferLayout layout,
+    bool has_topk_weight, const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto& cfg = config();
+  const auto plan = build_dispatch_materialize_records_jit_plan(
+      num_max_tokens_per_rank, uccl_include_path);
+  launch_v2_efa_dispatch_materialize_records_plan(
+      plan, window_ptr, batch_counts_ptr, batch_offsets_ptr, recv_x_ptr,
+      recv_topk_idx_ptr, recv_topk_weights_ptr, recv_src_global_ptr,
+      cfg.world_size, max_batches, num_max_tokens_per_rank, cfg.num_experts,
+      cfg.rank, layout, has_topk_weight, cuda_stream_ptr);
 }
 
 void V2EfaRuntime::launch_combine_descriptor_enqueue_d2h(

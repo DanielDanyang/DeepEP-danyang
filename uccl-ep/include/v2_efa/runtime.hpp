@@ -87,6 +87,14 @@ void launch_v2_efa_dispatch_receiver_metadata_plan(
     int num_source_tokens, int num_max_tokens_per_rank, int rank,
     int expert_alignment, bool do_expand,
     std::uintptr_t cuda_stream_ptr = 0);
+void launch_v2_efa_dispatch_materialize_records_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t window_ptr,
+    std::uintptr_t batch_counts_ptr, std::uintptr_t batch_offsets_ptr,
+    std::uintptr_t recv_x_ptr, std::uintptr_t recv_topk_idx_ptr,
+    std::uintptr_t recv_topk_weights_ptr, std::uintptr_t recv_src_global_ptr,
+    int num_sources, int max_batches, int num_max_tokens_per_rank,
+    int num_experts, int rank, DispatchTransferLayout layout,
+    bool has_topk_weight, std::uintptr_t cuda_stream_ptr = 0);
 void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t dispatch_segments_ptr,
     std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
@@ -150,6 +158,9 @@ class V2EfaRuntime {
       int num_max_tokens_per_rank, int num_channels_per_sm,
       const std::string& uccl_include_path = "") const;
   V2EfaJitLaunchPlan build_dispatch_receiver_metadata_jit_plan(
+      int num_max_tokens_per_rank,
+      const std::string& uccl_include_path = "") const;
+  V2EfaJitLaunchPlan build_dispatch_materialize_records_jit_plan(
       int num_max_tokens_per_rank,
       const std::string& uccl_include_path = "") const;
   V2EfaJitLaunchPlan build_combine_descriptor_enqueue_d2h_jit_plan(
@@ -232,6 +243,14 @@ class V2EfaRuntime {
       int num_source_tokens, int num_max_tokens_per_rank,
       int expert_alignment, bool do_expand,
       const std::string& uccl_include_path = "",
+      std::uintptr_t cuda_stream_ptr = 0) const;
+  void launch_dispatch_materialize_records(
+      std::uintptr_t window_ptr, std::uintptr_t batch_counts_ptr,
+      std::uintptr_t batch_offsets_ptr, std::uintptr_t recv_x_ptr,
+      std::uintptr_t recv_topk_idx_ptr, std::uintptr_t recv_topk_weights_ptr,
+      std::uintptr_t recv_src_global_ptr, int max_batches,
+      int num_max_tokens_per_rank, DispatchTransferLayout layout,
+      bool has_topk_weight, const std::string& uccl_include_path = "",
       std::uintptr_t cuda_stream_ptr = 0) const;
   void launch_combine_descriptor_enqueue_d2h(
       std::uintptr_t dispatch_segments_ptr,

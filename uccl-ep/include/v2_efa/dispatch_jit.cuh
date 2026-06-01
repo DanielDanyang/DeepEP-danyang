@@ -449,6 +449,76 @@ __global__ void v2_efa_dispatch_receiver_metadata_kernel(
   }
 }
 
+template <int kNumTopk, int kHiddenBytes>
+__global__ void v2_efa_dispatch_materialize_records_kernel(
+    const uint8_t* window, const int32_t* batch_counts,
+    const int32_t* batch_offsets, uint8_t* recv_x, int64_t* recv_topk_idx,
+    float* recv_topk_weights, int32_t* recv_src_global, int num_sources,
+    int max_batches, int num_max_tokens_per_rank, int num_experts, int rank,
+    DispatchTransferLayout layout, bool has_topk_weight) {
+  const int global_thread =
+      static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+  const int global_stride = static_cast<int>(gridDim.x * blockDim.x);
+  const int total_slots =
+      num_sources * max_batches * num_max_tokens_per_rank;
+  const int world_size = num_sources > 0 ? num_sources : 1;
+  const int experts_per_rank = num_experts / world_size;
+  const int num_local_experts = experts_per_rank > 0 ? experts_per_rank : 1;
+  const int local_expert_begin = rank * num_local_experts;
+  const int local_expert_end = local_expert_begin + num_local_experts;
+
+  for (int linear = global_thread; linear < total_slots;
+       linear += global_stride) {
+    const int slot = linear % num_max_tokens_per_rank;
+    const int batch_linear = linear / num_max_tokens_per_rank;
+    const int batch = batch_linear % max_batches;
+    const int source = batch_linear / max_batches;
+    const int count = __ldg(batch_counts + source * max_batches + batch);
+    const int out_begin = __ldg(batch_offsets + source * max_batches + batch);
+    if (count <= 0 || out_begin < 0 || slot >= count) {
+      continue;
+    }
+
+    const int out_row = out_begin + slot;
+    const uint64_t record_offset =
+        layout.remote_payload_base +
+        static_cast<uint64_t>(source) * layout.source_rank_stride +
+        static_cast<uint64_t>(batch) * layout.batch_payload_stride +
+        static_cast<uint64_t>(slot) * layout.expanded_slot_stride;
+    const auto* record = window + record_offset;
+    auto* dst_payload = recv_x + static_cast<uint64_t>(out_row) * kHiddenBytes;
+    const auto* src_payload = record + layout.record_payload_offset;
+    for (int byte = 0; byte < kHiddenBytes; ++byte) {
+      dst_payload[byte] = src_payload[byte];
+    }
+
+    const auto src_global_ptr = reinterpret_cast<const int32_t*>(
+        record + layout.record_src_global_offset);
+    recv_src_global[out_row] = *src_global_ptr;
+
+    const auto topk_ptr = reinterpret_cast<const int64_t*>(
+        record + layout.record_topk_idx_offset);
+    for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
+      const int64_t raw_expert = topk_ptr[topk_slot];
+      int64_t local_expert = -1;
+      if (raw_expert >= local_expert_begin && raw_expert < local_expert_end) {
+        local_expert = raw_expert - local_expert_begin;
+      }
+      recv_topk_idx[out_row * kNumTopk + topk_slot] = local_expert;
+    }
+
+    if (has_topk_weight && recv_topk_weights != nullptr &&
+        layout.record_topk_weight_bytes != 0) {
+      const auto weight_ptr = reinterpret_cast<const float*>(
+          record + layout.record_topk_weight_offset);
+      for (int topk_slot = 0; topk_slot < kNumTopk; ++topk_slot) {
+        recv_topk_weights[out_row * kNumTopk + topk_slot] =
+            weight_ptr[topk_slot];
+      }
+    }
+  }
+}
+
 template <int kInstance>
 __global__ void v2_efa_dispatch_enqueue_transfer_kernel(
     const DispatchSegmentDescriptor* segments,

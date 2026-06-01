@@ -1169,6 +1169,70 @@ class ElasticBuffer:
             _cuda_stream_ptr(stream),
         )
 
+    def launch_dispatch_materialize_records(
+        self,
+        batch_counts: torch.Tensor,
+        batch_offsets: torch.Tensor,
+        recv_x: torch.Tensor,
+        recv_topk_idx: torch.Tensor,
+        recv_topk_weights: Optional[torch.Tensor],
+        recv_src_global: torch.Tensor,
+        layout: dict,
+        max_batches: int,
+        num_max_tokens_per_rank: int,
+        has_topk_weight: bool,
+        uccl_include_path: str = "",
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        if self._v2_efa_window is None:
+            raise RuntimeError("native V2 EFA window is not initialized")
+        _require_cuda_contiguous(batch_counts, "batch_counts")
+        _require_cuda_contiguous(batch_offsets, "batch_offsets")
+        _require_cuda_contiguous(recv_x, "recv_x")
+        _require_cuda_contiguous(recv_topk_idx, "recv_topk_idx")
+        _require_cuda_contiguous(recv_src_global, "recv_src_global")
+        if recv_topk_weights is not None:
+            _require_cuda_contiguous(recv_topk_weights, "recv_topk_weights")
+        if batch_counts.dtype != torch.int32 or batch_offsets.dtype != torch.int32:
+            raise TypeError("batch_counts and batch_offsets must be torch.int32")
+        if recv_topk_idx.dtype != torch.int64:
+            raise TypeError("recv_topk_idx must be torch.int64")
+        if recv_src_global.dtype != torch.int32:
+            raise TypeError("recv_src_global must be torch.int32")
+        if recv_topk_weights is not None and recv_topk_weights.dtype != torch.float32:
+            raise TypeError("recv_topk_weights must be torch.float32")
+        if not uccl_include_path:
+            uccl_include_path = str(Path(__file__).resolve().parents[3] / "include")
+        self.runtime.launch_dispatch_materialize_records(
+            int(self._v2_efa_window.data_ptr()),
+            int(batch_counts.data_ptr()),
+            int(batch_offsets.data_ptr()),
+            int(recv_x.data_ptr()),
+            int(recv_topk_idx.data_ptr()),
+            0 if recv_topk_weights is None else int(recv_topk_weights.data_ptr()),
+            int(recv_src_global.data_ptr()),
+            int(max_batches),
+            int(num_max_tokens_per_rank),
+            int(layout.get("local_payload_base", 0)),
+            int(layout["remote_payload_base"]),
+            int(layout["remote_signal_base"]),
+            int(layout["src_token_stride"]),
+            int(layout["expanded_slot_stride"]),
+            int(layout["batch_payload_stride"]),
+            int(layout["source_rank_stride"]),
+            int(layout["source_signal_stride"]),
+            int(layout["token_record_bytes"]),
+            int(layout.get("record_payload_offset", 0)),
+            int(layout["record_src_global_offset"]),
+            int(layout["record_topk_idx_offset"]),
+            int(layout.get("record_topk_weight_offset", 0)),
+            int(layout.get("record_topk_weight_bytes", 0)),
+            int(layout.get("signal_stride", 4)),
+            bool(has_topk_weight),
+            str(uccl_include_path),
+            _cuda_stream_ptr(stream),
+        )
+
     def launch_combine_enqueue_d2h(
         self,
         segments: torch.Tensor,
