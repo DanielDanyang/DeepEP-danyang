@@ -503,13 +503,15 @@ __global__ void v2_efa_dispatch_signal_offsets_kernel(
     const uint8_t* window, int32_t* batch_counts, int32_t* batch_offsets,
     int32_t* recv_counts_per_rank, int32_t* total_recv_tokens,
     int num_sources, int max_batches, DispatchTransferLayout layout) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
+  if (blockIdx.x != 0) {
     return;
   }
   (void)kInstance;
 
-  int running = 0;
-  for (int source = 0; source < num_sources; ++source) {
+  const int tid = static_cast<int>(threadIdx.x);
+  const int stride = static_cast<int>(blockDim.x);
+
+  for (int source = tid; source < num_sources; source += stride) {
     const uint64_t done_offset =
         layout.remote_signal_base +
         static_cast<uint64_t>(source) * layout.source_signal_stride +
@@ -559,14 +561,27 @@ __global__ void v2_efa_dispatch_signal_offsets_kernel(
       batch_counts[idx] = count;
       batch_offsets[idx] = -1;
       if (count > 0) {
-        batch_offsets[idx] = running;
-        running += count;
         source_total += count;
       }
     }
     recv_counts_per_rank[source] = source_total;
   }
-  total_recv_tokens[0] = running;
+  __syncthreads();
+
+  if (tid == 0) {
+    int running = 0;
+    for (int source = 0; source < num_sources; ++source) {
+      for (int batch = 0; batch < max_batches; ++batch) {
+        const int idx = source * max_batches + batch;
+        const int count = batch_counts[idx];
+        if (count > 0) {
+          batch_offsets[idx] = running;
+          running += count;
+        }
+      }
+    }
+    total_recv_tokens[0] = running;
+  }
 }
 
 template <int kNumTopk, int kHiddenBytes>

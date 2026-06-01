@@ -2617,3 +2617,38 @@ README 风格 EP8x2 性能：
     现在更大的问题仍然是 staging/window layout 和 descriptor/materialize 路径：
     当前临时 record window 按 `world_size * tokens * topk` 为每个 source 预留空间，
     在 README-size `topk=8` 时会膨胀到每 rank 十几 GB，不是最终 native V2 layout。
+
+## 2026-06-01 dispatch 主路径轻量化
+
+- 删除 payload receive window 的整区清零：
+  - receiver 有效数据完全由 per-source/per-expert count signal 决定；
+  - stale payload 不会被读取；
+  - 每轮只清 `remote_signal_base` 后的 signal table 和 done slot。
+- 并行化 signal/count 等待：
+  - `v2_efa_dispatch_signal_offsets_kernel` 不再只用 thread0 等所有 source；
+  - block 内线程按 source 并行等待 done，并等待该 source 的 count table 总和达到
+    done 携带的 expected count；
+  - 每个 source 线程写 `batch_counts` 和 `recv_counts_per_rank`；
+  - thread0 最后按 source/batch 顺序做 prefix，保持 `batch_offsets` 和
+    `total_recv_tokens` 的确定性。
+- 这两个改动都在当前 dispatch 主路径内，不引入 reference、fallback、overlay 或
+  host-side semantic all-to-all。
+- 服务器验证：
+  - EP16 `--lanes 2` correctness 通过；
+  - `experts=256 topk=8 tokens=1024 hidden=1024 lanes=2`：
+    `avg_us=9990.26 payload_GBps=1.68`，
+    `stage_and_pre_barrier_ms=1.36`，
+    `descriptor_enqueue_ms=3.77`，
+    `completion_wait_ms=0.55`，
+    `signal_offsets_ms=0.94`，
+    `materialize_records_ms=0.86`；
+  - README-size `tokens=8192 hidden=7168 topk=1 experts=16 lanes=2`：
+    `avg_us=17740.73 payload_GBps=6.62`，
+    `descriptor_enqueue_ms=3.61`，
+    `completion_wait_ms=5.34`，
+    `signal_offsets_ms=0.14`，
+    `materialize_records_ms=1.90`。
+- 结论：
+  - payload 清零和 signal 等待不是最大项；
+  - 下一步必须拆掉当前 record staging/materialize 架构，并让 descriptor 构造不再按
+    `experts * tokens * topk` 扫描。

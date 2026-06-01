@@ -491,15 +491,9 @@ class ElasticBuffer:
     def _clear_dispatch_receive_window(self, layout: dict) -> None:
         if self._v2_efa_window is None:
             return
-        remote_payload_base = int(layout["remote_payload_base"])
-        remote_payload_bytes = int(layout["remote_payload_bytes"])
         remote_signal_base = int(layout["remote_signal_base"])
         signal_bytes = int(self.num_ranks) * int(layout["source_signal_stride"])
-        window = self._require_v2_efa_window(
-            max(remote_payload_base + remote_payload_bytes,
-                remote_signal_base + signal_bytes)
-        )
-        window[remote_payload_base: remote_payload_base + remote_payload_bytes].zero_()
+        window = self._require_v2_efa_window(remote_signal_base + signal_bytes)
         window[remote_signal_base: remote_signal_base + signal_bytes].zero_()
 
     def _stage_dispatch_records_to_v2_window(
