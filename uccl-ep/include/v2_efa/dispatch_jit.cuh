@@ -555,6 +555,9 @@ __global__ void v2_efa_dispatch_signal_offsets_kernel(
     }
   }
   __syncthreads();
+#if defined(__CUDA_ARCH__)
+  __threadfence_system();
+#endif
 
   for (int linear = tid; linear < num_sources * max_batches;
        linear += stride) {

@@ -2357,3 +2357,17 @@ README 风格 EP8x2 性能：
   - EP16 small bench timing，重点看 `post_barrier_ms` 是否为 0、
     `completion_wait_ms` 是否下降、`signal_offsets_ms` 是否没有因 spin wait 异常增大；
   - 再跑 README-size dispatch-only bench。
+
+## 2026-06-01 done signal review 修正
+
+- review 指出 done signal offset 必须和 Python window layout 的 `max_batches`
+  完全一致，否则会把 done word 写到 signal row 之外。
+- 当前分支里 `max_expert_batches()` 已经被收紧成 `num_experts`，所以 review
+  描述的 `num_experts * world_size` 越界在现有代码中不会触发；但该 helper 名字
+  容易被未来改回 worst-case 语义，确实不该作为 done slot index 的来源。
+- 已将三个 C++ dispatch launch path 的 `layout.max_batches` 显式改为
+  `cfg.num_experts`，和 Python `_launch_native_dispatch_transport()` /
+  `_make_dispatch_window_layout()` 的 `max_batches = self.num_experts` 对齐。
+- 在 receiver signal kernel 中，done-spin 结束后、读取 batch count table 前加入
+  `__threadfence_system()`，避免只靠 block barrier 处理 NIC 写入的系统可见性。
+- 本地检查通过；仍未服务器验证，因为服务器有其他用户任务。

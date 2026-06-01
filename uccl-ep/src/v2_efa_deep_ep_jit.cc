@@ -512,8 +512,7 @@ void V2EfaRuntime::launch_dispatch_enqueue_d2h(
   layout.num_scaleup_ranks = static_cast<uint32_t>(cfg.num_scaleup_ranks);
   layout.num_ranks = static_cast<uint32_t>(cfg.world_size);
   layout.source_rank = static_cast<uint32_t>(cfg.rank);
-  layout.max_batches = static_cast<uint32_t>(max_expert_batches(
-      cfg.num_experts, cfg.num_scaleout_ranks, cfg.num_scaleup_ranks));
+  layout.max_batches = static_cast<uint32_t>(cfg.num_experts);
   const auto plan = build_dispatch_enqueue_d2h_jit_plan(uccl_include_path);
   launch_v2_efa_dispatch_enqueue_d2h_plan(
       plan, segments_ptr, batches_ptr, num_batches, commands_ptr, head_ptr,
@@ -546,8 +545,7 @@ void V2EfaRuntime::launch_dispatch_descriptor_enqueue_d2h(
   layout.num_scaleup_ranks = static_cast<uint32_t>(cfg.num_scaleup_ranks);
   layout.num_ranks = static_cast<uint32_t>(cfg.world_size);
   layout.source_rank = static_cast<uint32_t>(cfg.rank);
-  layout.max_batches = static_cast<uint32_t>(max_expert_batches(
-      cfg.num_experts, cfg.num_scaleout_ranks, cfg.num_scaleup_ranks));
+  layout.max_batches = static_cast<uint32_t>(cfg.num_experts);
   const auto plan = build_dispatch_descriptor_enqueue_d2h_jit_plan(
       num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
       has_topk_weight, cached_mode, deterministic, do_cpu_sync, smem_bytes,
@@ -576,8 +574,7 @@ void V2EfaRuntime::launch_dispatch_direct_enqueue_d2h(
   layout.num_scaleup_ranks = static_cast<uint32_t>(cfg.num_scaleup_ranks);
   layout.num_ranks = static_cast<uint32_t>(cfg.world_size);
   layout.source_rank = static_cast<uint32_t>(cfg.rank);
-  layout.max_batches = static_cast<uint32_t>(max_expert_batches(
-      cfg.num_experts, cfg.num_scaleout_ranks, cfg.num_scaleup_ranks));
+  layout.max_batches = static_cast<uint32_t>(cfg.num_experts);
   const auto plan = build_dispatch_direct_enqueue_d2h_jit_plan(
       num_max_tokens_per_rank, num_channels_per_sm, scale_bytes,
       has_topk_weight, cached_mode, deterministic, do_cpu_sync, smem_bytes,
