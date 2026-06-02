@@ -2728,3 +2728,200 @@ README 风格 EP8x2 性能：
     `sglang::scheduler_TP*` GPU 进程，按 AGENTS 约束立即停止所有服务器操作；
   - 因此 signal-only CQE 改动当前是未验证状态，恢复验证时第一步应跑
     EP16 remote-pair correctness。
+- 之后再次同步并 build 了当前 signal-only CQE + EFA device name lifetime 修复：
+  - p5en_0 `make -j8 && make install` 通过；
+  - `ep.abi3.so` 已复制到 p5en_1 venv；
+  - 准备跑 correctness 前复查 GPU，发现两台机器均有
+    `/home/ubuntu/efs/xingyu/p16/.venv/bin/python -m sglang.launch_server`
+    双机任务；
+  - 按 AGENTS 约束未继续跑 correctness/bench，未 kill/打断该任务。
+
+## 2026-06-02 阶段 0/1/2 本地推进
+
+- 用户要求完成 `uccl-ep/PLAN.md` 中阶段 0、1、2。
+- 先复查两台服务器占用：
+  - `p5en_0` 和 `p5en_1` 均有
+    `/home/ubuntu/efs/xingyu/p16/.venv/bin/python -m sglang.launch_server`
+    双机任务；
+  - 按 AGENTS 约束立即停止所有服务器 build、correctness、benchmark、profiling；
+  - 本轮只做本地代码修改，未在服务器运行测试。
+- 本地完成的阶段 0/协议修复：
+  - `V2TransferCmd` 保持 16B，但 signal command 新增 `kSignal64` flag；
+  - 4-byte scaffold count/done signal 继续写 4 字节，避免覆盖 signal table；
+  - 8-byte streaming tail 可通过同一 command 写完整
+    `math::pack2<int, int64_t>(finish_or_epoch, tail_count)`；
+  - `EfaPostOp` 和 verbs signal scratch 改为承载 `uint64_t signal_value`；
+  - verbs sink 按 command flag 决定 signal write 长度，payload 仍 unsignaled、
+    signal signaled。
+- 本地完成的阶段 1 相关主路径修正：
+  - dispatch payload/signal command helper 不再用 `expert_id % num_efa_lanes`
+    选 lane；
+  - scaffold 下统一使用 `layout.efa_lane`，真正 fork `hybrid_dispatch.cuh`
+    时应由 `channel_idx % num_efa_lanes` 写入；
+  - 这消除了继续按 expert lane 生成 command 的错误方向。
+- 本地完成的阶段 2 scaffold：
+  - `V2EfaConnection` 新增 C++ persistent proxy API：
+    `start_proxy(queues, coalesce, ack_after_drain, num_threads)`、
+    `stop_proxy()`、`proxy_stats()`；
+  - 后台线程持续 drain `V2MappedD2HQueue`、post EFA verbs、poll signaled CQE；
+  - 手动 drain 与后台 drain 共用同一个 verbs sink 主路径；
+  - 当前为了 correctness 保守使用 sink/CQ mutex，后续性能版应拆成 per-lane
+    endpoint/sink 或更细粒度 locking。
+- 本地轻量检查：
+  - `python3 -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+    通过；
+  - `git diff --check` 通过。
+- 尚未完成/未验证：
+  - 阶段 0 的 EP16 correctness 和 README-size bench 仍因服务器占用未跑；
+  - 阶段 1 的真正 `hybrid_dispatch.cuh` fork 尚未完成，当前只是修正 command
+    协议和 scaffold lane 语义；
+  - persistent proxy 尚未服务器 build/correctness 验证。
+
+## 2026-06-02 review 后阶段 0/1/2 验证
+
+- 阅读外部 review，结论：
+  - `sq_sig_all=1` 但只按 signal 数量维护 outstanding CQE 的问题成立；
+    这会过早 reset signal scratch，并且 CQ 可能堆满 payload CQE。
+  - device-side `encode_v2_transfer_offset()` 溢出保护在 GPU 端被裁掉的问题成立；
+    已改为 device 端 `trap`、host 端 throw。
+  - Phase 1 tail 需要 64-bit signal write 的判断成立；已用
+    `V2TransferCmdFlags::kSignal64` 和 `make_v2_dispatch_tail_cmd()` 表达。
+  - `open_device()` / no-arg `create_srd_qp()` / no-lane `create_ah()` 是旧死代码；
+    已删除，避免未来 refactor 时出现 single-object 与 lane-vector 双清理风险。
+- 在服务器上实测过 `sq_sig_all=0 + signal-only CQE`：
+  - p5en_0 build 通过，双机 EP2 dispatch correctness 运行时失败；
+  - 错误为 `ibv_wr_complete failed for V2 EFA write: ret=22 errno=11
+    (Resource temporarily unavailable)`；
+  - 因此 p5en 当前 EFA SRD extended verbs path 不能直接走 unsignaled payload
+    write + signaled signal write。
+- 采用阶段 0 当前主路径：
+  - QP 继续 `sq_sig_all=1`；
+  - `V2EfaVerbsPostSink` 对 payload write 和 signal write 都累加
+    `posted_completions`；
+  - `V2EfaConnection` 的 outstanding counter 改按 `posted_completions`
+    增减，scratch reset 等待全部 CQE poll 完。
+- 服务器验证：
+  - p5en_0 / p5en_1 均无用户 GPU 任务后，同步代码到 EFS；
+  - p5en_0 `uccl-ep make -j8 && make install` 通过；
+  - `ep.abi3.so` 复制到 p5en_1 venv；
+  - 两机 import/ABI 检查通过：
+    `__native_v2_rewrite__=True`、`__native_v2_ready__=False`，
+    `V2EfaConnection` 暴露 `drain_queue/poll_completions/start_proxy/stop_proxy/proxy_stats`。
+- 双机 EP2 最小 dispatch correctness 通过：
+  - 命令：`torch.distributed.run --nnodes=2 --nproc_per_node=1
+    uccl-ep/tests/v2_efa_dispatch_correctness.py --tokens 8 --hidden 16
+    --experts 2 --sms 8 --lanes 1 --remote-pair`
+  - rank0 输出：
+    `dispatch_correctness_ok EP2 tokens=8 hidden=16 remote_pair=True
+    device=rdmap85s0 stats={'drained_commands': 4, 'posted_writes': 1,
+    'posted_signals': 3, 'posted_completions': 4, 'posted_bytes': 524,
+    'head': 4, 'tail': 4}`。
+- 当前诚实状态：
+  - 阶段 0 最小 correctness 已验证；EP16 correctness / README-size bench 仍需继续跑。
+  - 阶段 2 persistent proxy API 已编译并暴露，但 dispatch 主路径仍用同步
+    `drain_queue`，尚未以 proxy 线程跑 correctness。
+  - 阶段 1 真正 fork `hybrid_dispatch.cuh` 尚未完成；现有 dispatch 仍是 scaffold
+    window/materialize 路径，不能把 EP2 correctness 视为 90 GB/s native V2 路径。
+- 尝试继续跑 EP16 correctness 前再次检查服务器：
+  - p5en_0 / p5en_1 出现 `/home/ubuntu/efs/xingyu/p16/.venv/bin/python
+    -m sglang.launch_server` 双机任务；
+  - `nvidia-smi --query-compute-apps` 显示两台各 8 张 H200 均被
+    `sglang::scheduler_DP*_TP*_EP*` 占用，单卡约 127GB；
+  - 按 AGENTS 约束立即停止所有服务器 correctness/benchmark/profiling 操作；
+    未重启 EP16 测试，未 kill/打断该任务。
+
+## 2026-06-02 阶段 0/1/2 本地代码补齐（未跑服务器，未 commit）
+
+- 用户要求先完成阶段 0/1/2 的代码，暂时不跑、不 commit。
+- 阶段 0 代码状态：
+  - 保持 EFA SRD `sq_sig_all=1`；
+  - `posted_completions` 表示所有会进入 CQ 的 WR，payload/signal 都计入；
+  - Python 等待逻辑支持 proxy 线程先消费 CQE 的情况，通过
+    `V2EfaConnection.outstanding_completions()` 等 outstanding 归零。
+- 阶段 1 native hybrid dispatch 代码状态：
+  - `V2TransferCmd` 仍保持 16B，新增 `kWorkspace` flag；
+  - `EfaPostOp` 新增 `EfaMemoryRegion::{kBuffer,kWorkspace}`；
+  - verbs sink 支持 main buffer MR 与 workspace MR 两个 region；
+  - workspace command 必须有 workspace MR，否则直接报错，避免 tail/notify
+    静默落错 buffer；
+  - `V2EfaConnection` 构造函数增加可选 `workspace_addr/workspace_bytes`，
+    `local_info()` / `connect()` 会交换 per-lane workspace rkey；
+  - Python `init_native_v2_efa_transport()` 默认分配官方 V2 shape 的
+    workspace tensor，并随 buffer 一起注册；
+  - `dispatch_jit.cuh` 新增 device-side native shims：
+    `enqueue_native_dispatch_workspace_write()`、
+    `enqueue_native_dispatch_payload()`、
+    `enqueue_native_dispatch_tail()`，直接按 pointer - region_base 生成
+    buffer/workspace-relative `V2TransferCmd`；
+  - 已复制官方 V2 `deep_ep/include/deep_ep/impls/hybrid_dispatch.cuh` 为
+    `uccl-ep/include/v2_efa/hybrid_dispatch_native.cuh`；
+  - fork 中全部 `ncclTeamTagRail` call site 已替换：
+    notify rank_count / expert_count → workspace RDMA write command；
+    payload → buffer RDMA write command；
+    tail `red_add_rel` → workspace tail absolute write command；
+  - fork 中 `ncclTeamTagLsa` scaleup/NVLink 逻辑保持官方 V2 代码；
+  - 开头 scaleout GPU barrier 已从 fork 中移除，结尾 scaleup-only barrier 保留；
+  - 新增 `V2EfaRuntime.launch_native_hybrid_dispatch()`；
+  - 新增官方 V2 `dispatch_copy_epilogue` 的 JIT plan 和
+    `V2EfaRuntime.launch_dispatch_copy_epilogue()`；
+  - Python `ElasticBuffer.dispatch()` 已改为要求真实
+    `dev_comm/window/buffer/workspace/mapped_host_workspace` resource；缺失时直接
+    报错，不再把 scaffold/materialize 当生产 fallback。
+- 阶段 2 代码状态：
+  - native hybrid dispatch launch 前启动 C++ proxy，使 GPU kernel 等 tail 时
+    CPU proxy 已经并发 drain D2H FIFO；
+  - native epilogue launch 后同步 stream，再停止 proxy；
+  - 当前 Python 主路径先接单 queue；C++ API 已支持多 queue，后续可按
+    `channel_idx % num_fifo_queues` 扩展为 4 queue / 4 proxy threads。
+- 本地检查：
+  - `python3 -m py_compile uccl-ep/deep_ep_v2_wrapper/deep_ep/buffers/elastic.py`
+    通过；
+  - `git diff --check` 通过。
+  - 本机无 `nvcc`，无法在本地编译 CUDA/JIT 扩展；未做 C++ build。
+- 尚未做：
+  - 未上服务器 build/install；
+  - 未跑 EP16 correctness/bench；
+  - 未 commit；
+  - 需要在服务器暴露/传入官方 DeepEP V2 resource 指针；
+  - `do_cpu_sync=True` 精确长度路径仍需要 host workspace reader；当前 native
+    Python 主路径先支持 `do_cpu_sync=False` worst-case allocation。
+
+## 2026-06-02 review 修复与服务器 JIT 验证
+
+- 处理外部 review：
+  - `make_v2_dispatch_signal_cmd()` 4B signal 对当前 native tail 路径不成立：
+    native fork 使用 `make_v2_dispatch_tail_cmd()`，该路径已是 8B
+    `workspace` signal write；旧 scaffold signal 不再是生产 dispatch 主路径。
+  - `encode_v2_transfer_offset()` 的 device 侧溢出检查当前已经会 `trap`，
+    不存在静默截断；继续保留该保护。
+  - raw pointer 注册路径修复：如果调用者只传 `window_addr` 而没有
+    `workspace` tensor/`workspace_addr`，现在直接报错，避免在默认 `cuda`
+    设备上偷偷分配 workspace。
+  - `native_v2_regions()` 修复为 raw pointer 路径也返回注册地址/大小。
+  - CQ accounting review 是未来 `sq_sig_all=0` 的潜在问题；当前 p5en
+    主路径明确保持 `sq_sig_all=1`，所以 payload write 也会产生 CQE。
+    已在 `verbs_sink.hpp` 写明 `posted_completions` 的语义，避免未来半切换。
+- 额外发现并修复 native fork 的 EP8 x 2 rank 映射问题：
+  - 官方 Rail GIN target 是 scaleout rank；
+  - CPU EFA endpoint table 是全局 rank；
+  - native fork 中 notify/payload/tail target 已改为
+    `dst_scaleout_rank * kNumScaleupRanks + scaleup_rank_idx`。
+- 服务器操作：
+  - 上服务器前检查 p5en_0/p5en_1：`nvidia-smi --query-compute-apps`
+    均无 GPU compute app；未发现他人 GPU 任务。
+  - 同步代码到 `/home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/`。
+  - p5en_0 `uccl-ep make -j8` 通过。
+  - p5en_0 / p5en_1 `make install` 均安装新 `ep.abi3.so` 到
+    `/home/ubuntu/.venvs/deepep-danyang-cu13/lib/python3.12/site-packages/uccl/`。
+  - p5en_1 import 检查通过：
+    `V2EfaRuntime.launch_native_hybrid_dispatch` 和
+    `launch_dispatch_copy_epilogue` 均存在。
+  - p5en_0 native hybrid JIT compile 通过：
+    EP16-like config
+    `world=16, scaleout=2, scaleup=8, experts=256, topk=8, hidden=7168,
+    elem_bytes=1, sms=20, max_tokens=8192`；
+    输出 `compiled v2_efa_native_hybrid_dispatch 192 20`。
+- 当前仍未做真实性能/正确性：
+  - native dispatch correctness 还需要官方 DeepEP V2 resource binding 暴露
+    `dev_comm/window/buffer/workspace/mapped_host_workspace` 后才能端到端跑。
+  - 本次服务器验证覆盖 build/install/API/JIT compile，不覆盖 EP16 BW。

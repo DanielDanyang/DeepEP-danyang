@@ -21,6 +21,28 @@ _NATIVE_V2_REWRITE_MESSAGE = (
 )
 
 
+def _native_workspace_bytes() -> int:
+    # Mirrors deep_ep/common/layout.cuh::WorkspaceLayout::get_num_bytes(),
+    # aligned like csrc/elastic/buffer.hpp so the future native fork sees the
+    # same workspace shape as upstream DeepEP V2.
+    max_ranks = 1024
+    max_experts = 2048
+    max_channels = 1024
+    max_inflight_agrs = 32
+    num_bytes = 16
+    num_bytes += (max_ranks + max_experts) * 8
+    num_bytes += max_ranks * 8 * 2
+    num_bytes += max_experts * 8 * 2
+    num_bytes += max_ranks * 4
+    num_bytes += max_ranks * 4 * 2
+    num_bytes += max_experts * 4 * 2
+    num_bytes += max_ranks * max_channels * 8
+    num_bytes += max_ranks * max_channels * 4
+    num_bytes += 2 * 2 * 8
+    num_bytes += (max_inflight_agrs + 1) * max_ranks * 4
+    return _align(num_bytes, 2 << 20)
+
+
 @dataclass
 class EPHandle:
     """DeepEP V2 dispatch handle shape.
@@ -141,9 +163,14 @@ class ElasticBuffer:
         self.allow_multiple_reduction = bool(allow_multiple_reduction)
         self.prefer_overlap_with_compute = bool(prefer_overlap_with_compute)
         self._v2_efa_window: Optional[torch.Tensor] = None
+        self._v2_efa_workspace: Optional[torch.Tensor] = None
         self._v2_efa_connection = None
+        self._v2_efa_window_addr = 0
         self._v2_efa_window_bytes = 0
+        self._v2_efa_workspace_addr = 0
+        self._v2_efa_workspace_bytes = 0
         self._v2_efa_num_lanes = 1
+        self._native_v2_resources: Optional[dict] = None
 
     def _make_runtime(
         self,
@@ -256,6 +283,56 @@ class ElasticBuffer:
         tokens = self.num_max_tokens_per_rank if num_max_tokens_per_rank is None else int(num_max_tokens_per_rank)
         return self.runtime.workspace_plan(tokens)
 
+    def init_native_v2_deep_ep_resources(
+        self,
+        *,
+        nccl_dev_comm_ptr: int,
+        nccl_window_ptr: int,
+        buffer_ptr: int,
+        buffer_bytes: int,
+        workspace_ptr: int,
+        workspace_bytes: int,
+        mapped_host_workspace_ptr: int,
+        host_workspace_ptr: int = 0,
+    ) -> None:
+        resources = {
+            "nccl_dev_comm_ptr": int(nccl_dev_comm_ptr),
+            "nccl_window_ptr": int(nccl_window_ptr),
+            "buffer_ptr": int(buffer_ptr),
+            "buffer_bytes": int(buffer_bytes),
+            "workspace_ptr": int(workspace_ptr),
+            "workspace_bytes": int(workspace_bytes),
+            "mapped_host_workspace_ptr": int(mapped_host_workspace_ptr),
+            "host_workspace_ptr": int(host_workspace_ptr),
+        }
+        missing = [
+            name for name, value in resources.items()
+            if value <= 0 and name != "host_workspace_ptr"
+        ]
+        if missing:
+            raise ValueError(f"native V2 DeepEP resources contain null fields: {missing}")
+        self._native_v2_resources = resources
+
+    def _native_num_channels_per_sm(
+        self,
+        hidden_bytes: int,
+        sf_bytes: int,
+        num_topk: int,
+        smem_bytes: int = 228 * 1024,
+    ) -> int:
+        notify_smem = 0
+        if self.num_scaleout_ranks > 1:
+            notify_smem = _align(self.num_ranks + self.num_experts, 4 * 32) * 4
+        token_bytes = _v2_token_layout_bytes(hidden_bytes, sf_bytes, num_topk)
+        channels = min(
+            max(1, (int(smem_bytes) - notify_smem) // max(1, token_bytes)),
+            32 - 4,
+        )
+        channels = min(max(1, channels // 2), 8)
+        if self.num_scaleup_ranks > 1:
+            channels = min(channels, 4)
+        return max(1, int(channels))
+
     def route_expert(self, expert_id: int):
         return self.runtime.route_expert(int(expert_id))
 
@@ -367,7 +444,11 @@ class ElasticBuffer:
     def init_native_v2_efa_transport(
         self,
         window: Optional[torch.Tensor] = None,
+        workspace: Optional[torch.Tensor] = None,
+        window_addr: int = 0,
+        workspace_addr: int = 0,
         num_bytes: Optional[int] = None,
+        workspace_bytes: Optional[int] = None,
         num_lanes: int = 1,
         device_index: int = -1,
         signal_capacity: int = 65536,
@@ -381,13 +462,44 @@ class ElasticBuffer:
 
         if not hasattr(ep, "V2EfaConnection"):
             raise RuntimeError("uccl.ep was built without V2 EFA verbs connection support")
-        if window is None:
+        if window is None and int(window_addr) == 0:
             bytes_to_alloc = int(self.num_bytes if num_bytes is None else num_bytes)
             window = torch.empty((bytes_to_alloc,), dtype=torch.uint8, device="cuda")
-        _require_cuda_contiguous(window, "window")
-        bytes_in_window = int(window.numel() * window.element_size())
+        if window is not None:
+            _require_cuda_contiguous(window, "window")
+            window_addr = int(window.data_ptr())
+            bytes_in_window = int(window.numel() * window.element_size())
+        else:
+            if num_bytes is None:
+                raise ValueError("num_bytes is required when window_addr is provided")
+            bytes_in_window = int(num_bytes)
         if num_bytes is not None and int(num_bytes) > bytes_in_window:
             raise ValueError("num_bytes exceeds the provided V2 EFA window")
+        if window is None and int(workspace_addr) == 0 and workspace is None:
+            raise ValueError(
+                "workspace tensor or workspace_addr is required when window_addr "
+                "is provided as a raw pointer"
+            )
+        if workspace is None and int(workspace_addr) == 0:
+            workspace_alloc_bytes = int(
+                _native_workspace_bytes()
+                if workspace_bytes is None else workspace_bytes
+            )
+            workspace = torch.empty(
+                (workspace_alloc_bytes,), dtype=torch.uint8,
+                device=("cuda" if window is None else window.device)
+            )
+            workspace.zero_()
+        if workspace is not None:
+            _require_cuda_contiguous(workspace, "workspace")
+            workspace_addr = int(workspace.data_ptr())
+            bytes_in_workspace = int(workspace.numel() * workspace.element_size())
+            if workspace_bytes is not None and int(workspace_bytes) > bytes_in_workspace:
+                raise ValueError("workspace_bytes exceeds the provided V2 EFA workspace")
+        else:
+            if int(workspace_addr) != 0 and workspace_bytes is None:
+                raise ValueError("workspace_bytes is required when workspace_addr is provided")
+            bytes_in_workspace = int(0 if workspace_bytes is None else workspace_bytes)
         if device_index < 0 and "UCCL_V2_EFA_DEVICE_INDEX" not in os.environ:
             local_rank = int(os.environ.get("LOCAL_RANK", self.scaleup_rank_idx))
             efa_stride = int(os.environ.get("UCCL_V2_EFA_DEVICE_STRIDE", "2"))
@@ -395,21 +507,33 @@ class ElasticBuffer:
             device_index = efa_offset + local_rank * max(1, efa_stride)
 
         connection = ep.V2EfaConnection(
-            int(window.data_ptr()),
+            int(window_addr),
             int(bytes_in_window if num_bytes is None else num_bytes),
             int(self.num_ranks),
             int(self.rank_idx),
             int(max(1, num_lanes)),
             int(device_index),
             int(signal_capacity),
+            int(workspace_addr),
+            int(0 if workspace is None else (
+                bytes_in_workspace if workspace_bytes is None else workspace_bytes
+            )),
         )
         local_info = connection.local_info()
         all_infos = [None for _ in range(self.num_ranks)]
         dist.all_gather_object(all_infos, local_info, group=self.group)
         connection.connect(all_infos)
         self._v2_efa_window = window
+        self._v2_efa_workspace = workspace
         self._v2_efa_connection = connection
+        self._v2_efa_window_addr = int(window_addr)
         self._v2_efa_window_bytes = int(bytes_in_window if num_bytes is None else num_bytes)
+        self._v2_efa_workspace_addr = int(workspace_addr)
+        self._v2_efa_workspace_bytes = int(
+            0 if workspace is None else (
+                bytes_in_workspace if workspace_bytes is None else workspace_bytes
+            )
+        )
         self._v2_efa_num_lanes = int(max(1, num_lanes))
         return local_info
 
@@ -492,6 +616,16 @@ class ElasticBuffer:
     def has_native_v2_efa_transport(self) -> bool:
         return self._v2_efa_connection is not None
 
+    def native_v2_regions(self) -> dict:
+        if self._v2_efa_window_addr == 0:
+            return {}
+        return {
+            "buffer_ptr": int(self._v2_efa_window_addr),
+            "buffer_bytes": int(self._v2_efa_window_bytes),
+            "workspace_ptr": int(self._v2_efa_workspace_addr),
+            "workspace_bytes": int(self._v2_efa_workspace_bytes),
+        }
+
     def drain_native_v2_dispatch_transport(
         self,
         handle: EPHandle,
@@ -521,6 +655,65 @@ class ElasticBuffer:
         return self._v2_efa_connection.drain_queue(
             transport.combine_d2h_queue, bool(coalesce), bool(ack_after_drain)
         )
+
+    def start_native_v2_proxy(
+        self,
+        queues,
+        coalesce: bool = True,
+        ack_after_drain: bool = True,
+        num_threads: int = 1,
+    ):
+        if self._v2_efa_connection is None:
+            raise RuntimeError("native V2 EFA transport has not been initialized")
+        self._v2_efa_connection.start_proxy(
+            list(queues), bool(coalesce), bool(ack_after_drain), int(num_threads)
+        )
+
+    def stop_native_v2_proxy(self):
+        if self._v2_efa_connection is not None:
+            self._v2_efa_connection.stop_proxy()
+
+    def native_v2_proxy_stats(self):
+        if self._v2_efa_connection is None:
+            return None
+        return self._v2_efa_connection.proxy_stats()
+
+    def _drain_native_v2_queue_with_proxy(self, queue, expected_commands: int) -> dict:
+        if self._v2_efa_connection is None:
+            raise RuntimeError("native V2 EFA transport has not been initialized")
+        before = self._v2_efa_connection.proxy_stats()
+        before_drained = int(before.get("drained_commands", 0))
+        before_writes = int(before.get("posted_writes", 0))
+        before_signals = int(before.get("posted_signals", 0))
+        before_completions = int(before.get("posted_completions", 0))
+        before_bytes = int(before.get("posted_bytes", 0))
+        num_threads = max(1, min(int(self._v2_efa_num_lanes), 4))
+        self._v2_efa_connection.start_proxy([queue], True, True, num_threads)
+        deadline = time.perf_counter() + 5.0
+        stats = before
+        while time.perf_counter() < deadline:
+            stats = self._v2_efa_connection.proxy_stats()
+            if int(stats.get("drained_commands", 0)) - before_drained >= int(expected_commands):
+                break
+            time.sleep(0)
+        else:
+            self._v2_efa_connection.stop_proxy()
+            raise TimeoutError(
+                f"timed out waiting for native V2 proxy to drain {expected_commands} commands"
+            )
+        # Let the proxy thread observe and poll the CQEs it just generated.
+        self._v2_efa_connection.stop_proxy()
+        after = self._v2_efa_connection.proxy_stats()
+        return {
+            "drained_commands": int(after.get("drained_commands", 0)) - before_drained,
+            "posted_writes": int(after.get("posted_writes", 0)) - before_writes,
+            "posted_signals": int(after.get("posted_signals", 0)) - before_signals,
+            "posted_completions": int(after.get("posted_completions", 0)) - before_completions,
+            "posted_bytes": int(after.get("posted_bytes", 0)) - before_bytes,
+            "head": int(queue.head()),
+            "tail": int(queue.tail()),
+            "proxy_threads": num_threads,
+        }
 
     def launch_dispatch_descriptor_enqueue_d2h_queue(
         self,
@@ -1053,100 +1246,250 @@ class ElasticBuffer:
         do_cpu_sync = True if do_cpu_sync is None else bool(do_cpu_sync)
         num_sms = int(num_sms or self.get_theoretical_num_sms(num_experts, num_topk))
         elem_bytes = int(x_tensor.element_size())
-        payload_bytes = int(hidden * elem_bytes)
         scale_bytes = 0 if sf is None else int(sf.shape[1] * sf.element_size())
         self.configure_native_v2(num_experts, num_topk, hidden, elem_bytes, num_sms)
 
-        transport = self._launch_native_dispatch_transport(
+        if self._native_v2_resources is None:
+            raise RuntimeError(
+                "native V2 dispatch requires init_native_v2_deep_ep_resources(); "
+                "the old scaffold/materialize dispatch path is not a production fallback"
+            )
+
+        return self._dispatch_native_hybrid(
             x_tensor=x_tensor,
+            sf=sf,
             topk_idx=topk_idx,
             topk_weights=topk_weights,
+            cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
             num_tokens=num_tokens,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
-            payload_bytes=payload_bytes,
             scale_bytes=scale_bytes,
-            has_topk_weight=topk_weights is not None,
+            expert_alignment=expert_alignment,
+            num_sms=num_sms,
             do_cpu_sync=do_cpu_sync,
-        )
-
-        recv_x, recv_sf, recv_topk_idx, recv_topk_weights, recv_src_global, recv_counts = (
-            self._materialize_native_dispatch_from_window(
-                transport,
-                x_tensor,
-                topk_weights,
-                num_experts,
-                num_max_tokens_per_rank,
-            )
-        )
-        num_recv_tokens = int(sum(recv_counts))
-        metadata_begin = time.perf_counter()
-        recv_src_metadata, dst_buffer_slot_idx, psum_scaleup, psum_expert, expert_counts = (
-            self._build_v2_dispatch_metadata(
-                recv_topk_idx, recv_src_global, topk_idx, recv_counts,
-                num_experts, num_max_tokens_per_rank, expert_alignment,
-                do_expand,
-            )
-        )
-        token_metadata_at_forward, channel_linked_list = self._build_forward_metadata_tensors(
-            recv_topk_idx,
-            recv_src_metadata,
-            do_expand,
-            num_experts,
-            num_max_tokens_per_rank,
-        )
-        if transport.timings is not None:
-            transport.timings["metadata_ms"] = (time.perf_counter() - metadata_begin) * 1000.0
-
-        if cumulative_local_expert_recv_stats is not None:
-            cumulative_local_expert_recv_stats.add_(
-                torch.tensor(expert_counts, dtype=cumulative_local_expert_recv_stats.dtype,
-                             device=cumulative_local_expert_recv_stats.device)
-            )
-
-        if do_expand:
-            expand_begin = time.perf_counter()
-            expanded_tokens = int(psum_expert[-1].item()) if psum_expert.numel() else 0
-            expanded_x = torch.empty((max(expanded_tokens, 1), hidden),
-                                     dtype=x_tensor.dtype, device=x_tensor.device)
-            expanded_x.zero_()
-            expanded_weights = None
-            if topk_weights is not None:
-                expanded_weights = torch.empty((max(expanded_tokens, 1), num_topk),
-                                               dtype=topk_weights.dtype,
-                                               device=topk_weights.device)
-                expanded_weights.zero_()
-            self.launch_dispatch_expand_records(
-                recv_x=recv_x,
-                recv_topk_weights=recv_topk_weights,
-                recv_src_metadata=recv_src_metadata,
-                expanded_x=expanded_x,
-                expanded_topk_weights=expanded_weights,
-                num_recv_tokens=num_recv_tokens,
-                num_expanded_tokens=expanded_tokens,
-                num_max_tokens_per_rank=num_max_tokens_per_rank,
-            )
-            recv_x_out = expanded_x
-            recv_topk_idx_out = None
-            recv_topk_weights_out = expanded_weights
-            if transport.timings is not None:
-                torch.cuda.current_stream().synchronize()
-                transport.timings["expand_ms"] = (time.perf_counter() - expand_begin) * 1000.0
-        else:
-            recv_x_out = recv_x
-            recv_topk_idx_out = recv_topk_idx
-            recv_topk_weights_out = recv_topk_weights
-
-        if sf is not None:
-            recv_x_out = (recv_x_out, recv_sf if not do_expand else None)
-
-        cloned_topk_idx = topk_idx.clone() if do_handle_copy else topk_idx
-        new_handle = EPHandle(
             do_expand=do_expand,
-            num_experts=num_experts,
+            do_handle_copy=do_handle_copy,
+        )
+
+    def _dispatch_native_hybrid(
+        self,
+        *,
+        x_tensor: torch.Tensor,
+        sf: Optional[torch.Tensor],
+        topk_idx: torch.Tensor,
+        topk_weights: Optional[torch.Tensor],
+        cumulative_local_expert_recv_stats: Optional[torch.Tensor],
+        num_tokens: int,
+        num_max_tokens_per_rank: int,
+        scale_bytes: int,
+        expert_alignment: int,
+        num_sms: int,
+        do_cpu_sync: bool,
+        do_expand: bool,
+        do_handle_copy: bool,
+    ):
+        if self._native_v2_resources is None:
+            raise RuntimeError("native V2 resources are not initialized")
+        if self._v2_efa_connection is None:
+            raise RuntimeError("native V2 EFA transport is not initialized")
+        if do_cpu_sync and int(self._native_v2_resources.get("host_workspace_ptr", 0)) == 0:
+            raise RuntimeError(
+                "native V2 CPU-sync dispatch requires host_workspace_ptr; "
+                "pass do_cpu_sync=False until the official resource binding exposes it"
+            )
+
+        smem_bytes = 228 * 1024
+        hidden = int(x_tensor.shape[1])
+        elem_bytes = int(x_tensor.element_size())
+        num_topk = int(topk_idx.shape[1])
+        num_local_experts = int(self.num_experts // self.num_ranks)
+        num_sf_packs = 0 if sf is None else int(sf.shape[1])
+        sf_token_stride = 0 if sf is None else int(sf.stride(0))
+        sf_hidden_stride = 0 if sf is None else int(sf.stride(1))
+        hidden_bytes = hidden * elem_bytes
+        sf_bytes = int(scale_bytes)
+        num_channels_per_sm = self._native_num_channels_per_sm(
+            hidden_bytes, sf_bytes, num_topk, smem_bytes
+        )
+        num_channels = int(num_sms) * int(num_channels_per_sm)
+        num_max_tokens_per_channel = max(
+            1, (int(num_max_tokens_per_rank) + num_channels - 1) // num_channels
+        )
+        max_forwarded_tokens = self.num_scaleout_ranks * num_max_tokens_per_channel + 1
+        forward_dims = 2 + num_topk * 2
+
+        psum_scaleup = torch.empty((self.num_scaleup_ranks,), dtype=torch.int32, device=x_tensor.device)
+        psum_expert = torch.empty((num_local_experts + 1,), dtype=torch.int32, device=x_tensor.device)
+        dst_buffer_slot_idx = torch.empty(
+            (num_channels, self.num_scaleout_ranks, num_max_tokens_per_channel, num_topk),
+            dtype=torch.int32,
+            device=x_tensor.device,
+        )
+        token_metadata_at_forward = torch.empty(
+            (num_channels, max_forwarded_tokens, forward_dims),
+            dtype=torch.int32,
+            device=x_tensor.device,
+        )
+        channel_linked_list = torch.empty(
+            (num_channels, max_forwarded_tokens, self.num_scaleup_ranks),
+            dtype=torch.int32,
+            device=x_tensor.device,
+        )
+        copied_topk_idx = topk_idx.clone() if do_handle_copy else topk_idx
+
+        queue_capacity = _next_power_of_two(
+            max(65536, int(num_tokens) * max(1, num_topk) * 8 + num_channels * self.num_scaleout_ranks * 8)
+        )
+        queue = self.allocate_d2h_queue(queue_capacity)
+        layout = self._make_dispatch_window_layout(
+            num_tokens=num_tokens,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            payload_bytes=hidden_bytes,
+            max_batches=max(1, int(self.num_experts)),
+            num_topk=num_topk,
+            has_topk_weight=topk_weights is not None,
+        )
+
+        proxy_before = self._v2_efa_connection.proxy_stats()
+        self.start_native_v2_proxy([queue])
+        try:
+            self.runtime.launch_native_hybrid_dispatch(
+                int(x_tensor.data_ptr()),
+                0 if sf is None else int(sf.data_ptr()),
+                int(topk_idx.data_ptr()),
+                0 if topk_weights is None else int(topk_weights.data_ptr()),
+                int(copied_topk_idx.data_ptr()),
+                0 if cumulative_local_expert_recv_stats is None else int(cumulative_local_expert_recv_stats.data_ptr()),
+                int(psum_scaleup.data_ptr()),
+                int(psum_expert.data_ptr()),
+                int(dst_buffer_slot_idx.data_ptr()),
+                int(token_metadata_at_forward.data_ptr()),
+                int(num_tokens),
+                int(num_max_tokens_per_rank),
+                int(num_channels_per_sm),
+                int(num_sf_packs),
+                int(sf_token_stride),
+                int(sf_hidden_stride),
+                int(expert_alignment),
+                int(max(1, self._v2_efa_num_lanes)),
+                int(os.environ.get("UCCL_V2_GPU_TIMEOUT_CYCLES", "200000000000")),
+                False,
+                False,
+                bool(do_cpu_sync),
+                int(smem_bytes),
+                int(self._native_v2_resources["nccl_dev_comm_ptr"]),
+                int(self._native_v2_resources["nccl_window_ptr"]),
+                int(self._native_v2_resources["buffer_ptr"]),
+                int(self._native_v2_resources["workspace_ptr"]),
+                int(self._native_v2_resources["mapped_host_workspace_ptr"]),
+                int(queue.commands_ptr()),
+                int(queue.head_ptr()),
+                int(queue.tail_ptr()),
+                int(queue.capacity()),
+                int(self._native_v2_resources["buffer_ptr"]),
+                int(self._native_v2_resources["workspace_ptr"]),
+                int(layout["local_payload_base"]),
+                int(layout["remote_payload_base"]),
+                int(layout["remote_signal_base"]),
+                int(layout["src_token_stride"]),
+                int(layout["expanded_slot_stride"]),
+                int(layout["batch_payload_stride"]),
+                int(layout.get("source_rank_stride", 0)),
+                int(layout.get("source_signal_stride", 0)),
+                int(layout.get("token_record_bytes", 0)),
+                int(layout.get("record_payload_offset", 0)),
+                int(layout.get("record_src_global_offset", 0)),
+                int(layout.get("record_topk_idx_offset", 0)),
+                int(layout.get("record_topk_weight_offset", 0)),
+                int(layout.get("record_topk_weight_bytes", 0)),
+                int(layout.get("signal_stride", 4)),
+                int(max(1, self._v2_efa_num_lanes)),
+                str(Path(__file__).resolve().parents[3] / "include"),
+                _cuda_stream_ptr(torch.cuda.current_stream()),
+            )
+
+            if do_cpu_sync:
+                raise RuntimeError("host workspace CPU reader is not implemented in uccl-ep wrapper yet")
+            num_recv_tokens = int(num_max_tokens_per_rank) * int(self.num_ranks)
+            num_expanded_tokens = (
+                self.num_ranks * int(num_max_tokens_per_rank) * min(num_topk, num_local_experts)
+            )
+            num_expanded_tokens = _align(num_expanded_tokens + (expert_alignment - 1) * num_local_experts, expert_alignment)
+            num_allocated_tokens = num_expanded_tokens if do_expand else num_recv_tokens
+            recv_x = torch.empty((num_allocated_tokens, hidden), dtype=x_tensor.dtype, device=x_tensor.device)
+            recv_sf = None
+            recv_topk_idx = None if do_expand else torch.empty(
+                (num_allocated_tokens, num_topk), dtype=topk_idx.dtype, device=topk_idx.device
+            )
+            recv_topk_weights = None
+            if topk_weights is not None:
+                weight_shape = (num_allocated_tokens,) if do_expand else (num_allocated_tokens, num_topk)
+                recv_topk_weights = torch.empty(weight_shape, dtype=topk_weights.dtype, device=topk_weights.device)
+            recv_src_metadata = torch.empty(
+                (num_recv_tokens, num_topk + 2), dtype=torch.int32, device=x_tensor.device
+            )
+            recv_sf_token_stride = 0
+            recv_sf_hidden_stride = 0
+            if sf is not None:
+                recv_sf = torch.empty((num_allocated_tokens, num_sf_packs), dtype=sf.dtype, device=sf.device)
+                recv_sf_token_stride = int(recv_sf.stride(0))
+                recv_sf_hidden_stride = int(recv_sf.stride(1))
+            self.runtime.launch_dispatch_copy_epilogue(
+                int(self._native_v2_resources["buffer_ptr"]),
+                int(self._native_v2_resources["workspace_ptr"]),
+                int(psum_scaleup.data_ptr()),
+                int(psum_expert.data_ptr()),
+                int(recv_x.data_ptr()),
+                0 if recv_sf is None else int(recv_sf.data_ptr()),
+                0 if recv_topk_idx is None else int(recv_topk_idx.data_ptr()),
+                0 if recv_topk_weights is None else int(recv_topk_weights.data_ptr()),
+                int(recv_src_metadata.data_ptr()),
+                int(channel_linked_list.data_ptr()),
+                int(num_recv_tokens),
+                int(num_max_tokens_per_rank),
+                int(num_channels),
+                int(num_sf_packs),
+                int(recv_sf_token_stride),
+                int(recv_sf_hidden_stride),
+                bool(do_expand),
+                False,
+                int(smem_bytes),
+                str(Path(__file__).resolve().parents[3] / "include"),
+                _cuda_stream_ptr(torch.cuda.current_stream()),
+            )
+            torch.cuda.current_stream().synchronize()
+        finally:
+            self.stop_native_v2_proxy()
+        proxy_after = self._v2_efa_connection.proxy_stats()
+        transport = V2TransportHandle(
+            dispatch_segments=torch.empty((0,), dtype=torch.uint8, device=x_tensor.device),
+            dispatch_batches=torch.empty((0,), dtype=torch.uint8, device=x_tensor.device),
+            dispatch_route_offsets=torch.empty((0,), dtype=torch.int32, device=x_tensor.device),
+            dispatch_counters=torch.empty((0,), dtype=torch.int32, device=x_tensor.device),
+            combine_segments=None,
+            combine_batches=None,
+            combine_counters=None,
+            d2h_queue=queue,
+            combine_d2h_queue=None,
+            dispatch_layout=layout,
+            combine_layout=None,
+            num_dispatch_batches=0,
+            num_dispatch_segments=0,
+            num_combine_batches=0,
+            num_combine_segments=0,
+            payload_bytes=hidden_bytes,
+            scale_bytes=scale_bytes,
+            dispatch_drain_stats={"proxy_before": proxy_before, "proxy_after": proxy_after},
+            timings=None,
+        )
+        expert_counts = [0 for _ in range(num_local_experts)]
+        handle = EPHandle(
+            do_expand=do_expand,
+            num_experts=self.num_experts,
             expert_alignment=expert_alignment,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             num_sms=num_sms,
-            topk_idx=cloned_topk_idx,
+            topk_idx=copied_topk_idx,
             num_recv_tokens_per_expert_list=expert_counts,
             psum_num_recv_tokens_per_scaleup_rank=psum_scaleup,
             psum_num_recv_tokens_per_expert=psum_expert,
@@ -1156,8 +1499,8 @@ class ElasticBuffer:
             channel_linked_list=channel_linked_list,
             transport_handle=transport,
         )
-
-        return recv_x_out, recv_topk_idx_out, recv_topk_weights_out, new_handle, EventOverlap(None)
+        recv_x_out = (recv_x, recv_sf) if sf is not None else recv_x
+        return recv_x_out, recv_topk_idx, recv_topk_weights, handle, EventOverlap(None)
 
     def combine(
         self,
@@ -1250,7 +1593,10 @@ class ElasticBuffer:
         num_batches = int(counters[1].item())
         dispatch_drain_stats = None
         drain_begin = time.perf_counter()
-        dispatch_drain_stats = self._v2_efa_connection.drain_queue(queue, True, True)
+        expected_commands = int(queue.head()) - int(queue.tail())
+        dispatch_drain_stats = self._drain_native_v2_queue_with_proxy(
+            queue, expected_commands
+        )
         timings["proxy_drain_ms"] = (time.perf_counter() - drain_begin) * 1000.0
         wait_begin = time.perf_counter()
         self._wait_native_v2_efa_completions(dispatch_drain_stats)
@@ -1282,7 +1628,26 @@ class ElasticBuffer:
     def _wait_native_v2_efa_completions(self, stats: Optional[dict]) -> None:
         if self._v2_efa_connection is None or stats is None:
             return
-        expected = int(stats.get("posted_writes", 0)) + int(stats.get("posted_signals", 0))
+        if int(stats.get("proxy_threads", 0)) > 0:
+            deadline = time.perf_counter() + 5.0
+            spins = 0
+            while time.perf_counter() < deadline:
+                pending = int(self._v2_efa_connection.outstanding_completions())
+                if pending == 0:
+                    return
+                # Help the proxy-drained path make forward progress after the
+                # short-lived proxy thread has stopped.
+                self._v2_efa_connection.poll_completions(max(1, min(pending, 64)))
+                spins += 1
+                if spins % 4096 == 0:
+                    time.sleep(0)
+            raise TimeoutError("timed out waiting for native V2 proxy CQEs")
+        expected = int(
+            stats.get(
+                "posted_completions",
+                int(stats.get("posted_writes", 0)) + int(stats.get("posted_signals", 0)),
+            )
+        )
         seen = 0
         deadline = time.perf_counter() + 5.0
         spins = 0
@@ -1495,6 +1860,16 @@ def _align_2mb(x: int) -> int:
 
 def _align(x: int, alignment: int) -> int:
     return ((int(x) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
+
+def _v2_token_layout_bytes(hidden_bytes: int, sf_bytes: int, num_topk: int) -> int:
+    metadata_bytes = int(num_topk) * (4 + 4) + (1 + int(num_topk)) * 4
+    return (
+        _align(int(hidden_bytes), 32)
+        + _align(int(sf_bytes), 32)
+        + _align(metadata_bytes, 32)
+        + _align(8, 32)
+    )
 
 
 def _next_power_of_two(x: int) -> int:

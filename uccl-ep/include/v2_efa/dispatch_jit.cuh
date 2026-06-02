@@ -9,6 +9,64 @@ namespace uccl::v2_efa {
 namespace detail {
 
 #if defined(__CUDA_ARCH__)
+__device__ __forceinline__ uint64_t ptr_to_region_offset(const void* ptr,
+                                                         uint64_t base) {
+  const auto addr = reinterpret_cast<uint64_t>(ptr);
+  if (addr < base) {
+    asm volatile("trap;");
+  }
+  return addr - base;
+}
+
+__device__ __forceinline__ bool enqueue_native_dispatch_workspace_write(
+    V2TransferD2HQueueView queue, const void* local_workspace_ptr,
+    const void* remote_workspace_ptr, uint32_t bytes, uint32_t dst_rank,
+    uint32_t channel_or_lane, uint64_t workspace_base,
+    DispatchTransferLayout layout) {
+  const uint32_t num_lanes = layout.num_efa_lanes == 0 ? 1u : layout.num_efa_lanes;
+  return enqueue_v2_transfer_d2h(
+      queue,
+      make_v2_dispatch_workspace_write_cmd(
+          dst_rank,
+          channel_or_lane % num_lanes,
+          bytes,
+          ptr_to_region_offset(local_workspace_ptr, workspace_base),
+          ptr_to_region_offset(remote_workspace_ptr, workspace_base)));
+}
+
+__device__ __forceinline__ bool enqueue_native_dispatch_payload(
+    V2TransferD2HQueueView queue, const void* local_buffer_ptr,
+    const void* remote_buffer_ptr, uint32_t bytes, uint32_t dst_rank,
+    uint32_t channel_idx, uint64_t buffer_base, DispatchTransferLayout layout) {
+  const uint32_t num_lanes = layout.num_efa_lanes == 0 ? 1u : layout.num_efa_lanes;
+  return enqueue_v2_transfer_d2h(
+      queue,
+      make_v2_transfer_cmd(
+          V2TransferCmdKind::kDispatchPayload,
+          dst_rank,
+          channel_idx % num_lanes,
+          /*descriptor_index=*/0,
+          channel_idx,
+          bytes,
+          /*signal_value=*/0,
+          ptr_to_region_offset(local_buffer_ptr, buffer_base),
+          ptr_to_region_offset(remote_buffer_ptr, buffer_base)));
+}
+
+__device__ __forceinline__ bool enqueue_native_dispatch_tail(
+    V2TransferD2HQueueView queue, const void* remote_tail_ptr,
+    uint64_t tail_word, uint32_t dst_rank, uint32_t channel_idx,
+    uint64_t workspace_base, DispatchTransferLayout layout) {
+  return enqueue_v2_transfer_d2h(
+      queue,
+      make_v2_dispatch_tail_cmd(
+          dst_rank,
+          channel_idx,
+          tail_word,
+          ptr_to_region_offset(remote_tail_ptr, workspace_base),
+          layout));
+}
+
 struct DispatchDescriptorBuildResult {
   int num_segments = 0;
   int num_batches = 0;

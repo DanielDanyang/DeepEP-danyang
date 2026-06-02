@@ -16,12 +16,18 @@ enum class EfaPostOpKind : uint32_t {
   kSignalWrite = 2,
 };
 
+enum class EfaMemoryRegion : uint32_t {
+  kBuffer = 0,
+  kWorkspace = 1,
+};
+
 struct EfaPostOp {
   EfaPostOpKind kind = EfaPostOpKind::kWrite;
+  EfaMemoryRegion region = EfaMemoryRegion::kBuffer;
   uint32_t target_rank = 0;
   uint32_t target_lane = 0;
   uint32_t bytes = 0;
-  uint32_t signal_value = 0;
+  uint64_t signal_value = 0;
   uint64_t local_offset = 0;
   uint64_t remote_offset = 0;
   uint32_t descriptor_index = 0;
@@ -30,10 +36,11 @@ struct EfaPostOp {
 
 struct ResolvedEfaPostOp {
   EfaPostOpKind kind = EfaPostOpKind::kWrite;
+  EfaMemoryRegion region = EfaMemoryRegion::kBuffer;
   uint32_t target_rank = 0;
   uint32_t target_lane = 0;
   uint32_t bytes = 0;
-  uint32_t signal_value = 0;
+  uint64_t signal_value = 0;
   uint64_t local_offset = 0;
   uint64_t remote_offset = 0;
   uint64_t remote_addr = 0;
@@ -111,10 +118,13 @@ inline EfaPostOp make_efa_post_op(const V2TransferCmd& command) {
     throw std::invalid_argument("invalid V2 transfer command header");
   }
   EfaPostOp op;
+  op.region = v2_transfer_uses_workspace(command)
+                  ? EfaMemoryRegion::kWorkspace
+                  : EfaMemoryRegion::kBuffer;
   op.target_rank = command.target_rank;
   op.target_lane = command.target_lane;
   op.bytes = command.bytes;
-  op.signal_value = command.signal_value;
+  op.signal_value = v2_transfer_signal_value(command);
   op.local_offset =
       is_v2_transfer_payload(command) ? v2_transfer_local_offset(command) : 0;
   op.remote_offset = v2_transfer_remote_offset(command);
@@ -128,7 +138,10 @@ inline EfaPostOp make_efa_post_op(const V2TransferCmd& command) {
   if (kind == V2TransferCmdKind::kDispatchSignal ||
       kind == V2TransferCmdKind::kCombineSignal) {
     op.kind = EfaPostOpKind::kSignalWrite;
-    op.bytes = sizeof(uint32_t);
+    op.bytes =
+        (command.flags & static_cast<uint8_t>(V2TransferCmdFlags::kSignal64))
+            ? sizeof(uint64_t)
+            : sizeof(uint32_t);
     return op;
   }
   throw std::invalid_argument("unknown V2 transfer command kind");
@@ -144,6 +157,7 @@ inline ResolvedEfaPostOp resolve_efa_post_op(const EfaPostOp& op,
 
   ResolvedEfaPostOp resolved;
   resolved.kind = op.kind;
+  resolved.region = op.region;
   resolved.target_rank = op.target_rank;
   resolved.target_lane = op.target_lane;
   resolved.bytes = op.bytes;

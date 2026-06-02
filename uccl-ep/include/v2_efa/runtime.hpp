@@ -82,6 +82,35 @@ void launch_v2_efa_dispatch_expand_records_plan(
     std::uintptr_t expanded_topk_weights_ptr, int num_recv_tokens,
     int num_expanded_tokens, bool has_topk_weight,
     std::uintptr_t cuda_stream_ptr = 0);
+void launch_v2_efa_native_hybrid_dispatch_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t x_ptr,
+    std::uintptr_t sf_ptr, std::uintptr_t topk_idx_ptr,
+    std::uintptr_t topk_weights_ptr, std::uintptr_t copied_topk_idx_ptr,
+    std::uintptr_t cumulative_local_expert_recv_stats_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+    std::uintptr_t dst_buffer_slot_idx_ptr,
+    std::uintptr_t token_metadata_at_forward_ptr, int num_tokens,
+    int sf_token_stride, int sf_hidden_stride,
+    std::uintptr_t nccl_dev_comm_ptr, std::uintptr_t nccl_window_ptr,
+    std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
+    std::uintptr_t mapped_host_workspace_ptr, int scaleout_rank,
+    int scaleup_rank, std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+    std::uintptr_t tail_ptr, int queue_capacity, std::uintptr_t buffer_base,
+    std::uintptr_t workspace_base, DispatchTransferLayout layout,
+    std::uintptr_t cuda_stream_ptr = 0);
+void launch_v2_efa_dispatch_copy_epilogue_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t buffer_ptr,
+    std::uintptr_t workspace_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+    std::uintptr_t recv_x_ptr, std::uintptr_t recv_sf_ptr,
+    std::uintptr_t recv_topk_idx_ptr,
+    std::uintptr_t recv_topk_weights_ptr,
+    std::uintptr_t recv_src_metadata_ptr,
+    std::uintptr_t channel_linked_list_ptr, int num_recv_tokens,
+    int recv_sf_token_stride, int recv_sf_hidden_stride, int scaleout_rank,
+    int scaleup_rank, std::uintptr_t cuda_stream_ptr = 0);
 void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t dispatch_segments_ptr,
     std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
@@ -129,6 +158,16 @@ class V2EfaRuntime {
       const std::string& uccl_include_path = "") const;
   V2EfaJitLaunchPlan build_dispatch_expand_records_jit_plan(
       int num_max_tokens_per_rank,
+      const std::string& uccl_include_path = "") const;
+  V2EfaJitLaunchPlan build_native_hybrid_dispatch_jit_plan(
+      int num_max_tokens_per_rank, int num_channels_per_sm,
+      int num_sf_packs, int expert_alignment, int num_qps,
+      int64_t num_timeout_cycles, bool cached_mode, bool deterministic,
+      bool do_cpu_sync, int smem_bytes,
+      const std::string& uccl_include_path = "") const;
+  V2EfaJitLaunchPlan build_dispatch_copy_epilogue_jit_plan(
+      int num_max_tokens_per_rank, int num_channels, int num_sf_packs,
+      bool do_expand, bool cached_mode, int smem_bytes,
       const std::string& uccl_include_path = "") const;
   V2EfaJitLaunchPlan build_combine_descriptor_enqueue_d2h_jit_plan(
       int num_max_tokens_per_rank, int num_channels, int payload_bytes,
@@ -197,6 +236,40 @@ class V2EfaRuntime {
       std::uintptr_t expanded_topk_weights_ptr, int num_recv_tokens,
       int num_expanded_tokens, bool has_topk_weight,
       int num_max_tokens_per_rank,
+      const std::string& uccl_include_path = "",
+      std::uintptr_t cuda_stream_ptr = 0) const;
+  void launch_native_hybrid_dispatch(
+      std::uintptr_t x_ptr, std::uintptr_t sf_ptr,
+      std::uintptr_t topk_idx_ptr, std::uintptr_t topk_weights_ptr,
+      std::uintptr_t copied_topk_idx_ptr,
+      std::uintptr_t cumulative_local_expert_recv_stats_ptr,
+      std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+      std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+      std::uintptr_t dst_buffer_slot_idx_ptr,
+      std::uintptr_t token_metadata_at_forward_ptr, int num_tokens,
+      int num_max_tokens_per_rank, int num_channels_per_sm,
+      int num_sf_packs, int sf_token_stride, int sf_hidden_stride,
+      int expert_alignment, int num_qps, int64_t num_timeout_cycles,
+      bool cached_mode, bool deterministic, bool do_cpu_sync, int smem_bytes,
+      std::uintptr_t nccl_dev_comm_ptr, std::uintptr_t nccl_window_ptr,
+      std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
+      std::uintptr_t mapped_host_workspace_ptr, std::uintptr_t commands_ptr,
+      std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
+      std::uintptr_t buffer_base, std::uintptr_t workspace_base,
+      DispatchTransferLayout layout, const std::string& uccl_include_path = "",
+      std::uintptr_t cuda_stream_ptr = 0) const;
+  void launch_dispatch_copy_epilogue(
+      std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
+      std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+      std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+      std::uintptr_t recv_x_ptr, std::uintptr_t recv_sf_ptr,
+      std::uintptr_t recv_topk_idx_ptr,
+      std::uintptr_t recv_topk_weights_ptr,
+      std::uintptr_t recv_src_metadata_ptr,
+      std::uintptr_t channel_linked_list_ptr, int num_recv_tokens,
+      int num_max_tokens_per_rank, int num_channels, int num_sf_packs,
+      int recv_sf_token_stride, int recv_sf_hidden_stride, bool do_expand,
+      bool cached_mode, int smem_bytes,
       const std::string& uccl_include_path = "",
       std::uintptr_t cuda_stream_ptr = 0) const;
   void launch_combine_descriptor_enqueue_d2h(

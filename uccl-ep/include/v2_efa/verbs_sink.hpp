@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -28,6 +30,10 @@ constexpr uint32_t kDefaultEfaQKey = 0x11111111u;
 struct V2VerbsPostStats {
   uint64_t posted_writes = 0;
   uint64_t posted_signals = 0;
+  // Number of WRs expected to generate CQEs.  Current p5en SRD path keeps
+  // QP.sq_sig_all=1, so payload writes and signal writes both enter the CQ.
+  // If sq_sig_all is ever disabled, only signaled WRs may increment this.
+  uint64_t posted_completions = 0;
   uint64_t posted_bytes = 0;
 };
 
@@ -41,7 +47,7 @@ struct V2VerbsLocalWindow {
 };
 
 struct V2VerbsSignalScratch {
-  uint32_t* values = nullptr;
+  uint64_t* values = nullptr;
   uint64_t capacity = 0;
   uint32_t lkey = 0;
   std::vector<uint32_t> lkeys_by_lane;
@@ -57,6 +63,9 @@ struct V2VerbsEndpoint {
   uint64_t remote_base = 0;
   uint64_t remote_bytes = 0;
   uint32_t remote_rkey = 0;
+  uint64_t remote_workspace_base = 0;
+  uint64_t remote_workspace_bytes = 0;
+  uint32_t remote_workspace_rkey = 0;
 };
 
 class V2VerbsEndpointTable {
@@ -101,9 +110,11 @@ inline void check_v2_verbs_range(const char* name, uint64_t offset,
 class V2EfaVerbsPostSink final : public EfaPostSink {
  public:
   V2EfaVerbsPostSink(V2VerbsLocalWindow local_window,
+                     V2VerbsLocalWindow workspace_window,
                      V2VerbsSignalScratch signal_scratch,
                      const V2VerbsEndpointTable* endpoints)
       : local_window_(local_window),
+        workspace_window_(workspace_window),
         signal_scratch_(signal_scratch),
         endpoints_(endpoints) {
     if (endpoints_ == nullptr) {
@@ -117,17 +128,43 @@ class V2EfaVerbsPostSink final : public EfaPostSink {
   void post(const EfaPostOp& op) override {
     const auto& endpoint = endpoints_->get(op.target_rank, op.target_lane);
     validate_endpoint(endpoint);
-    check_v2_verbs_range("remote", op.remote_offset, op.bytes,
-                         endpoint.remote_bytes);
+    const bool use_workspace = op.region == EfaMemoryRegion::kWorkspace;
+    if (use_workspace &&
+        (workspace_window_.base == 0 || workspace_window_.bytes == 0 ||
+         endpoint.remote_workspace_base == 0 ||
+         endpoint.remote_workspace_bytes == 0 ||
+         endpoint.remote_workspace_rkey == 0)) {
+      throw std::invalid_argument(
+          "V2 EFA workspace command requires registered workspace MRs");
+    }
+    const auto& local_region =
+        use_workspace && workspace_window_.base != 0 ? workspace_window_
+                                                     : local_window_;
+    const uint64_t remote_base =
+        use_workspace && endpoint.remote_workspace_base != 0
+            ? endpoint.remote_workspace_base
+            : endpoint.remote_base;
+    const uint64_t remote_bytes =
+        use_workspace && endpoint.remote_workspace_bytes != 0
+            ? endpoint.remote_workspace_bytes
+            : endpoint.remote_bytes;
+    const uint32_t remote_rkey =
+        use_workspace && endpoint.remote_workspace_rkey != 0
+            ? endpoint.remote_workspace_rkey
+            : endpoint.remote_rkey;
+    check_v2_verbs_range("remote", op.remote_offset, op.bytes, remote_bytes);
 
     if (op.kind == EfaPostOpKind::kWrite) {
       check_v2_verbs_range("local", op.local_offset, op.bytes,
-                           local_window_.bytes);
-      post_write(endpoint, local_window_.base + op.local_offset,
-                 local_lkey(endpoint.lane),
-                 endpoint.remote_base + op.remote_offset,
-                 endpoint.remote_rkey, op.bytes);
+                           local_region.bytes);
+      post_write(endpoint, local_region.base + op.local_offset,
+                 local_lkey(local_region, endpoint.lane),
+                 remote_base + op.remote_offset,
+                 remote_rkey, op.bytes, false);
       stats_.posted_writes += 1;
+      // QP.sq_sig_all=1 in V2EfaConnectionHandle::open_lane(), so this
+      // unsignaled-by-flag write still produces a completion.
+      stats_.posted_completions += 1;
       stats_.posted_bytes += op.bytes;
       return;
     }
@@ -139,10 +176,11 @@ class V2EfaVerbsPostSink final : public EfaPostSink {
                  reinterpret_cast<uint64_t>(signal_scratch_.values +
                                             scratch_idx),
                  signal_lkey(endpoint.lane),
-                 endpoint.remote_base + op.remote_offset,
-                 endpoint.remote_rkey, sizeof(uint32_t));
+                 remote_base + op.remote_offset,
+                 remote_rkey, op.bytes, true);
       stats_.posted_signals += 1;
-      stats_.posted_bytes += sizeof(uint32_t);
+      stats_.posted_completions += 1;
+      stats_.posted_bytes += op.bytes;
       return;
     }
 
@@ -173,11 +211,11 @@ class V2EfaVerbsPostSink final : public EfaPostSink {
     return next_signal_scratch_++;
   }
 
-  uint32_t local_lkey(uint32_t lane) const {
-    if (!local_window_.lkeys_by_lane.empty()) {
-      return local_window_.lkeys_by_lane.at(lane);
+  uint32_t local_lkey(const V2VerbsLocalWindow& window, uint32_t lane) const {
+    if (!window.lkeys_by_lane.empty()) {
+      return window.lkeys_by_lane.at(lane);
     }
-    return local_window_.lkey;
+    return window.lkey;
   }
 
   uint32_t signal_lkey(uint32_t lane) const {
@@ -189,19 +227,22 @@ class V2EfaVerbsPostSink final : public EfaPostSink {
 
   void post_write(const V2VerbsEndpoint& endpoint, uint64_t local_addr,
                   uint32_t local_lkey, uint64_t remote_addr,
-                  uint32_t remote_rkey, uint32_t bytes) {
+                  uint32_t remote_rkey, uint32_t bytes, bool signaled) {
 #ifdef EFA
     auto* qpx = reinterpret_cast<ibv_qp_ex*>(endpoint.qp);
     ibv_wr_start(qpx);
     qpx->wr_id = next_wr_id_++;
     qpx->comp_mask = 0;
-    qpx->wr_flags = IBV_SEND_SIGNALED;
+    qpx->wr_flags = signaled ? IBV_SEND_SIGNALED : 0;
     ibv_wr_rdma_write(qpx, remote_rkey, remote_addr);
     ibv_wr_set_ud_addr(qpx, endpoint.ah, endpoint.dst_qpn, endpoint.qkey);
     ibv_wr_set_sge(qpx, local_lkey, local_addr, bytes);
     const int ret = ibv_wr_complete(qpx);
     if (ret != 0) {
-      throw std::runtime_error("ibv_wr_complete failed for V2 EFA write");
+      throw std::runtime_error(
+          std::string("ibv_wr_complete failed for V2 EFA write: ret=") +
+          std::to_string(ret) + " errno=" + std::to_string(errno) + " (" +
+          std::strerror(errno) + ")");
     }
 #else
     ibv_sge sge{};
@@ -214,19 +255,23 @@ class V2EfaVerbsPostSink final : public EfaPostSink {
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_RDMA_WRITE;
-    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
     wr.wr.rdma.remote_addr = remote_addr;
     wr.wr.rdma.rkey = remote_rkey;
 
     ibv_send_wr* bad = nullptr;
     const int ret = ibv_post_send(endpoint.qp, &wr, &bad);
     if (ret != 0) {
-      throw std::runtime_error("ibv_post_send failed for V2 RDMA write");
+      throw std::runtime_error(
+          std::string("ibv_post_send failed for V2 RDMA write: ret=") +
+          std::to_string(ret) + " errno=" + std::to_string(errno) + " (" +
+          std::strerror(errno) + ")");
     }
 #endif
   }
 
   V2VerbsLocalWindow local_window_;
+  V2VerbsLocalWindow workspace_window_;
   V2VerbsSignalScratch signal_scratch_;
   const V2VerbsEndpointTable* endpoints_ = nullptr;
   uint64_t next_wr_id_ = 1;

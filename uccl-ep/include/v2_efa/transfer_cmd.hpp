@@ -34,6 +34,11 @@ enum class V2TransferCmdFlags : uint8_t {
   kPayload = 1u << 1,
   kDispatch = 1u << 2,
   kCombine = 1u << 3,
+  kSignal64 = 1u << 4,
+  // The command offsets are relative to the V2 workspace MR instead of the
+  // main ElasticBuffer/buffer MR.  Native dispatch notify/tail commands use
+  // this; scaffold payload/count-window commands intentionally leave it clear.
+  kWorkspace = 1u << 5,
 };
 
 V2_EFA_HOST_DEVICE inline constexpr V2TransferCmdFlags operator|(
@@ -52,7 +57,7 @@ struct V2TransferCmd {
   uint32_t remote_offset_shifted = 0;
   union {
     uint32_t local_offset_shifted;
-    uint32_t signal_value;
+    uint32_t signal_value_lo;
   };
 };
 #pragma pack(pop)
@@ -133,17 +138,21 @@ V2_EFA_HOST_DEVICE inline uint8_t v2_transfer_flags(V2TransferCmdKind kind) {
 
 V2_EFA_HOST_DEVICE inline uint32_t encode_v2_transfer_offset(uint64_t offset) {
   const auto align = uint64_t{1} << kV2TransferOffsetShift;
-#if !V2_EFA_DEVICE_CODE
   if ((offset & (align - 1)) != 0) {
+#if V2_EFA_DEVICE_CODE
+    asm volatile("trap;");
+#else
     throw std::invalid_argument("V2 transfer offset is not aligned");
-  }
 #endif
+  }
   const auto shifted = offset >> kV2TransferOffsetShift;
-#if !V2_EFA_DEVICE_CODE
   if (shifted > UINT32_MAX) {
+#if V2_EFA_DEVICE_CODE
+    asm volatile("trap;");
+#else
     throw std::out_of_range("V2 transfer offset exceeds command range");
-  }
 #endif
+  }
   return static_cast<uint32_t>(shifted);
 }
 
@@ -163,6 +172,12 @@ V2_EFA_HOST_DEVICE inline bool is_v2_transfer_signal(
          0;
 }
 
+V2_EFA_HOST_DEVICE inline bool v2_transfer_uses_workspace(
+    const V2TransferCmd& command) {
+  return (command.flags &
+          static_cast<uint8_t>(V2TransferCmdFlags::kWorkspace)) != 0;
+}
+
 V2_EFA_HOST_DEVICE inline uint64_t v2_transfer_remote_offset(
     const V2TransferCmd& command) {
   return decode_v2_transfer_offset(command.remote_offset_shifted);
@@ -171,6 +186,12 @@ V2_EFA_HOST_DEVICE inline uint64_t v2_transfer_remote_offset(
 V2_EFA_HOST_DEVICE inline uint64_t v2_transfer_local_offset(
     const V2TransferCmd& command) {
   return decode_v2_transfer_offset(command.local_offset_shifted);
+}
+
+V2_EFA_HOST_DEVICE inline uint64_t v2_transfer_signal_value(
+    const V2TransferCmd& command) {
+  return (static_cast<uint64_t>(command.bytes) << 32) |
+         static_cast<uint64_t>(command.signal_value_lo);
 }
 
 V2_EFA_HOST_DEVICE inline void pack_v2_transfer_cmd(
@@ -210,7 +231,7 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd unpack_v2_transfer_cmd(
 V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_transfer_cmd(
     V2TransferCmdKind kind, uint32_t target_rank, uint32_t target_lane,
     uint32_t descriptor_index, uint32_t batch_index, uint32_t bytes,
-    uint32_t signal_value, uint64_t local_offset, uint64_t remote_offset) {
+    uint64_t signal_value, uint64_t local_offset, uint64_t remote_offset) {
 #if !V2_EFA_DEVICE_CODE
   if (target_rank > UINT8_MAX || target_lane > UINT8_MAX) {
     throw std::out_of_range("V2 transfer target exceeds command range");
@@ -224,13 +245,55 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_transfer_cmd(
   out.bytes = bytes;
   out.remote_offset_shifted = encode_v2_transfer_offset(remote_offset);
   if ((out.flags & static_cast<uint8_t>(V2TransferCmdFlags::kSignal)) != 0) {
-    out.signal_value = signal_value;
+    if (bytes == sizeof(uint64_t)) {
+      out.flags |= static_cast<uint8_t>(V2TransferCmdFlags::kSignal64);
+    }
+    out.bytes = static_cast<uint32_t>(signal_value >> 32);
+    out.signal_value_lo = static_cast<uint32_t>(signal_value & 0xFFFFFFFFu);
   } else {
     out.local_offset_shifted = encode_v2_transfer_offset(local_offset);
   }
   (void)descriptor_index;
   (void)batch_index;
   return out;
+}
+
+V2_EFA_HOST_DEVICE inline V2TransferCmd mark_v2_transfer_workspace(
+    V2TransferCmd command) {
+  command.flags |= static_cast<uint8_t>(V2TransferCmdFlags::kWorkspace);
+  return command;
+}
+
+V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_workspace_write_cmd(
+    uint32_t target_rank, uint32_t target_lane, uint32_t bytes,
+    uint64_t local_workspace_offset, uint64_t remote_workspace_offset,
+    uint32_t descriptor_index = 0, uint32_t batch_index = 0) {
+  return mark_v2_transfer_workspace(make_v2_transfer_cmd(
+      V2TransferCmdKind::kDispatchPayload,
+      target_rank,
+      target_lane,
+      descriptor_index,
+      batch_index,
+      bytes,
+      /*signal_value=*/0,
+      local_workspace_offset,
+      remote_workspace_offset));
+}
+
+V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_workspace_signal_cmd(
+    uint32_t target_rank, uint32_t target_lane, uint32_t bytes,
+    uint64_t signal_value, uint64_t remote_workspace_offset,
+    uint32_t descriptor_index = 0, uint32_t batch_index = 0) {
+  return mark_v2_transfer_workspace(make_v2_transfer_cmd(
+      V2TransferCmdKind::kDispatchSignal,
+      target_rank,
+      target_lane,
+      descriptor_index,
+      batch_index,
+      bytes,
+      signal_value,
+      /*local_offset=*/0,
+      remote_workspace_offset));
 }
 
 V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_payload_cmd(
@@ -262,10 +325,7 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_payload_cmd(
           : static_cast<uint32_t>(segment.dst_scaleout_rank);
   const uint32_t num_efa_lanes =
       layout.num_efa_lanes == 0 ? 1u : layout.num_efa_lanes;
-  const uint32_t efa_lane =
-      use_global_rank ? (static_cast<uint32_t>(segment.expert_id) %
-                         num_efa_lanes)
-                      : static_cast<uint32_t>(segment.dst_scaleup_lane);
+  const uint32_t efa_lane = layout.efa_lane % num_efa_lanes;
   return make_v2_transfer_cmd(
       V2TransferCmdKind::kDispatchPayload,
       dst_global_rank,
@@ -294,10 +354,7 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_signal_cmd(
           : static_cast<uint32_t>(batch.dst_scaleout_rank);
   const uint32_t num_efa_lanes =
       layout.num_efa_lanes == 0 ? 1u : layout.num_efa_lanes;
-  const uint32_t efa_lane =
-      use_global_rank ? (static_cast<uint32_t>(batch.expert_id) %
-                         num_efa_lanes)
-                      : static_cast<uint32_t>(batch.dst_scaleup_lane);
+  const uint32_t efa_lane = layout.efa_lane % num_efa_lanes;
   return make_v2_transfer_cmd(
       V2TransferCmdKind::kDispatchSignal,
       dst_global_rank,
@@ -327,6 +384,21 @@ V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_done_cmd(
       /*local_offset=*/0,
       source_signal_base +
           static_cast<uint64_t>(layout.max_batches) * layout.signal_stride);
+}
+
+V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_dispatch_tail_cmd(
+    uint32_t target_rank, uint32_t channel_idx, uint64_t tail_word,
+    uint64_t tail_offset, const DispatchTransferLayout& layout) {
+  const uint32_t num_efa_lanes =
+      layout.num_efa_lanes == 0 ? 1u : layout.num_efa_lanes;
+  return make_v2_dispatch_workspace_signal_cmd(
+      target_rank,
+      channel_idx % num_efa_lanes,
+      sizeof(uint64_t),
+      tail_word,
+      tail_offset,
+      /*descriptor_index=*/0,
+      channel_idx);
 }
 
 V2_EFA_HOST_DEVICE inline V2TransferCmd make_v2_combine_payload_cmd(

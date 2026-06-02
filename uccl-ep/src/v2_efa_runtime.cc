@@ -187,6 +187,58 @@ V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_expand_records_jit_plan(
   return build_v2_efa_dispatch_expand_records_jit_plan(jit_config);
 }
 
+V2EfaJitLaunchPlan V2EfaRuntime::build_native_hybrid_dispatch_jit_plan(
+    int num_max_tokens_per_rank, int num_channels_per_sm, int num_sf_packs,
+    int expert_alignment, int num_qps, int64_t num_timeout_cycles,
+    bool cached_mode, bool deterministic, bool do_cpu_sync, int smem_bytes,
+    const std::string& uccl_include_path) const {
+  V2EfaDispatchJitConfig jit_config;
+  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
+  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
+  jit_config.num_experts = config_.num_experts;
+  jit_config.num_topk = config_.num_topk;
+  jit_config.hidden = config_.hidden;
+  jit_config.elem_bytes = config_.elem_bytes;
+  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
+  jit_config.num_channels_per_sm = num_channels_per_sm;
+  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
+  jit_config.scaleout_rank = config_.scaleout_rank;
+  jit_config.scaleup_rank = config_.scaleup_rank;
+  jit_config.num_sf_packs = num_sf_packs;
+  jit_config.expert_alignment = expert_alignment;
+  jit_config.num_qps = num_qps;
+  jit_config.num_timeout_cycles = num_timeout_cycles;
+  jit_config.cached_mode = cached_mode;
+  jit_config.deterministic = deterministic;
+  jit_config.do_cpu_sync = do_cpu_sync;
+  jit_config.smem_bytes = smem_bytes;
+  jit_config.uccl_include_path = uccl_include_path;
+  return build_v2_efa_native_hybrid_dispatch_jit_plan(jit_config);
+}
+
+V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_copy_epilogue_jit_plan(
+    int num_max_tokens_per_rank, int num_channels, int num_sf_packs,
+    bool do_expand, bool cached_mode, int smem_bytes,
+    const std::string& uccl_include_path) const {
+  V2EfaDispatchJitConfig jit_config;
+  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
+  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
+  jit_config.num_experts = config_.num_experts;
+  jit_config.num_topk = config_.num_topk;
+  jit_config.hidden = config_.hidden;
+  jit_config.elem_bytes = config_.elem_bytes;
+  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
+  jit_config.num_channels_per_sm = std::max(1, num_channels / jit_config.num_sms);
+  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
+  jit_config.scaleout_rank = config_.scaleout_rank;
+  jit_config.scaleup_rank = config_.scaleup_rank;
+  jit_config.num_sf_packs = num_sf_packs;
+  jit_config.smem_bytes = smem_bytes;
+  jit_config.uccl_include_path = uccl_include_path;
+  return build_v2_efa_dispatch_copy_epilogue_jit_plan(
+      jit_config, num_channels, do_expand, cached_mode);
+}
+
 V2EfaJitLaunchPlan
 V2EfaRuntime::build_combine_descriptor_enqueue_d2h_jit_plan(
     int num_max_tokens_per_rank, int num_channels, int payload_bytes,

@@ -37,6 +37,10 @@ struct V2EfaDispatchJitConfig {
   int scaleout_rank = 0;
   int scaleup_rank = 0;
   int scale_bytes = 0;
+  int num_sf_packs = 0;
+  int expert_alignment = 1;
+  int num_qps = 1;
+  int64_t num_timeout_cycles = 200000000000ll;
   bool has_topk_weight = true;
   bool cached_mode = false;
   bool deterministic = false;
@@ -152,6 +156,83 @@ inline V2EfaJitLaunchPlan build_v2_efa_dispatch_descriptor_enqueue_d2h_jit_plan(
          << config.num_scaleout_ranks << ", " << config.num_scaleup_ranks
          << ", " << config.num_experts << ", " << config.num_topk << ", "
          << hidden_bytes << ">);\n"
+         << "}\n";
+  plan.source = source.str();
+  return plan;
+}
+
+inline V2EfaJitLaunchPlan build_v2_efa_native_hybrid_dispatch_jit_plan(
+    V2EfaDispatchJitConfig config) {
+  config.num_sms = default_dispatch_num_sms(config);
+  validate_v2_efa_jit_common(
+      config.num_scaleout_ranks, config.num_scaleup_ranks, config.num_experts,
+      config.num_topk, config.num_sms, config.num_max_tokens_per_rank);
+  if (config.num_scaleout_ranks <= 1 || config.hidden <= 0 ||
+      config.elem_bytes <= 0 || config.num_channels_per_sm <= 0 ||
+      config.expert_alignment <= 0 || config.num_qps <= 0 ||
+      config.num_timeout_cycles <= 0) {
+    throw std::invalid_argument(
+        "invalid V2 EFA native hybrid dispatch JIT config");
+  }
+  if (config.deterministic) {
+    throw std::invalid_argument(
+        "native V2 EFA hybrid dispatch does not support deterministic mode");
+  }
+
+  constexpr int kNumNotifyWarps = 4;
+  const int num_notify_warps = config.cached_mode ? 0 : kNumNotifyWarps;
+  const int num_scaleout_warps = config.num_channels_per_sm;
+  const int num_forward_warps = config.num_channels_per_sm;
+  const int num_threads =
+      (num_notify_warps + num_scaleout_warps + num_forward_warps) * 32;
+  if (num_threads <= 0 || num_threads > 1024) {
+    throw std::invalid_argument(
+        "invalid V2 EFA native hybrid dispatch thread count");
+  }
+
+  const int hidden_bytes = config.hidden * config.elem_bytes;
+  V2EfaJitLaunchPlan plan;
+  plan.name = "v2_efa_native_hybrid_dispatch";
+  plan.grid_dim_x = config.num_sms;
+  plan.grid_dim_y = 1;
+  plan.num_threads = num_threads;
+  plan.smem_bytes = config.smem_bytes;
+  plan.cluster_dim = 2 - (config.num_sms % 2);
+  plan.cooperative = true;
+  plan.pdl_enabled = false;
+  plan.num_notify_warps = num_notify_warps;
+  plan.num_scaleout_warps = num_scaleout_warps;
+  plan.num_forward_warps = num_forward_warps;
+
+  std::ostringstream source;
+  source << "#include <deep_ep/common/comm.cuh>\n"
+         << "#include <deep_ep/common/compiled.cuh>\n"
+         << "#include <deep_ep/common/exception.cuh>\n"
+         << "#include <deep_ep/common/layout.cuh>\n"
+         << "#include <deep_ep/common/math.cuh>\n"
+         << "#include <deep_ep/common/ptx.cuh>\n"
+         << "#include "
+         << quote_include(config.uccl_include_path, "v2_efa/dispatch_jit.cuh")
+         << "\n"
+         << "#include "
+         << quote_include(config.uccl_include_path,
+                          "v2_efa/hybrid_dispatch_native.cuh")
+         << "\n\n"
+         << "using namespace deep_ep::elastic;\n\n"
+         << "static void __instantiate_kernel() {\n"
+         << "    auto ptr = reinterpret_cast<void*>(&"
+         << "hybrid_dispatch_impl<"
+         << (config.do_cpu_sync ? "true" : "false") << ", "
+         << ((config.cached_mode || config.deterministic) ? "true" : "false")
+         << ", "
+         << config.num_sms << ", " << num_notify_warps << ", "
+         << num_scaleout_warps << ", " << num_forward_warps << ", "
+         << config.num_scaleout_ranks << ", " << config.num_scaleup_ranks
+         << ", " << hidden_bytes << ", " << config.num_sf_packs << ", "
+         << config.num_max_tokens_per_rank << ", " << config.num_experts
+         << ", " << config.num_topk << ", " << config.expert_alignment
+         << ", " << config.num_qps << ", " << config.num_timeout_cycles
+         << ">);\n"
          << "}\n";
   plan.source = source.str();
   return plan;
@@ -394,6 +475,59 @@ inline V2EfaJitLaunchPlan build_v2_efa_dispatch_expand_records_jit_plan(
          << "    auto ptr = reinterpret_cast<void*>(&"
          << "v2_efa_dispatch_expand_records_kernel<"
          << config.num_topk << ", " << hidden_bytes << ">);\n"
+         << "}\n";
+  plan.source = source.str();
+  return plan;
+}
+
+inline V2EfaJitLaunchPlan build_v2_efa_dispatch_copy_epilogue_jit_plan(
+    V2EfaDispatchJitConfig config, int num_channels, bool do_expand,
+    bool cached_mode) {
+  config.num_sms = default_dispatch_num_sms(config);
+  validate_v2_efa_jit_common(
+      config.num_scaleout_ranks, config.num_scaleup_ranks, config.num_experts,
+      config.num_topk, config.num_sms, config.num_max_tokens_per_rank);
+  if (config.hidden <= 0 || config.elem_bytes <= 0 ||
+      config.num_sf_packs < 0 || num_channels <= 0 ||
+      config.smem_bytes <= 0) {
+    throw std::invalid_argument(
+        "invalid V2 EFA dispatch copy-epilogue JIT config");
+  }
+
+  const int hidden_bytes = config.hidden * config.elem_bytes;
+  const int token_bytes = v2_token_layout_bytes(
+      hidden_bytes, config.num_sf_packs * static_cast<int>(sizeof(float)),
+      config.num_topk, true, true);
+  const int num_warps = std::min(config.smem_bytes / token_bytes, 32);
+  if (num_warps <= 0) {
+    throw std::invalid_argument(
+        "insufficient shared memory for V2 dispatch copy epilogue");
+  }
+
+  V2EfaJitLaunchPlan plan;
+  plan.name = "v2_efa_dispatch_copy_epilogue";
+  plan.grid_dim_x = config.num_sms;
+  plan.grid_dim_y = 1;
+  plan.num_threads = num_warps * 32;
+  plan.smem_bytes = config.smem_bytes;
+  plan.cluster_dim = 1;
+  plan.cooperative = false;
+  plan.pdl_enabled = true;
+
+  std::ostringstream source;
+  source << "#include <deep_ep/impls/dispatch_copy_epilogue.cuh>\n\n"
+         << "using namespace deep_ep::elastic;\n\n"
+         << "static void __instantiate_kernel() {\n"
+         << "    auto ptr = reinterpret_cast<void*>(&"
+         << "dispatch_copy_epilogue_impl<"
+         << (do_expand ? "true" : "false") << ", "
+         << (cached_mode ? "true" : "false") << ", "
+         << config.num_sms << ", " << num_channels << ", " << num_warps
+         << ", " << config.num_scaleout_ranks << ", "
+         << config.num_scaleup_ranks << ", " << hidden_bytes << ", "
+         << config.num_sf_packs << ", " << config.num_max_tokens_per_rank
+         << ", " << config.num_experts << ", " << config.num_topk
+         << ">);\n"
          << "}\n";
   plan.source = source.str();
   return plan;

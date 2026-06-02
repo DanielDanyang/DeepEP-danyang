@@ -1,8 +1,12 @@
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cuda_runtime_api.h>
@@ -103,11 +107,18 @@ nb::dict transfer_cmd_to_dict(const v2::V2TransferCmd& cmd) {
   out["target_rank"] = cmd.target_rank;
   out["target_lane"] = cmd.target_lane;
   out["flags"] = cmd.flags;
-  out["bytes"] = cmd.bytes;
+  out["region"] = v2::v2_transfer_uses_workspace(cmd)
+                      ? static_cast<uint32_t>(v2::EfaMemoryRegion::kWorkspace)
+                      : static_cast<uint32_t>(v2::EfaMemoryRegion::kBuffer);
   out["remote_offset"] = v2::v2_transfer_remote_offset(cmd);
   if (v2::is_v2_transfer_signal(cmd)) {
-    out["signal_value"] = cmd.signal_value;
+    out["bytes"] =
+        (cmd.flags & static_cast<uint8_t>(v2::V2TransferCmdFlags::kSignal64))
+            ? sizeof(uint64_t)
+            : sizeof(uint32_t);
+    out["signal_value"] = v2::v2_transfer_signal_value(cmd);
   } else {
+    out["bytes"] = cmd.bytes;
     out["local_offset"] = v2::v2_transfer_local_offset(cmd);
   }
   return out;
@@ -116,6 +127,7 @@ nb::dict transfer_cmd_to_dict(const v2::V2TransferCmd& cmd) {
 nb::dict efa_post_op_to_dict(const v2::EfaPostOp& op) {
   nb::dict out;
   out["kind"] = static_cast<uint32_t>(op.kind);
+  out["region"] = static_cast<uint32_t>(op.region);
   out["target_rank"] = op.target_rank;
   out["target_lane"] = op.target_lane;
   out["bytes"] = op.bytes;
@@ -126,6 +138,14 @@ nb::dict efa_post_op_to_dict(const v2::EfaPostOp& op) {
   out["batch_index"] = op.batch_index;
   return out;
 }
+
+struct V2ConnectionDrainStats {
+  size_t drained_commands = 0;
+  uint64_t posted_writes = 0;
+  uint64_t posted_signals = 0;
+  uint64_t posted_completions = 0;
+  uint64_t posted_bytes = 0;
+};
 
 nb::dict jit_launch_plan_to_dict(const v2::V2EfaJitLaunchPlan& plan) {
   nb::dict out;
@@ -300,13 +320,17 @@ class V2EfaConnectionHandle {
   V2EfaConnectionHandle(std::uintptr_t local_addr, uint64_t bytes,
                         uint32_t world_size, uint32_t rank,
                         uint32_t num_lanes = 1, int device_index = -1,
-                        uint64_t signal_capacity = 65536)
+                        uint64_t signal_capacity = 65536,
+                        std::uintptr_t workspace_addr = 0,
+                        uint64_t workspace_bytes = 0)
       : local_addr_(local_addr),
         bytes_(bytes),
+        workspace_addr_(workspace_addr),
+        workspace_bytes_(workspace_bytes),
         world_size_(world_size),
         rank_(rank),
         num_lanes_(std::max<uint32_t>(num_lanes, 1)),
-        signal_values_(static_cast<size_t>(std::max<uint64_t>(
+      signal_values_(static_cast<size_t>(std::max<uint64_t>(
             signal_capacity, uint64_t{1}))) {
 #ifndef EFA
     throw std::runtime_error(
@@ -323,6 +347,7 @@ class V2EfaConnectionHandle {
     lane_pds_.reserve(num_lanes_);
     lane_cqs_.reserve(num_lanes_);
     lane_mrs_.reserve(num_lanes_);
+    lane_workspace_mrs_.reserve(num_lanes_);
     lane_signal_mrs_.reserve(num_lanes_);
     lane_gids_.reserve(num_lanes_);
     lane_device_names_.reserve(num_lanes_);
@@ -350,6 +375,16 @@ class V2EfaConnectionHandle {
     out["lkey"] = lane_mrs_.empty() || lane_mrs_[0] == nullptr
                       ? uint32_t{0}
                       : lane_mrs_[0]->lkey;
+    out["workspace_addr"] = workspace_addr_;
+    out["workspace_bytes"] = workspace_bytes_;
+    out["workspace_rkey"] =
+        lane_workspace_mrs_.empty() || lane_workspace_mrs_[0] == nullptr
+            ? uint32_t{0}
+            : lane_workspace_mrs_[0]->rkey;
+    out["workspace_lkey"] =
+        lane_workspace_mrs_.empty() || lane_workspace_mrs_[0] == nullptr
+            ? uint32_t{0}
+            : lane_workspace_mrs_[0]->lkey;
     out["device_name"] =
         lane_device_names_.empty() ? std::string{} : lane_device_names_[0];
     std::vector<uint32_t> qpns;
@@ -375,6 +410,14 @@ class V2EfaConnectionHandle {
       lane_info["lkey"] = lane_mrs_.at(lane) == nullptr
                               ? uint32_t{0}
                               : lane_mrs_.at(lane)->lkey;
+      lane_info["workspace_rkey"] =
+          lane_workspace_mrs_.empty() || lane_workspace_mrs_.at(lane) == nullptr
+              ? uint32_t{0}
+              : lane_workspace_mrs_.at(lane)->rkey;
+      lane_info["workspace_lkey"] =
+          lane_workspace_mrs_.empty() || lane_workspace_mrs_.at(lane) == nullptr
+              ? uint32_t{0}
+              : lane_workspace_mrs_.at(lane)->lkey;
       lane_info["device_name"] = lane_device_names_.at(lane);
       std::vector<uint8_t> lane_gid(16);
       std::memcpy(lane_gid.data(), lane_gids_.at(lane).raw, lane_gid.size());
@@ -400,6 +443,19 @@ class V2EfaConnectionHandle {
           static_cast<uint64_t>(nb::cast<std::uintptr_t>(info["addr"]));
       const auto remote_bytes = nb::cast<uint64_t>(info["bytes"]);
       const auto remote_rkey = nb::cast<uint32_t>(info["rkey"]);
+      const auto remote_workspace_addr =
+          info.contains("workspace_addr")
+              ? static_cast<uint64_t>(
+                    nb::cast<std::uintptr_t>(info["workspace_addr"]))
+              : uint64_t{0};
+      const auto remote_workspace_bytes =
+          info.contains("workspace_bytes")
+              ? nb::cast<uint64_t>(info["workspace_bytes"])
+              : uint64_t{0};
+      const auto remote_workspace_rkey =
+          info.contains("workspace_rkey")
+              ? nb::cast<uint32_t>(info["workspace_rkey"])
+              : uint32_t{0};
       const auto qpns = nb::cast<std::vector<uint32_t>>(info["qpns"]);
       const auto gid = nb::cast<std::vector<uint8_t>>(info["gid"]);
       if (remote_addr == 0 || remote_bytes == 0 || remote_rkey == 0 ||
@@ -415,10 +471,14 @@ class V2EfaConnectionHandle {
         auto lane_gid = gid;
         auto lane_qpn = qpns.at(lane % qpns.size());
         auto lane_rkey = remote_rkey;
+        auto lane_workspace_rkey = remote_workspace_rkey;
         if (has_lane_infos && lane < static_cast<uint32_t>(nb::len(lane_infos))) {
           nb::dict lane_info = nb::cast<nb::dict>(lane_infos[lane]);
           lane_qpn = nb::cast<uint32_t>(lane_info["qpn"]);
           lane_rkey = nb::cast<uint32_t>(lane_info["rkey"]);
+          if (lane_info.contains("workspace_rkey")) {
+            lane_workspace_rkey = nb::cast<uint32_t>(lane_info["workspace_rkey"]);
+          }
           lane_gid = nb::cast<std::vector<uint8_t>>(lane_info["gid"]);
           if (lane_gid.size() != 16) {
             throw std::invalid_argument("invalid V2 EFA lane gid");
@@ -436,6 +496,9 @@ class V2EfaConnectionHandle {
         endpoint.remote_base = remote_addr;
         endpoint.remote_bytes = remote_bytes;
         endpoint.remote_rkey = lane_rkey;
+        endpoint.remote_workspace_base = remote_workspace_addr;
+        endpoint.remote_workspace_bytes = remote_workspace_bytes;
+        endpoint.remote_workspace_rkey = lane_workspace_rkey;
         endpoint_table_->set(endpoint);
       }
     }
@@ -449,6 +512,17 @@ class V2EfaConnectionHandle {
       local_window.lkeys_by_lane.push_back(mr->lkey);
     }
 
+    v2::V2VerbsLocalWindow workspace_window;
+    workspace_window.base = workspace_addr_;
+    workspace_window.bytes = workspace_bytes_;
+    if (!lane_workspace_mrs_.empty() && lane_workspace_mrs_.at(0) != nullptr) {
+      workspace_window.lkey = lane_workspace_mrs_.at(0)->lkey;
+      workspace_window.lkeys_by_lane.reserve(lane_workspace_mrs_.size());
+      for (auto* mr : lane_workspace_mrs_) {
+        workspace_window.lkeys_by_lane.push_back(mr == nullptr ? 0 : mr->lkey);
+      }
+    }
+
     v2::V2VerbsSignalScratch signal_scratch;
     signal_scratch.values = signal_values_.data();
     signal_scratch.capacity = signal_values_.size();
@@ -459,7 +533,7 @@ class V2EfaConnectionHandle {
     }
 
     sink_ = std::make_unique<v2::V2EfaVerbsPostSink>(
-        local_window, signal_scratch, endpoint_table_.get());
+        local_window, workspace_window, signal_scratch, endpoint_table_.get());
   }
 
   bool is_connected() const { return sink_ != nullptr; }
@@ -467,30 +541,71 @@ class V2EfaConnectionHandle {
   nb::dict drain_queue(MappedD2HQueueHandle& queue, bool coalesce = true,
                        bool ack_after_drain = true) {
     ensure_connected();
-    const auto before = sink_->stats();
-    uint64_t observed_ready_end = 0;
-    const auto commands = queue.poll_ready(&observed_ready_end);
-    if (coalesce) {
-      v2::CoalescingEfaPostSink coalesced(sink_.get());
-      v2::drain_v2_transfer_cmds_to_efa_posts(commands, coalesced);
-      coalesced.flush();
-    } else {
-      v2::drain_v2_transfer_cmds_to_efa_posts(commands, *sink_);
-    }
-    if (ack_after_drain) {
-      queue.ack_ready_until(observed_ready_end);
-    }
-    const auto after = sink_->stats();
-    outstanding_signaled_posts_ +=
-        (after.posted_writes - before.posted_writes) +
-        (after.posted_signals - before.posted_signals);
+    const auto stats = drain_queue_internal(queue, coalesce, ack_after_drain);
     nb::dict out;
-    out["drained_commands"] = commands.size();
-    out["posted_writes"] = after.posted_writes - before.posted_writes;
-    out["posted_signals"] = after.posted_signals - before.posted_signals;
-    out["posted_bytes"] = after.posted_bytes - before.posted_bytes;
+    out["drained_commands"] = stats.drained_commands;
+    out["posted_writes"] = stats.posted_writes;
+    out["posted_signals"] = stats.posted_signals;
+    out["posted_completions"] = stats.posted_completions;
+    out["posted_bytes"] = stats.posted_bytes;
     out["head"] = queue.head();
     out["tail"] = queue.tail();
+    return out;
+  }
+
+  void start_proxy(const nb::sequence& queues, bool coalesce = true,
+                   bool ack_after_drain = true, uint32_t num_threads = 1) {
+    ensure_connected();
+    stop_proxy();
+    proxy_queues_.clear();
+    for (size_t i = 0; i < nb::len(queues); ++i) {
+      proxy_queues_.push_back(&nb::cast<MappedD2HQueueHandle&>(queues[i]));
+    }
+    if (proxy_queues_.empty()) {
+      throw std::invalid_argument("V2 EFA proxy needs at least one D2H queue");
+    }
+    proxy_drained_commands_.store(0, std::memory_order_release);
+    proxy_posted_writes_.store(0, std::memory_order_release);
+    proxy_posted_signals_.store(0, std::memory_order_release);
+    proxy_posted_completions_.store(0, std::memory_order_release);
+    proxy_posted_bytes_.store(0, std::memory_order_release);
+    proxy_coalesce_ = coalesce;
+    proxy_ack_after_drain_ = ack_after_drain;
+    proxy_run_.store(true, std::memory_order_release);
+    const auto num_queues = static_cast<uint32_t>(proxy_queues_.size());
+    const auto threads =
+        std::max<uint32_t>(1, std::min<uint32_t>(num_threads, num_queues));
+    proxy_threads_.reserve(threads);
+    for (uint32_t thread_idx = 0; thread_idx < threads; ++thread_idx) {
+      proxy_threads_.emplace_back([this, thread_idx, threads]() {
+        proxy_loop(thread_idx, threads);
+      });
+    }
+  }
+
+  void stop_proxy() {
+    proxy_run_.store(false, std::memory_order_release);
+    for (auto& thread : proxy_threads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+    proxy_threads_.clear();
+  }
+
+  nb::dict proxy_stats() const {
+    nb::dict out;
+    out["drained_commands"] =
+        proxy_drained_commands_.load(std::memory_order_acquire);
+    out["posted_writes"] = proxy_posted_writes_.load(std::memory_order_acquire);
+    out["posted_signals"] =
+        proxy_posted_signals_.load(std::memory_order_acquire);
+    out["posted_completions"] =
+        proxy_posted_completions_.load(std::memory_order_acquire);
+    out["posted_bytes"] = proxy_posted_bytes_.load(std::memory_order_acquire);
+    out["running"] = proxy_run_.load(std::memory_order_acquire);
+    out["num_threads"] = proxy_threads_.size();
+    out["num_queues"] = proxy_queues_.size();
     return out;
   }
 
@@ -499,30 +614,46 @@ class V2EfaConnectionHandle {
     v2::EfaPostOp op;
     op.kind = static_cast<v2::EfaPostOpKind>(
         nb::cast<uint32_t>(op_dict["kind"]));
+    if (op_dict.contains("region")) {
+      op.region = static_cast<v2::EfaMemoryRegion>(
+          nb::cast<uint32_t>(op_dict["region"]));
+    }
     op.target_rank = nb::cast<uint32_t>(op_dict["target_rank"]);
     op.target_lane = nb::cast<uint32_t>(op_dict["target_lane"]);
     op.bytes = nb::cast<uint32_t>(op_dict["bytes"]);
     if (op_dict.contains("signal_value")) {
-      op.signal_value = nb::cast<uint32_t>(op_dict["signal_value"]);
+      op.signal_value = nb::cast<uint64_t>(op_dict["signal_value"]);
     }
     if (op_dict.contains("local_offset")) {
       op.local_offset = nb::cast<uint64_t>(op_dict["local_offset"]);
     }
     op.remote_offset = nb::cast<uint64_t>(op_dict["remote_offset"]);
+    std::lock_guard<std::mutex> lock(sink_mutex_);
     const auto before = sink_->stats();
     sink_->post(op);
     const auto after = sink_->stats();
     outstanding_signaled_posts_ +=
-        (after.posted_writes - before.posted_writes) +
-        (after.posted_signals - before.posted_signals);
+        after.posted_completions - before.posted_completions;
     nb::dict out;
     out["posted_writes"] = after.posted_writes - before.posted_writes;
     out["posted_signals"] = after.posted_signals - before.posted_signals;
+    out["posted_completions"] =
+        after.posted_completions - before.posted_completions;
     out["posted_bytes"] = after.posted_bytes - before.posted_bytes;
     return out;
   }
 
   uint32_t poll_completions(uint32_t max_entries = 64) {
+    std::lock_guard<std::mutex> lock(sink_mutex_);
+    return poll_completions_unlocked(max_entries);
+  }
+
+  uint64_t outstanding_completions() const {
+    std::lock_guard<std::mutex> lock(sink_mutex_);
+    return outstanding_signaled_posts_;
+  }
+
+  uint32_t poll_completions_unlocked(uint32_t max_entries = 64) {
     if (lane_cqs_.empty() || max_entries == 0) {
       return 0;
     }
@@ -568,12 +699,14 @@ class V2EfaConnectionHandle {
     if (sink_ == nullptr) {
       out["posted_writes"] = uint64_t{0};
       out["posted_signals"] = uint64_t{0};
+      out["posted_completions"] = uint64_t{0};
       out["posted_bytes"] = uint64_t{0};
       return out;
     }
     const auto& stats = sink_->stats();
     out["posted_writes"] = stats.posted_writes;
     out["posted_signals"] = stats.posted_signals;
+    out["posted_completions"] = stats.posted_completions;
     out["posted_bytes"] = stats.posted_bytes;
     return out;
   }
@@ -582,6 +715,72 @@ class V2EfaConnectionHandle {
   void ensure_connected() const {
     if (sink_ == nullptr) {
       throw std::runtime_error("V2 EFA connection is not connected");
+    }
+  }
+
+  V2ConnectionDrainStats drain_queue_internal(MappedD2HQueueHandle& queue,
+                                              bool coalesce,
+                                              bool ack_after_drain) {
+    std::lock_guard<std::mutex> lock(sink_mutex_);
+    const auto before = sink_->stats();
+    uint64_t observed_ready_end = 0;
+    const auto commands = queue.poll_ready(&observed_ready_end);
+    if (coalesce) {
+      v2::CoalescingEfaPostSink coalesced(sink_.get());
+      v2::drain_v2_transfer_cmds_to_efa_posts(commands, coalesced);
+      coalesced.flush();
+    } else {
+      v2::drain_v2_transfer_cmds_to_efa_posts(commands, *sink_);
+    }
+    if (ack_after_drain) {
+      queue.ack_ready_until(observed_ready_end);
+    }
+    const auto after = sink_->stats();
+    outstanding_signaled_posts_ +=
+        after.posted_completions - before.posted_completions;
+    V2ConnectionDrainStats stats;
+    stats.drained_commands = commands.size();
+    stats.posted_writes = after.posted_writes - before.posted_writes;
+    stats.posted_signals = after.posted_signals - before.posted_signals;
+    stats.posted_completions =
+        after.posted_completions - before.posted_completions;
+    stats.posted_bytes = after.posted_bytes - before.posted_bytes;
+    return stats;
+  }
+
+  void proxy_loop(uint32_t thread_idx, uint32_t num_threads) {
+    while (proxy_run_.load(std::memory_order_acquire)) {
+      bool progressed = false;
+      for (size_t queue_idx = thread_idx; queue_idx < proxy_queues_.size();
+           queue_idx += num_threads) {
+        auto* queue = proxy_queues_[queue_idx];
+        if (queue == nullptr) {
+          continue;
+        }
+        const auto stats =
+            drain_queue_internal(*queue, proxy_coalesce_,
+                                 proxy_ack_after_drain_);
+        if (stats.drained_commands != 0) {
+          progressed = true;
+          proxy_drained_commands_.fetch_add(stats.drained_commands,
+                                            std::memory_order_relaxed);
+          proxy_posted_writes_.fetch_add(stats.posted_writes,
+                                         std::memory_order_relaxed);
+          proxy_posted_signals_.fetch_add(stats.posted_signals,
+                                          std::memory_order_relaxed);
+          proxy_posted_completions_.fetch_add(stats.posted_completions,
+                                              std::memory_order_relaxed);
+          proxy_posted_bytes_.fetch_add(stats.posted_bytes,
+                                        std::memory_order_relaxed);
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lock(sink_mutex_);
+        (void)poll_completions_unlocked(64);
+      }
+      if (!progressed) {
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+      }
     }
   }
 
@@ -622,6 +821,7 @@ class V2EfaConnectionHandle {
     }
 
     const char* name = ibv_get_device_name(devices[selected]);
+    const std::string device_name = name == nullptr ? std::string{} : name;
     auto* context = ibv_open_device(devices[selected]);
     ibv_free_device_list(devices);
     if (context == nullptr) {
@@ -650,11 +850,28 @@ class V2EfaConnectionHandle {
       ibv_close_device(context);
       throw std::runtime_error("ibv_reg_mr failed for V2 EFA lane window");
     }
+    ibv_mr* workspace_mr = nullptr;
+    if (workspace_addr_ != 0 && workspace_bytes_ != 0) {
+      workspace_mr = ibv_reg_mr(
+          pd, reinterpret_cast<void*>(workspace_addr_), workspace_bytes_,
+          access);
+      if (workspace_mr == nullptr) {
+        ibv_dereg_mr(mr);
+        ibv_destroy_cq(cq);
+        ibv_dealloc_pd(pd);
+        ibv_close_device(context);
+        throw std::runtime_error(
+            "ibv_reg_mr failed for V2 EFA lane workspace");
+      }
+    }
     auto* signal_mr =
         ibv_reg_mr(pd, signal_values_.data(),
-                   signal_values_.size() * sizeof(uint32_t),
+                   signal_values_.size() * sizeof(uint64_t),
                    IBV_ACCESS_LOCAL_WRITE);
     if (signal_mr == nullptr) {
+      if (workspace_mr != nullptr) {
+        ibv_dereg_mr(workspace_mr);
+      }
       ibv_dereg_mr(mr);
       ibv_destroy_cq(cq);
       ibv_dealloc_pd(pd);
@@ -665,6 +882,9 @@ class V2EfaConnectionHandle {
     ibv_gid gid{};
     if (ibv_query_gid(context, 1, 0, &gid) != 0) {
       ibv_dereg_mr(signal_mr);
+      if (workspace_mr != nullptr) {
+        ibv_dereg_mr(workspace_mr);
+      }
       ibv_dereg_mr(mr);
       ibv_destroy_cq(cq);
       ibv_dealloc_pd(pd);
@@ -677,99 +897,11 @@ class V2EfaConnectionHandle {
     lane_pds_.push_back(pd);
     lane_cqs_.push_back(cq);
     lane_mrs_.push_back(mr);
+    lane_workspace_mrs_.push_back(workspace_mr);
     lane_signal_mrs_.push_back(signal_mr);
     lane_gids_.push_back(gid);
-    lane_device_names_.push_back(name == nullptr ? std::string{} : std::string(name));
+    lane_device_names_.push_back(device_name);
     qps_.push_back(qp);
-  }
-
-  void open_device(int requested_index) {
-    int num_devices = 0;
-    auto** devices = ibv_get_device_list(&num_devices);
-    if (devices == nullptr || num_devices == 0) {
-      throw std::runtime_error("ibv_get_device_list found no RDMA devices");
-    }
-
-    int selected = requested_index;
-    if (selected < 0) {
-      if (const char* env = std::getenv("UCCL_V2_EFA_DEVICE_INDEX")) {
-        selected = std::atoi(env);
-      }
-    }
-    if (selected < 0) {
-      selected = 0;
-      for (int i = 0; i < num_devices; ++i) {
-        const char* name = ibv_get_device_name(devices[i]);
-        if (name != nullptr && std::string(name).find("efa") != std::string::npos) {
-          selected = i;
-          break;
-        }
-      }
-    }
-    if (selected < 0 || selected >= num_devices) {
-      ibv_free_device_list(devices);
-      throw std::out_of_range("V2 EFA device index out of range");
-    }
-    device_name_ = ibv_get_device_name(devices[selected]);
-    context_ = ibv_open_device(devices[selected]);
-    ibv_free_device_list(devices);
-    if (context_ == nullptr) {
-      throw std::runtime_error("ibv_open_device failed for V2 EFA");
-    }
-  }
-
-  ibv_qp* create_srd_qp() {
-#ifndef EFA
-    throw std::runtime_error("SRD QP requires EFA");
-#else
-    ibv_qp_init_attr_ex qp_attr{};
-    efadv_qp_init_attr efa_attr{};
-    qp_attr.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_SEND_OPS_FLAGS;
-    qp_attr.send_ops_flags = IBV_QP_EX_WITH_RDMA_WRITE;
-    qp_attr.cap.max_send_wr = kMaxOutstandingSends;
-    qp_attr.cap.max_recv_wr = kMaxOutstandingSends;
-    qp_attr.cap.max_send_sge = 1;
-    qp_attr.cap.max_recv_sge = 1;
-    qp_attr.cap.max_inline_data = 0;
-    qp_attr.pd = pd_;
-    qp_attr.qp_context = context_;
-    qp_attr.sq_sig_all = 1;
-    qp_attr.send_cq = cq_;
-    qp_attr.recv_cq = cq_;
-    qp_attr.qp_type = IBV_QPT_DRIVER;
-
-    efa_attr.driver_qp_type = EFADV_QP_DRIVER_TYPE_SRD;
-    efa_attr.flags = EFADV_QP_FLAGS_UNSOLICITED_WRITE_RECV;
-
-    auto* qp = efadv_create_qp_ex(context_, &qp_attr, &efa_attr,
-                                  sizeof(efadv_qp_init_attr));
-    if (qp == nullptr) {
-      throw std::runtime_error("efadv_create_qp_ex failed for V2 EFA");
-    }
-
-    ibv_qp_attr attr{};
-    attr.qp_state = IBV_QPS_INIT;
-    attr.pkey_index = 0;
-    attr.port_num = 1;
-    attr.qkey = v2::kDefaultEfaQKey;
-    if (ibv_modify_qp(qp, &attr,
-                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
-                          IBV_QP_QKEY) != 0) {
-      throw std::runtime_error("ibv_modify_qp INIT failed for V2 EFA");
-    }
-    std::memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RTR;
-    if (ibv_modify_qp(qp, &attr, IBV_QP_STATE) != 0) {
-      throw std::runtime_error("ibv_modify_qp RTR failed for V2 EFA");
-    }
-    std::memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RTS;
-    attr.sq_psn = 0;
-    if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
-      throw std::runtime_error("ibv_modify_qp RTS failed for V2 EFA");
-    }
-    return qp;
-#endif
   }
 
   ibv_qp* create_srd_qp(ibv_context* context, ibv_pd* pd, ibv_cq* cq) {
@@ -840,21 +972,8 @@ class V2EfaConnectionHandle {
     return ah;
   }
 
-  ibv_ah* create_ah(const std::vector<uint8_t>& remote_gid) {
-    ibv_ah_attr attr{};
-    attr.is_global = 1;
-    attr.port_num = 1;
-    attr.grh.sgid_index = 0;
-    std::memcpy(&attr.grh.dgid, remote_gid.data(), 16);
-    attr.grh.hop_limit = 255;
-    auto* ah = ibv_create_ah(pd_, &attr);
-    if (ah == nullptr) {
-      throw std::runtime_error("ibv_create_ah failed for V2 EFA");
-    }
-    return ah;
-  }
-
   void destroy() {
+    stop_proxy();
     sink_.reset();
     endpoint_table_.reset();
     for (auto* ah : ahs_) {
@@ -875,6 +994,12 @@ class V2EfaConnectionHandle {
       }
     }
     lane_signal_mrs_.clear();
+    for (auto* mr : lane_workspace_mrs_) {
+      if (mr != nullptr) {
+        ibv_dereg_mr(mr);
+      }
+    }
+    lane_workspace_mrs_.clear();
     for (auto* mr : lane_mrs_) {
       if (mr != nullptr) {
         ibv_dereg_mr(mr);
@@ -901,53 +1026,40 @@ class V2EfaConnectionHandle {
     lane_contexts_.clear();
     lane_gids_.clear();
     lane_device_names_.clear();
-    if (signal_mr_ != nullptr) {
-      ibv_dereg_mr(signal_mr_);
-      signal_mr_ = nullptr;
-    }
-    if (mr_ != nullptr) {
-      ibv_dereg_mr(mr_);
-      mr_ = nullptr;
-    }
-    if (cq_ != nullptr) {
-      ibv_destroy_cq(cq_);
-      cq_ = nullptr;
-    }
-    if (pd_ != nullptr) {
-      ibv_dealloc_pd(pd_);
-      pd_ = nullptr;
-    }
-    if (context_ != nullptr) {
-      ibv_close_device(context_);
-      context_ = nullptr;
-    }
   }
 
   std::uintptr_t local_addr_ = 0;
   uint64_t bytes_ = 0;
+  std::uintptr_t workspace_addr_ = 0;
+  uint64_t workspace_bytes_ = 0;
   uint32_t world_size_ = 0;
   uint32_t rank_ = 0;
   uint32_t num_lanes_ = 1;
-  std::string device_name_;
   std::vector<std::string> lane_device_names_;
-  ibv_context* context_ = nullptr;
   std::vector<ibv_context*> lane_contexts_;
-  ibv_pd* pd_ = nullptr;
   std::vector<ibv_pd*> lane_pds_;
-  ibv_cq* cq_ = nullptr;
   std::vector<ibv_cq*> lane_cqs_;
-  ibv_mr* mr_ = nullptr;
   std::vector<ibv_mr*> lane_mrs_;
-  ibv_mr* signal_mr_ = nullptr;
+  std::vector<ibv_mr*> lane_workspace_mrs_;
   std::vector<ibv_mr*> lane_signal_mrs_;
-  ibv_gid gid_{};
   std::vector<ibv_gid> lane_gids_;
   std::vector<ibv_qp*> qps_;
   std::vector<ibv_ah*> ahs_;
-  std::vector<uint32_t> signal_values_;
+  std::vector<uint64_t> signal_values_;
   uint64_t outstanding_signaled_posts_ = 0;
   std::unique_ptr<v2::V2VerbsEndpointTable> endpoint_table_;
   std::unique_ptr<v2::V2EfaVerbsPostSink> sink_;
+  mutable std::mutex sink_mutex_;
+  std::atomic<bool> proxy_run_{false};
+  bool proxy_coalesce_ = true;
+  bool proxy_ack_after_drain_ = true;
+  std::vector<MappedD2HQueueHandle*> proxy_queues_;
+  std::vector<std::thread> proxy_threads_;
+  std::atomic<uint64_t> proxy_drained_commands_{0};
+  std::atomic<uint64_t> proxy_posted_writes_{0};
+  std::atomic<uint64_t> proxy_posted_signals_{0};
+  std::atomic<uint64_t> proxy_posted_completions_{0};
+  std::atomic<uint64_t> proxy_posted_bytes_{0};
 };
 
 #endif  // UCCL_V2_EFA_HAS_VERBS
@@ -1021,20 +1133,29 @@ NB_MODULE(ep, m) {
 #if UCCL_V2_EFA_HAS_VERBS
   nb::class_<V2EfaConnectionHandle>(m, "V2EfaConnection")
       .def(nb::init<std::uintptr_t, uint64_t, uint32_t, uint32_t, uint32_t,
-                    int, uint64_t>(),
+                    int, uint64_t, std::uintptr_t, uint64_t>(),
            nb::arg("local_addr"), nb::arg("bytes"), nb::arg("world_size"),
            nb::arg("rank"), nb::arg("num_lanes") = 1,
            nb::arg("device_index") = -1,
-           nb::arg("signal_capacity") = 65536)
+           nb::arg("signal_capacity") = 65536,
+           nb::arg("workspace_addr") = 0,
+           nb::arg("workspace_bytes") = 0)
       .def("local_info", &V2EfaConnectionHandle::local_info)
       .def("connect", &V2EfaConnectionHandle::connect)
       .def("is_connected", &V2EfaConnectionHandle::is_connected)
       .def("drain_queue", &V2EfaConnectionHandle::drain_queue,
            nb::arg("queue"), nb::arg("coalesce") = true,
            nb::arg("ack_after_drain") = true)
+      .def("start_proxy", &V2EfaConnectionHandle::start_proxy,
+           nb::arg("queues"), nb::arg("coalesce") = true,
+           nb::arg("ack_after_drain") = true, nb::arg("num_threads") = 1)
+      .def("stop_proxy", &V2EfaConnectionHandle::stop_proxy)
+      .def("proxy_stats", &V2EfaConnectionHandle::proxy_stats)
       .def("post_op", &V2EfaConnectionHandle::post_op)
       .def("poll_completions", &V2EfaConnectionHandle::poll_completions,
            nb::arg("max_entries") = 64)
+      .def("outstanding_completions",
+           &V2EfaConnectionHandle::outstanding_completions)
       .def("stats", &V2EfaConnectionHandle::stats);
 #endif
 
@@ -1087,6 +1208,31 @@ NB_MODULE(ep, m) {
            nb::arg("num_channels_per_sm") = 1,
            nb::arg("scale_bytes") = 0,
            nb::arg("has_topk_weight") = true,
+           nb::arg("cached_mode") = false,
+           nb::arg("deterministic") = false,
+           nb::arg("do_cpu_sync") = false,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("uccl_include_path") = "")
+      .def("compile_native_hybrid_dispatch_jit",
+           [](const v2::V2EfaRuntime& self, int num_max_tokens_per_rank,
+              int num_channels_per_sm, int num_sf_packs,
+              int expert_alignment, int num_qps,
+              std::int64_t num_timeout_cycles, bool cached_mode,
+              bool deterministic, bool do_cpu_sync, int smem_bytes,
+              const std::string& uccl_include_path) {
+             const auto plan = self.build_native_hybrid_dispatch_jit_plan(
+                 num_max_tokens_per_rank, num_channels_per_sm, num_sf_packs,
+                 expert_alignment, num_qps, num_timeout_cycles, cached_mode,
+                 deterministic, do_cpu_sync, smem_bytes, uccl_include_path);
+             v2::compile_v2_efa_jit_plan(plan);
+             return jit_launch_plan_to_dict(plan);
+           },
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm") = 1,
+           nb::arg("num_sf_packs") = 0,
+           nb::arg("expert_alignment") = 1,
+           nb::arg("num_qps") = 1,
+           nb::arg("num_timeout_cycles") = 200000000000ll,
            nb::arg("cached_mode") = false,
            nb::arg("deterministic") = false,
            nb::arg("do_cpu_sync") = false,
@@ -1271,6 +1417,174 @@ NB_MODULE(ep, m) {
            nb::arg("record_topk_weight_bytes") = 0,
            nb::arg("signal_stride") = sizeof(std::uint32_t),
            nb::arg("num_efa_lanes") = 1,
+           nb::arg("uccl_include_path") = "",
+           nb::arg("cuda_stream_ptr") = 0)
+      .def("launch_native_hybrid_dispatch",
+           [](const v2::V2EfaRuntime& self, std::uintptr_t x_ptr,
+              std::uintptr_t sf_ptr, std::uintptr_t topk_idx_ptr,
+              std::uintptr_t topk_weights_ptr,
+              std::uintptr_t copied_topk_idx_ptr,
+              std::uintptr_t cumulative_local_expert_recv_stats_ptr,
+              std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+              std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+              std::uintptr_t dst_buffer_slot_idx_ptr,
+              std::uintptr_t token_metadata_at_forward_ptr, int num_tokens,
+              int num_max_tokens_per_rank, int num_channels_per_sm,
+              int num_sf_packs, int sf_token_stride, int sf_hidden_stride,
+              int expert_alignment, int num_qps,
+              std::int64_t num_timeout_cycles, bool cached_mode,
+              bool deterministic, bool do_cpu_sync, int smem_bytes,
+              std::uintptr_t nccl_dev_comm_ptr,
+              std::uintptr_t nccl_window_ptr, std::uintptr_t buffer_ptr,
+              std::uintptr_t workspace_ptr,
+              std::uintptr_t mapped_host_workspace_ptr,
+              std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+              std::uintptr_t tail_ptr, int queue_capacity,
+              std::uintptr_t buffer_base, std::uintptr_t workspace_base,
+              std::uint64_t local_payload_base,
+              std::uint64_t remote_payload_base,
+              std::uint64_t remote_signal_base, std::uint32_t src_token_stride,
+              std::uint32_t expanded_slot_stride,
+              std::uint32_t batch_payload_stride,
+              std::uint32_t source_rank_stride,
+              std::uint32_t source_signal_stride,
+              std::uint32_t token_record_bytes,
+              std::uint32_t record_payload_offset,
+              std::uint32_t record_src_global_offset,
+              std::uint32_t record_topk_idx_offset,
+              std::uint32_t record_topk_weight_offset,
+              std::uint32_t record_topk_weight_bytes,
+              std::uint32_t signal_stride, std::uint32_t num_efa_lanes,
+              const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             v2::DispatchTransferLayout layout;
+             layout.local_payload_base = local_payload_base;
+             layout.remote_payload_base = remote_payload_base;
+             layout.remote_signal_base = remote_signal_base;
+             layout.src_token_stride = src_token_stride;
+             layout.expanded_slot_stride = expanded_slot_stride;
+             layout.batch_payload_stride = batch_payload_stride;
+             layout.source_rank_stride = source_rank_stride;
+             layout.source_signal_stride = source_signal_stride;
+             layout.token_record_bytes = token_record_bytes;
+             layout.record_payload_offset = record_payload_offset;
+             layout.record_src_global_offset = record_src_global_offset;
+             layout.record_topk_idx_offset = record_topk_idx_offset;
+             layout.record_topk_weight_offset = record_topk_weight_offset;
+             layout.record_topk_weight_bytes = record_topk_weight_bytes;
+             layout.signal_stride = signal_stride;
+             layout.num_efa_lanes = std::max<std::uint32_t>(num_efa_lanes, 1);
+             self.launch_native_hybrid_dispatch(
+                 x_ptr, sf_ptr, topk_idx_ptr, topk_weights_ptr,
+                 copied_topk_idx_ptr, cumulative_local_expert_recv_stats_ptr,
+                 psum_num_recv_tokens_per_scaleup_rank_ptr,
+                 psum_num_recv_tokens_per_expert_ptr, dst_buffer_slot_idx_ptr,
+                 token_metadata_at_forward_ptr, num_tokens,
+                 num_max_tokens_per_rank, num_channels_per_sm, num_sf_packs,
+                 sf_token_stride, sf_hidden_stride, expert_alignment, num_qps,
+                 num_timeout_cycles, cached_mode, deterministic, do_cpu_sync,
+                 smem_bytes, nccl_dev_comm_ptr, nccl_window_ptr, buffer_ptr,
+                 workspace_ptr, mapped_host_workspace_ptr, commands_ptr,
+                 head_ptr, tail_ptr, queue_capacity, buffer_base,
+                 workspace_base, layout, uccl_include_path, cuda_stream_ptr);
+           },
+           nb::arg("x_ptr"),
+           nb::arg("sf_ptr"),
+           nb::arg("topk_idx_ptr"),
+           nb::arg("topk_weights_ptr"),
+           nb::arg("copied_topk_idx_ptr"),
+           nb::arg("cumulative_local_expert_recv_stats_ptr"),
+           nb::arg("psum_num_recv_tokens_per_scaleup_rank_ptr"),
+           nb::arg("psum_num_recv_tokens_per_expert_ptr"),
+           nb::arg("dst_buffer_slot_idx_ptr"),
+           nb::arg("token_metadata_at_forward_ptr"),
+           nb::arg("num_tokens"),
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels_per_sm") = 1,
+           nb::arg("num_sf_packs") = 0,
+           nb::arg("sf_token_stride") = 0,
+           nb::arg("sf_hidden_stride") = 0,
+           nb::arg("expert_alignment") = 1,
+           nb::arg("num_qps") = 1,
+           nb::arg("num_timeout_cycles") = 200000000000ll,
+           nb::arg("cached_mode") = false,
+           nb::arg("deterministic") = false,
+           nb::arg("do_cpu_sync") = true,
+           nb::arg("smem_bytes") = 228 * 1024,
+           nb::arg("nccl_dev_comm_ptr"),
+           nb::arg("nccl_window_ptr"),
+           nb::arg("buffer_ptr"),
+           nb::arg("workspace_ptr"),
+           nb::arg("mapped_host_workspace_ptr"),
+           nb::arg("commands_ptr"),
+           nb::arg("head_ptr"),
+           nb::arg("tail_ptr"),
+           nb::arg("queue_capacity"),
+           nb::arg("buffer_base"),
+           nb::arg("workspace_base"),
+           nb::arg("local_payload_base") = 0,
+           nb::arg("remote_payload_base") = 0,
+           nb::arg("remote_signal_base") = 0,
+           nb::arg("src_token_stride") = 0,
+           nb::arg("expanded_slot_stride") = 0,
+           nb::arg("batch_payload_stride") = 0,
+           nb::arg("source_rank_stride") = 0,
+           nb::arg("source_signal_stride") = 0,
+           nb::arg("token_record_bytes") = 0,
+           nb::arg("record_payload_offset") = 0,
+           nb::arg("record_src_global_offset") = 0,
+           nb::arg("record_topk_idx_offset") = 0,
+           nb::arg("record_topk_weight_offset") = 0,
+           nb::arg("record_topk_weight_bytes") = 0,
+           nb::arg("signal_stride") = sizeof(std::uint32_t),
+           nb::arg("num_efa_lanes") = 1,
+           nb::arg("uccl_include_path") = "",
+           nb::arg("cuda_stream_ptr") = 0)
+      .def("launch_dispatch_copy_epilogue",
+           [](const v2::V2EfaRuntime& self, std::uintptr_t buffer_ptr,
+              std::uintptr_t workspace_ptr,
+              std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+              std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+              std::uintptr_t recv_x_ptr, std::uintptr_t recv_sf_ptr,
+              std::uintptr_t recv_topk_idx_ptr,
+              std::uintptr_t recv_topk_weights_ptr,
+              std::uintptr_t recv_src_metadata_ptr,
+              std::uintptr_t channel_linked_list_ptr, int num_recv_tokens,
+              int num_max_tokens_per_rank, int num_channels,
+              int num_sf_packs, int recv_sf_token_stride,
+              int recv_sf_hidden_stride, bool do_expand, bool cached_mode,
+              int smem_bytes, const std::string& uccl_include_path,
+              std::uintptr_t cuda_stream_ptr) {
+             self.launch_dispatch_copy_epilogue(
+                 buffer_ptr, workspace_ptr,
+                 psum_num_recv_tokens_per_scaleup_rank_ptr,
+                 psum_num_recv_tokens_per_expert_ptr, recv_x_ptr, recv_sf_ptr,
+                 recv_topk_idx_ptr, recv_topk_weights_ptr,
+                 recv_src_metadata_ptr, channel_linked_list_ptr,
+                 num_recv_tokens, num_max_tokens_per_rank, num_channels,
+                 num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
+                 do_expand, cached_mode, smem_bytes, uccl_include_path,
+                 cuda_stream_ptr);
+           },
+           nb::arg("buffer_ptr"),
+           nb::arg("workspace_ptr"),
+           nb::arg("psum_num_recv_tokens_per_scaleup_rank_ptr"),
+           nb::arg("psum_num_recv_tokens_per_expert_ptr"),
+           nb::arg("recv_x_ptr"),
+           nb::arg("recv_sf_ptr"),
+           nb::arg("recv_topk_idx_ptr"),
+           nb::arg("recv_topk_weights_ptr"),
+           nb::arg("recv_src_metadata_ptr"),
+           nb::arg("channel_linked_list_ptr"),
+           nb::arg("num_recv_tokens"),
+           nb::arg("num_max_tokens_per_rank"),
+           nb::arg("num_channels"),
+           nb::arg("num_sf_packs") = 0,
+           nb::arg("recv_sf_token_stride") = 0,
+           nb::arg("recv_sf_hidden_stride") = 0,
+           nb::arg("do_expand") = false,
+           nb::arg("cached_mode") = false,
+           nb::arg("smem_bytes") = 228 * 1024,
            nb::arg("uccl_include_path") = "",
            nb::arg("cuda_stream_ptr") = 0)
       .def("launch_dispatch_forward_metadata",

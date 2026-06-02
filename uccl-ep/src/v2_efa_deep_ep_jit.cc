@@ -1,7 +1,10 @@
 #include "v2_efa/runtime.hpp"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <deep_ep/common/compiled.cuh>
 #include <cuda_runtime_api.h>
+#include <nccl.h>
+#include <nccl_device.h>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -324,6 +327,96 @@ void launch_v2_efa_dispatch_expand_records_plan(
       num_expanded_tokens, has_topk_weight));
 }
 
+void launch_v2_efa_native_hybrid_dispatch_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t x_ptr,
+    std::uintptr_t sf_ptr, std::uintptr_t topk_idx_ptr,
+    std::uintptr_t topk_weights_ptr, std::uintptr_t copied_topk_idx_ptr,
+    std::uintptr_t cumulative_local_expert_recv_stats_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+    std::uintptr_t dst_buffer_slot_idx_ptr,
+    std::uintptr_t token_metadata_at_forward_ptr, int num_tokens,
+    int sf_token_stride, int sf_hidden_stride,
+    std::uintptr_t nccl_dev_comm_ptr, std::uintptr_t nccl_window_ptr,
+    std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
+    std::uintptr_t mapped_host_workspace_ptr, int scaleout_rank,
+    int scaleup_rank, std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
+    std::uintptr_t tail_ptr, int queue_capacity, std::uintptr_t buffer_base,
+    std::uintptr_t workspace_base, DispatchTransferLayout layout,
+    std::uintptr_t cuda_stream_ptr) {
+  if (num_tokens < 0 || sf_token_stride < 0 || sf_hidden_stride < 0 ||
+      queue_capacity <= 0 || buffer_base == 0 || workspace_base == 0 ||
+      nccl_dev_comm_ptr == 0 || nccl_window_ptr == 0 ||
+      mapped_host_workspace_ptr == 0) {
+    throw std::invalid_argument("invalid V2 EFA native hybrid dispatch launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config, reinterpret_cast<void*>(x_ptr),
+      reinterpret_cast<deep_ep::sf_pack_t*>(sf_ptr),
+      checked_ptr<deep_ep::topk_idx_t>(topk_idx_ptr, "topk_idx"),
+      reinterpret_cast<float*>(topk_weights_ptr),
+      reinterpret_cast<deep_ep::topk_idx_t*>(copied_topk_idx_ptr),
+      reinterpret_cast<int*>(cumulative_local_expert_recv_stats_ptr),
+      checked_ptr<int>(psum_num_recv_tokens_per_scaleup_rank_ptr,
+                       "psum_num_recv_tokens_per_scaleup_rank"),
+      checked_ptr<int>(psum_num_recv_tokens_per_expert_ptr,
+                       "psum_num_recv_tokens_per_expert"),
+      checked_ptr<int>(dst_buffer_slot_idx_ptr, "dst_buffer_slot_idx"),
+      checked_ptr<int>(token_metadata_at_forward_ptr,
+                       "token_metadata_at_forward"),
+      num_tokens, sf_token_stride, sf_hidden_stride,
+      *checked_ptr<ncclDevComm_t>(nccl_dev_comm_ptr, "nccl_dev_comm"),
+      reinterpret_cast<ncclWindow_t>(nccl_window_ptr),
+      checked_ptr<void>(buffer_ptr, "buffer"),
+      checked_ptr<void>(workspace_ptr, "workspace"),
+      checked_ptr<void>(mapped_host_workspace_ptr, "mapped_host_workspace"),
+      scaleout_rank, scaleup_rank,
+      checked_ptr<V2TransferCmd>(commands_ptr, "commands"),
+      checked_ptr<uint64_t>(head_ptr, "head"),
+      checked_ptr<uint64_t>(tail_ptr, "tail"),
+      checked_queue_capacity(queue_capacity), buffer_base, workspace_base,
+      layout));
+}
+
+void launch_v2_efa_dispatch_copy_epilogue_plan(
+    const V2EfaJitLaunchPlan& plan, std::uintptr_t buffer_ptr,
+    std::uintptr_t workspace_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+    std::uintptr_t recv_x_ptr, std::uintptr_t recv_sf_ptr,
+    std::uintptr_t recv_topk_idx_ptr,
+    std::uintptr_t recv_topk_weights_ptr,
+    std::uintptr_t recv_src_metadata_ptr,
+    std::uintptr_t channel_linked_list_ptr, int num_recv_tokens,
+    int recv_sf_token_stride, int recv_sf_hidden_stride, int scaleout_rank,
+    int scaleup_rank, std::uintptr_t cuda_stream_ptr) {
+  if (num_recv_tokens < 0 || recv_sf_token_stride < 0 ||
+      recv_sf_hidden_stride < 0) {
+    throw std::invalid_argument("invalid V2 EFA dispatch epilogue launch");
+  }
+
+  const auto runtime = build_v2_efa_jit_runtime(plan);
+  auto config = make_launch_config(plan, runtime->kernel, cuda_stream_ptr);
+  check_jit_launch_result(deep_ep::jit::launch_kernel(
+      runtime->kernel, config, checked_ptr<void>(buffer_ptr, "buffer"),
+      checked_ptr<void>(workspace_ptr, "workspace"),
+      checked_ptr<int>(psum_num_recv_tokens_per_scaleup_rank_ptr,
+                       "psum_num_recv_tokens_per_scaleup_rank"),
+      checked_ptr<int>(psum_num_recv_tokens_per_expert_ptr,
+                       "psum_num_recv_tokens_per_expert"),
+      checked_ptr<void>(recv_x_ptr, "recv_x"),
+      reinterpret_cast<deep_ep::sf_pack_t*>(recv_sf_ptr),
+      reinterpret_cast<deep_ep::topk_idx_t*>(recv_topk_idx_ptr),
+      reinterpret_cast<float*>(recv_topk_weights_ptr),
+      checked_ptr<int>(recv_src_metadata_ptr, "recv_src_metadata"),
+      reinterpret_cast<int*>(channel_linked_list_ptr), num_recv_tokens,
+      recv_sf_token_stride, recv_sf_hidden_stride, scaleout_rank,
+      scaleup_rank));
+}
+
 void launch_v2_efa_combine_descriptor_enqueue_d2h_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t dispatch_segments_ptr,
     std::uintptr_t dispatch_batches_ptr, int num_dispatch_batches,
@@ -547,6 +640,75 @@ void V2EfaRuntime::launch_dispatch_expand_records(
       plan, recv_x_ptr, recv_topk_weights_ptr, recv_src_metadata_ptr,
       expanded_x_ptr, expanded_topk_weights_ptr, num_recv_tokens,
       num_expanded_tokens, has_topk_weight, cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_native_hybrid_dispatch(
+    std::uintptr_t x_ptr, std::uintptr_t sf_ptr,
+    std::uintptr_t topk_idx_ptr, std::uintptr_t topk_weights_ptr,
+    std::uintptr_t copied_topk_idx_ptr,
+    std::uintptr_t cumulative_local_expert_recv_stats_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+    std::uintptr_t dst_buffer_slot_idx_ptr,
+    std::uintptr_t token_metadata_at_forward_ptr, int num_tokens,
+    int num_max_tokens_per_rank, int num_channels_per_sm, int num_sf_packs,
+    int sf_token_stride, int sf_hidden_stride, int expert_alignment,
+    int num_qps, int64_t num_timeout_cycles, bool cached_mode,
+    bool deterministic, bool do_cpu_sync, int smem_bytes,
+    std::uintptr_t nccl_dev_comm_ptr, std::uintptr_t nccl_window_ptr,
+    std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
+    std::uintptr_t mapped_host_workspace_ptr, std::uintptr_t commands_ptr,
+    std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
+    std::uintptr_t buffer_base, std::uintptr_t workspace_base,
+    DispatchTransferLayout layout, const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto& cfg = config();
+  layout.skip_scaleout_rank = cfg.scaleout_rank;
+  layout.num_scaleup_ranks = static_cast<uint32_t>(cfg.num_scaleup_ranks);
+  layout.num_ranks = static_cast<uint32_t>(cfg.world_size);
+  layout.source_rank = static_cast<uint32_t>(cfg.rank);
+  layout.max_batches = static_cast<uint32_t>(cfg.num_experts);
+  const auto plan = build_native_hybrid_dispatch_jit_plan(
+      num_max_tokens_per_rank, num_channels_per_sm, num_sf_packs,
+      expert_alignment, num_qps, num_timeout_cycles, cached_mode,
+      deterministic, do_cpu_sync, smem_bytes, uccl_include_path);
+  launch_v2_efa_native_hybrid_dispatch_plan(
+      plan, x_ptr, sf_ptr, topk_idx_ptr, topk_weights_ptr,
+      copied_topk_idx_ptr, cumulative_local_expert_recv_stats_ptr,
+      psum_num_recv_tokens_per_scaleup_rank_ptr,
+      psum_num_recv_tokens_per_expert_ptr, dst_buffer_slot_idx_ptr,
+      token_metadata_at_forward_ptr, num_tokens, sf_token_stride,
+      sf_hidden_stride, nccl_dev_comm_ptr, nccl_window_ptr, buffer_ptr,
+      workspace_ptr, mapped_host_workspace_ptr, cfg.scaleout_rank,
+      cfg.scaleup_rank, commands_ptr, head_ptr, tail_ptr, queue_capacity,
+      buffer_base, workspace_base, layout, cuda_stream_ptr);
+}
+
+void V2EfaRuntime::launch_dispatch_copy_epilogue(
+    std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+    std::uintptr_t psum_num_recv_tokens_per_expert_ptr,
+    std::uintptr_t recv_x_ptr, std::uintptr_t recv_sf_ptr,
+    std::uintptr_t recv_topk_idx_ptr,
+    std::uintptr_t recv_topk_weights_ptr,
+    std::uintptr_t recv_src_metadata_ptr,
+    std::uintptr_t channel_linked_list_ptr, int num_recv_tokens,
+    int num_max_tokens_per_rank, int num_channels, int num_sf_packs,
+    int recv_sf_token_stride, int recv_sf_hidden_stride, bool do_expand,
+    bool cached_mode, int smem_bytes, const std::string& uccl_include_path,
+    std::uintptr_t cuda_stream_ptr) const {
+  const auto& cfg = config();
+  const auto plan = build_dispatch_copy_epilogue_jit_plan(
+      num_max_tokens_per_rank, num_channels, num_sf_packs, do_expand,
+      cached_mode, smem_bytes, uccl_include_path);
+  launch_v2_efa_dispatch_copy_epilogue_plan(
+      plan, buffer_ptr, workspace_ptr,
+      psum_num_recv_tokens_per_scaleup_rank_ptr,
+      psum_num_recv_tokens_per_expert_ptr, recv_x_ptr, recv_sf_ptr,
+      recv_topk_idx_ptr, recv_topk_weights_ptr, recv_src_metadata_ptr,
+      channel_linked_list_ptr, num_recv_tokens, recv_sf_token_stride,
+      recv_sf_hidden_stride, cfg.scaleout_rank, cfg.scaleup_rank,
+      cuda_stream_ptr);
 }
 
 void V2EfaRuntime::launch_combine_descriptor_enqueue_d2h(
