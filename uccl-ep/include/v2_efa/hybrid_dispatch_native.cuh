@@ -38,9 +38,11 @@ hybrid_dispatch_impl(
     void* buffer,
     void* workspace, void* mapped_host_workspace,
     const int scaleout_rank_idx, const int scaleup_rank_idx,
-    uccl::v2_efa::V2TransferCmd* d2h_commands,
-    uint64_t* d2h_head, uint64_t* d2h_tail,
-    const int d2h_capacity, const uint64_t buffer_base,
+    // Multi-queue: one view per proxy thread (sharded by channel_idx % num_d2h_queues).
+    // For a single-queue launch, pass num_d2h_queues=1.
+    const uccl::v2_efa::V2TransferD2HQueueView* d2h_queue_views,
+    const uint32_t num_d2h_queues,
+    const uint64_t buffer_base,
     const uint64_t workspace_base,
     uccl::v2_efa::DispatchTransferLayout transfer_layout) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
@@ -74,11 +76,11 @@ hybrid_dispatch_impl(
         sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    uccl::v2_efa::V2TransferD2HQueueView d2h_queue{
-        d2h_commands,
-        d2h_head,
-        d2h_tail,
-        static_cast<uint32_t>(d2h_capacity)};
+    // Each SM selects its D2H queue by channel_idx % num_d2h_queues.
+    // For the notify warp (no channel affinity) we use thread_idx % num_d2h_queues
+    // so work fans out evenly across queues.
+    const auto num_queues = (num_d2h_queues > 0) ? num_d2h_queues : 1u;
+    const auto notify_queue = d2h_queue_views[thread_idx % num_queues];
 
     // The golden layout during the whole process for both scale-out and forward warps
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
@@ -176,14 +178,14 @@ hybrid_dispatch_impl(
                 const auto dst_global_rank_idx =
                     dst_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
                 if (not uccl::v2_efa::detail::enqueue_native_dispatch_workspace_write(
-                    d2h_queue,
+                    notify_queue,
                     workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),
                     workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),
                     kNumScaleupRanks * sizeof(int), dst_global_rank_idx,
                     dst_scaleout_rank_idx, workspace_base, transfer_layout))
                     asm volatile("trap;");
                 if (not uccl::v2_efa::detail::enqueue_native_dispatch_workspace_write(
-                    d2h_queue,
+                    notify_queue,
                     workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx),
                     workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx),
                     kNumExpertsPerScaleout * sizeof(int), dst_global_rank_idx,
@@ -329,6 +331,8 @@ hybrid_dispatch_impl(
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         const int scaleout_warp_idx = warp_idx - kNumNotifyWarps;
         const int channel_idx = sm_idx * kNumChannelsPerSM + scaleout_warp_idx;
+        // Each channel owns one D2H queue (round-robin assignment).
+        const auto scaleout_queue = d2h_queue_views[static_cast<uint32_t>(channel_idx) % num_queues];
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumMaxTokensPerChannel>(channel_idx);
 
@@ -346,7 +350,7 @@ hybrid_dispatch_impl(
                 const auto dst_global_rank_idx =
                     lane_idx * kNumScaleupRanks + scaleup_rank_idx;
                 if (not uccl::v2_efa::detail::enqueue_native_dispatch_tail(
-                    d2h_queue, ptr, static_cast<uint64_t>(signaled_tail),
+                    scaleout_queue, ptr, static_cast<uint64_t>(signaled_tail),
                     dst_global_rank_idx, channel_idx, workspace_base,
                     transfer_layout))
                     asm volatile("trap;");
@@ -454,7 +458,7 @@ hybrid_dispatch_impl(
                 const auto dst_global_rank_idx =
                     stored_dst_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
                 if (not uccl::v2_efa::detail::enqueue_native_dispatch_payload(
-                        d2h_queue,
+                        scaleout_queue,
                         scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
                         scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
                         tma_buffer.get_num_bytes<false>(),

@@ -340,12 +340,15 @@ void launch_v2_efa_native_hybrid_dispatch_plan(
     std::uintptr_t nccl_dev_comm_ptr, std::uintptr_t nccl_window_ptr,
     std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
     std::uintptr_t mapped_host_workspace_ptr, int scaleout_rank,
-    int scaleup_rank, std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
-    std::uintptr_t tail_ptr, int queue_capacity, std::uintptr_t buffer_base,
+    int scaleup_rank,
+    // Multi-queue: GPU pointer to array of V2TransferD2HQueueView structs.
+    std::uintptr_t queue_views_ptr, uint32_t num_queues,
+    std::uintptr_t buffer_base,
     std::uintptr_t workspace_base, DispatchTransferLayout layout,
     std::uintptr_t cuda_stream_ptr) {
   if (num_tokens < 0 || sf_token_stride < 0 || sf_hidden_stride < 0 ||
-      queue_capacity <= 0 || buffer_base == 0 || workspace_base == 0 ||
+      num_queues == 0 || queue_views_ptr == 0 ||
+      buffer_base == 0 || workspace_base == 0 ||
       nccl_dev_comm_ptr == 0 || nccl_window_ptr == 0 ||
       mapped_host_workspace_ptr == 0) {
     throw std::invalid_argument("invalid V2 EFA native hybrid dispatch launch");
@@ -374,10 +377,9 @@ void launch_v2_efa_native_hybrid_dispatch_plan(
       checked_ptr<void>(workspace_ptr, "workspace"),
       checked_ptr<void>(mapped_host_workspace_ptr, "mapped_host_workspace"),
       scaleout_rank, scaleup_rank,
-      checked_ptr<V2TransferCmd>(commands_ptr, "commands"),
-      checked_ptr<uint64_t>(head_ptr, "head"),
-      checked_ptr<uint64_t>(tail_ptr, "tail"),
-      checked_queue_capacity(queue_capacity), buffer_base, workspace_base,
+      reinterpret_cast<const V2TransferD2HQueueView*>(queue_views_ptr),
+      num_queues,
+      buffer_base, workspace_base,
       layout));
 }
 
@@ -657,8 +659,8 @@ void V2EfaRuntime::launch_native_hybrid_dispatch(
     bool deterministic, bool do_cpu_sync, int smem_bytes,
     std::uintptr_t nccl_dev_comm_ptr, std::uintptr_t nccl_window_ptr,
     std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
-    std::uintptr_t mapped_host_workspace_ptr, std::uintptr_t commands_ptr,
-    std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
+    std::uintptr_t mapped_host_workspace_ptr,
+    std::uintptr_t queue_views_ptr, uint32_t num_queues,
     std::uintptr_t buffer_base, std::uintptr_t workspace_base,
     DispatchTransferLayout layout, const std::string& uccl_include_path,
     std::uintptr_t cuda_stream_ptr) const {
@@ -680,7 +682,7 @@ void V2EfaRuntime::launch_native_hybrid_dispatch(
       token_metadata_at_forward_ptr, num_tokens, sf_token_stride,
       sf_hidden_stride, nccl_dev_comm_ptr, nccl_window_ptr, buffer_ptr,
       workspace_ptr, mapped_host_workspace_ptr, cfg.scaleout_rank,
-      cfg.scaleup_rank, commands_ptr, head_ptr, tail_ptr, queue_capacity,
+      cfg.scaleup_rank, queue_views_ptr, num_queues,
       buffer_base, workspace_base, layout, cuda_stream_ptr);
 }
 

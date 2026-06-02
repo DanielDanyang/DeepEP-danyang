@@ -172,6 +172,36 @@ public:
         return comm_stream;
     }
 
+    // Expose all pointers needed to drive the native V2 EFA dispatch kernel.
+    // Returns mapped pointers for V2 JIT kernels plus raw symmetric pointers
+    // for EFA MR registration.  NCCL may expose a local LSA pointer through
+    // ncclGetLsaDevicePointer(); kernels should use that mapped pointer, while
+    // verbs registration must use the original symmetric allocation address.
+    // Keys:
+    //   buffer_ptr/workspace_ptr: mapped device pointers for CUDA kernels.
+    //   rdma_buffer_ptr/rdma_workspace_ptr: raw pointers for EFA ibv_reg_mr.
+    //   host_workspace_ptr/mapped_host_workspace_ptr,
+    //   nccl_dev_comm_ptr/nccl_window_ptr.
+    // as a dict of int64 values so Python can pass them to uccl-ep.
+    pybind11::dict get_native_v2_resources() const {
+        const auto num_workspace_bytes = math::align<int64_t>(
+            layout::WorkspaceLayout::get_num_bytes(), symmetric::kNumAlignmentBytes);
+        auto* raw_workspace = nccl_context->get_raw_window_ptr();
+        auto* raw_buffer = static_cast<uint8_t*>(raw_workspace) + num_workspace_bytes;
+        pybind11::dict out;
+        out["buffer_ptr"]                 = reinterpret_cast<int64_t>(buffer);
+        out["buffer_bytes"]               = static_cast<int64_t>(num_gpu_buffer_bytes);
+        out["workspace_ptr"]              = reinterpret_cast<int64_t>(workspace);
+        out["workspace_bytes"]            = static_cast<int64_t>(num_workspace_bytes);
+        out["rdma_buffer_ptr"]            = reinterpret_cast<int64_t>(raw_buffer);
+        out["rdma_workspace_ptr"]         = reinterpret_cast<int64_t>(raw_workspace);
+        out["host_workspace_ptr"]         = reinterpret_cast<int64_t>(host_workspace);
+        out["mapped_host_workspace_ptr"]  = reinterpret_cast<int64_t>(mapped_host_workspace);
+        out["nccl_dev_comm_ptr"]          = reinterpret_cast<int64_t>(&nccl_context->dev_comm);
+        out["nccl_window_ptr"]            = reinterpret_cast<int64_t>(nccl_context->window);
+        return out;
+    }
+
     std::tuple<int, int> get_physical_domain_size() const {
         return {nccl_context->num_rdma_ranks, nccl_context->num_nvl_ranks};
     }
@@ -1323,7 +1353,8 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
-        .def("combine", &ElasticBuffer::combine);
+        .def("combine", &ElasticBuffer::combine)
+        .def("get_native_v2_resources", &ElasticBuffer::get_native_v2_resources);
     m.def("create_cpu_handle", &ElasticBuffer::create_cpu_handle);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);
     m.def("get_elastic_buffer_alignment", [=]() {

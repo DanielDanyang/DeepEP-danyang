@@ -302,6 +302,18 @@ class MappedD2HQueueHandle {
     ack_ready_until(observed_ready_end);
   }
 
+  // Returns a bytes object holding the raw V2TransferD2HQueueView struct.
+  // Python can concatenate several of these, copy to a CUDA tensor, and pass
+  // the tensor's data_ptr() to the multi-queue dispatch kernel.
+  nb::bytes view_bytes() const {
+    v2::V2TransferD2HQueueView view;
+    view.commands = commands_device_;
+    view.head     = head_device_;
+    view.tail     = tail_device_;
+    view.capacity = capacity_;
+    return nb::bytes(reinterpret_cast<const char*>(&view), sizeof(view));
+  }
+
  private:
   uint32_t capacity_ = 0;
   size_t commands_bytes_ = 0;
@@ -1128,7 +1140,8 @@ NB_MODULE(ep, m) {
                out.append(efa_post_op_to_dict(op));
              }
              return out;
-      });
+      })
+      .def("view_bytes", &MappedD2HQueueHandle::view_bytes);
 
 #if UCCL_V2_EFA_HAS_VERBS
   nb::class_<V2EfaConnectionHandle>(m, "V2EfaConnection")
@@ -1438,8 +1451,9 @@ NB_MODULE(ep, m) {
               std::uintptr_t nccl_window_ptr, std::uintptr_t buffer_ptr,
               std::uintptr_t workspace_ptr,
               std::uintptr_t mapped_host_workspace_ptr,
-              std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
-              std::uintptr_t tail_ptr, int queue_capacity,
+              // Multi-queue: GPU pointer to array of V2TransferD2HQueueView.
+              // Build with ElasticBuffer.build_queue_views_tensor(queues).
+              std::uintptr_t queue_views_ptr, std::uint32_t num_queues,
               std::uintptr_t buffer_base, std::uintptr_t workspace_base,
               std::uint64_t local_payload_base,
               std::uint64_t remote_payload_base,
@@ -1484,9 +1498,10 @@ NB_MODULE(ep, m) {
                  sf_token_stride, sf_hidden_stride, expert_alignment, num_qps,
                  num_timeout_cycles, cached_mode, deterministic, do_cpu_sync,
                  smem_bytes, nccl_dev_comm_ptr, nccl_window_ptr, buffer_ptr,
-                 workspace_ptr, mapped_host_workspace_ptr, commands_ptr,
-                 head_ptr, tail_ptr, queue_capacity, buffer_base,
-                 workspace_base, layout, uccl_include_path, cuda_stream_ptr);
+                 workspace_ptr, mapped_host_workspace_ptr,
+                 queue_views_ptr, num_queues,
+                 buffer_base, workspace_base, layout,
+                 uccl_include_path, cuda_stream_ptr);
            },
            nb::arg("x_ptr"),
            nb::arg("sf_ptr"),
@@ -1516,10 +1531,8 @@ NB_MODULE(ep, m) {
            nb::arg("buffer_ptr"),
            nb::arg("workspace_ptr"),
            nb::arg("mapped_host_workspace_ptr"),
-           nb::arg("commands_ptr"),
-           nb::arg("head_ptr"),
-           nb::arg("tail_ptr"),
-           nb::arg("queue_capacity"),
+           nb::arg("queue_views_ptr"),
+           nb::arg("num_queues") = 1,
            nb::arg("buffer_base"),
            nb::arg("workspace_base"),
            nb::arg("local_payload_base") = 0,

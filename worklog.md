@@ -1,5 +1,42 @@
 # DeepEP / NCCL GIN Worklog
 
+## 2026-06-02 Phase 0/1/2 resource binding + multi-queue proxy
+
+### Phase 0 — V2 resource binding (csrc/elastic/buffer.hpp)
+- 新增 `ElasticBuffer::get_native_v2_resources()` 返回 pybind11::dict，包含：
+  `buffer_ptr`, `buffer_bytes`, `workspace_ptr`, `workspace_bytes`,
+  `host_workspace_ptr`, `mapped_host_workspace_ptr`, `nccl_dev_comm_ptr`, `nccl_window_ptr`
+- 在 `register_apis` 注册 `.def("get_native_v2_resources", ...)`
+
+### Phase 1 — Auto-init from DeepEP V2 buffer (elastic.py)
+- 新增 `ElasticBuffer.init_from_deep_ep_v2(deep_ep_buffer, num_lanes, ...)` ：
+  一次调用完成 `init_native_v2_efa_transport()` + `init_native_v2_deep_ep_resources()`
+  资源全部从 `deep_ep_buffer._handle.get_native_v2_resources()` 提取，不再需要手动传指针
+- 用法：`uccl_buf.init_from_deep_ep_v2(deep_ep_buf, num_lanes=2)`
+
+### Phase 2 — Multi-queue D2H FIFO + persistent proxy threads
+- `hybrid_dispatch_native.cuh`：kernel 参数由单 `V2TransferD2HQueueView` 改为
+  `const V2TransferD2HQueueView* d2h_queue_views, uint32_t num_d2h_queues`
+  - notify warp：`notify_queue = d2h_queue_views[thread_idx % num_queues]`
+  - scaleout warp：`scaleout_queue = d2h_queue_views[channel_idx % num_queues]`
+- `v2_efa_deep_ep_jit.cc` / `v2_efa_runtime.cc` / `runtime.hpp`：接口同步更新
+- `uccl_ep.cc`：
+  - `MappedD2HQueueHandle::view_bytes()` 新增 → 返回 raw V2TransferD2HQueueView bytes
+  - Python binding 新增 `.def("view_bytes", ...)`
+  - `launch_native_hybrid_dispatch` binding 由 `commands_ptr/head_ptr/tail_ptr/capacity`
+    改为 `queue_views_ptr: int, num_queues: int`
+- `elastic.py`：
+  - `build_queue_views_tensor(queues)` 静态方法：打包多个 V2MappedD2HQueue 为 GPU tensor
+  - `_dispatch_native_hybrid`：分配 N 个 queue（`UCCL_V2_NUM_PROXY_THREADS` 控制，默认
+    min(4, num_efa_lanes, num_channels)），start_proxy 传 N queues + N threads，
+    kernel 传 queue_views tensor 和 num_queues
+
+### 待验证
+- build + install（cmake rebuild 后 pip install）
+- EP2 correctness（基础）
+- EP16 correctness（完整路径）
+- EP16 bench（目标 80+ GB/s）
+
 ## 2026-06-01 dispatch receiver metadata 下沉到 JIT
 
 - 目标：
@@ -2925,3 +2962,69 @@ README 风格 EP8x2 性能：
   - native dispatch correctness 还需要官方 DeepEP V2 resource binding 暴露
     `dev_comm/window/buffer/workspace/mapped_host_workspace` 后才能端到端跑。
   - 本次服务器验证覆盖 build/install/API/JIT compile，不覆盖 EP16 BW。
+
+## 2026-06-02 Phase 0/1/2 review 修复与 EP1x2 smoke
+
+- Review 发现并修复：
+  - `csrc/elastic/buffer.hpp` 中 `nccl_dev_comm_ptr` 不能把
+    `nccl_context->dev_comm` 当指针转整数；`ncclDevComm_t` 是值类型，必须暴露
+    `&nccl_context->dev_comm`。
+  - Python multi-queue view 不再手写 `struct.pack("<QQQIi")`；改为使用
+    C++ `V2MappedD2HQueue.view_bytes()` 暴露的真实
+    `V2TransferD2HQueueView` bytes，避免 Python 和 C++ struct layout 漂移。
+  - `UCCL_V2_NUM_PROXY_THREADS` 加了下界和按 lane/channel 的上界，避免 0
+    queue 或空 queue。
+  - `init_from_deep_ep_v2()` 兼容官方 DeepEP Python buffer 的真实字段
+    `runtime`，同时仍接受 `_handle` 或直接传 C++ handle。
+  - 官方 DeepEP V2 的 `buffer_ptr/workspace_ptr` 是
+    `ncclGetLsaDevicePointer()` 返回的 mapped/LSA 指针，CUDA kernel 应使用它；
+    EFA verbs `ibv_reg_mr` 应注册原始 symmetric allocation 指针。
+    因此新增：
+    - `NCCLSymmetricMemoryContext::get_raw_window_ptr()`
+    - resource dict 中的 `rdma_buffer_ptr`
+    - resource dict 中的 `rdma_workspace_ptr`
+    `init_from_deep_ep_v2()` 用 `rdma_*` 初始化 EFA transport，但仍把
+    mapped `buffer_ptr/workspace_ptr` 传给 native JIT runtime。
+  - 外部 pointer 模式下 `_v2_efa_window` 没有 Python tensor owner；
+    `_require_v2_efa_window()` 现在只要求 connection 存在并检查
+    `_v2_efa_window_bytes`。
+  - 外部 `workspace_addr` 模式之前把 `workspace_bytes` 传成 0，导致 workspace
+    MR 未注册；已改为传入真实 `registered_workspace_bytes`。
+  - native hybrid dispatch hardcoded `228 * 1024` dynamic smem 在服务器 launch
+    时触发 `CUDA_ERROR_INVALID_VALUE`；默认改为 `224 * 1024`，并允许
+    `UCCL_V2_SMEM_BYTES` 覆盖。
+
+- 服务器构建：
+  - 上服务器前多次检查 p5en_0/p5en_1 `nvidia-smi --query-compute-apps`，
+    均无 GPU compute app。
+  - `uccl-ep make -j8 && make install` 通过，p5en_0/p5en_1 venv 均已安装。
+  - 主 DeepEP extension 用 CUDA 13.0 重建：
+    `/usr/local/cuda-13.0` 对齐当前 PyTorch `2.12.0+cu130`；
+    使用 `/usr/local/cuda`/12.9 会被 PyTorch CUDA mismatch 检查拒绝。
+  - p5en_0 / p5en_1 均确认
+    `deep_ep._C.ElasticBuffer.get_native_v2_resources` 存在。
+  - native hybrid JIT compile 再次通过：
+    `compiled v2_efa_native_hybrid_dispatch 192 20`。
+
+- EP1x2 临时 smoke：
+  - 临时脚本：
+    `/home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/uccl-ep/tests/_tmp_native_v2_init_smoke.py`
+  - 脚本直接创建官方 `deep_ep._C.ElasticBuffer` 作为资源来源，再用
+    wrapper `ElasticBuffer.init_from_deep_ep_v2()` 接入 UCCL native V2 EFA。
+  - `do_cpu_sync=False`，验证 dispatch data path，不验证尚未实现的 host
+    workspace reader。
+  - EP1x2 两边均通过 payload/idx/weight smoke；rank0/rank1 输出：
+    `native_v2_init_dispatch_ok`。
+  - 每 rank proxy stats：
+    `drained_commands=134, posted_writes=6, posted_signals=128,
+    posted_completions=134, posted_bytes=1168`。
+  - 临时 C++ handle 用 `explicitly_destroy=True` 避免测试退出时直接析构跑
+    DeepEP barrier/finalize；因此日志末尾有预期 leak 提示。正式路径应由真实
+    DeepEP Python buffer 生命周期管理。
+
+- 仍未完成：
+  - 现有 repo 内正式 smoke/correctness/bench 脚本还需要改成
+    `init_from_deep_ep_v2()` 主路径；旧脚本只初始化 EFA transport，会在缺少
+    `_native_v2_resources` 时失败。
+  - `do_cpu_sync=True` 的 host workspace reader 仍未实现。
+  - 尚未跑 EP8x2/EP16 correctness 和 BW。

@@ -77,6 +77,10 @@ public:
     int64_t num_gpu_bytes;
     int64_t num_cpu_bytes;
 
+    void* get_raw_window_ptr() const {
+        return raw_window_ptr;
+    }
+
     NCCLSymmetricMemoryContext(const int64_t& nccl_comm, const symmetric::cpu_comm_t& cpu_comm,
                                const int& num_ranks, const int& rank_idx,
                                const int64_t& num_bytes, const int64_t& num_cpu_bytes,

@@ -95,8 +95,9 @@ void launch_v2_efa_native_hybrid_dispatch_plan(
     std::uintptr_t nccl_dev_comm_ptr, std::uintptr_t nccl_window_ptr,
     std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
     std::uintptr_t mapped_host_workspace_ptr, int scaleout_rank,
-    int scaleup_rank, std::uintptr_t commands_ptr, std::uintptr_t head_ptr,
-    std::uintptr_t tail_ptr, int queue_capacity, std::uintptr_t buffer_base,
+    int scaleup_rank,
+    std::uintptr_t queue_views_ptr, uint32_t num_queues,
+    std::uintptr_t buffer_base,
     std::uintptr_t workspace_base, DispatchTransferLayout layout,
     std::uintptr_t cuda_stream_ptr = 0);
 void launch_v2_efa_dispatch_copy_epilogue_plan(
@@ -253,8 +254,8 @@ class V2EfaRuntime {
       bool cached_mode, bool deterministic, bool do_cpu_sync, int smem_bytes,
       std::uintptr_t nccl_dev_comm_ptr, std::uintptr_t nccl_window_ptr,
       std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
-      std::uintptr_t mapped_host_workspace_ptr, std::uintptr_t commands_ptr,
-      std::uintptr_t head_ptr, std::uintptr_t tail_ptr, int queue_capacity,
+      std::uintptr_t mapped_host_workspace_ptr,
+      std::uintptr_t queue_views_ptr, uint32_t num_queues,
       std::uintptr_t buffer_base, std::uintptr_t workspace_base,
       DispatchTransferLayout layout, const std::string& uccl_include_path = "",
       std::uintptr_t cuda_stream_ptr = 0) const;
