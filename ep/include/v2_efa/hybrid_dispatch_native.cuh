@@ -7,8 +7,48 @@
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
 
+// Native UCCL EFA transport: the scaleout (ncclTeamTagRail) GIN calls are
+// replaced by old 16B TransferCmd WRITEs pushed to host-pinned D2H queues and
+// drained by the UCCL proxy.  The scaleup (ncclTeamTagLsa) NVLink GIN path is
+// untouched.
+// NOTE: uccl headers are NOT on the JIT compiler's -I path (only deep_ep and
+// nccl are), so these must be spelled relative to THIS file's directory
+// (include/v2_efa/).  The JIT generator includes this header via an absolute
+// path, after which these relatives resolve against include/.
+// TODO(build): pulling the full ring_buffer.cuh drags <infiniband/verbs.h> +
+// host members into the device JIT TU; if NVCC chokes, factor a lean
+// device-only command-ABI header shared with ring_buffer.cuh.
+#include "../ring_buffer.cuh"
+#include "workspace.hpp"
 
 namespace deep_ep::elastic {
+
+// All native EFA writes address one registered NCCL symmetric window whose base
+// is the mapped `workspace` pointer (buffer = workspace + workspace_bytes, with
+// the signal scratch carved from the back).  An offset within that window is the
+// shifted distance from `window_base`; because the window is symmetric, the same
+// offset is valid as both the local source (req_lptr) and the remote
+// destination (req_rptr).
+__device__ __forceinline__ uint32_t v2_window_off(const void* ptr,
+                                                  uint64_t window_base) {
+    return static_cast<uint32_t>(
+        (reinterpret_cast<uint64_t>(ptr) - window_base) >> kWriteAddrShiftNormal);
+}
+
+// Push a single-shot WRITE command (no scratch staging needed: the source data
+// already lives in registered window memory).
+__device__ __forceinline__ void v2_d2h_write(DeviceToHostCmdBuffer* q,
+                                             int dst_rank, uint32_t bytes,
+                                             uint32_t local_off,
+                                             uint32_t remote_off) {
+    TransferCmd cmd{};
+    cmd.cmd_type = make_cmd_type(CmdType::WRITE, false, false);
+    cmd.dst_rank = static_cast<uint8_t>(dst_rank);
+    cmd.bytes = bytes;
+    cmd.req_lptr = local_off;
+    cmd.req_rptr = remote_off;
+    q->atomic_set_and_commit(cmd);
+}
 
 template <bool kDoCPUSync,
           bool kReuseSlotIndices,
@@ -45,7 +85,10 @@ hybrid_dispatch_impl(
     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
     void* buffer,
     void* workspace, void* mapped_host_workspace,
-    const int scaleout_rank_idx, const int scaleup_rank_idx) {
+    const int scaleout_rank_idx, const int scaleup_rank_idx,
+    // Native UCCL EFA transport resources (replace the scaleout GIN path)
+    DeviceToHostCmdBuffer** d2h_queues, const uint32_t num_d2h_queues,
+    const uint64_t signal_scratch_base) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
@@ -62,6 +105,10 @@ hybrid_dispatch_impl(
     const auto workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
     const auto host_workspace_layout = layout::WorkspaceLayout(mapped_host_workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
 
+    // Native EFA window: offset origin for all TransferCmd req_lptr/req_rptr.
+    const uint64_t window_base = reinterpret_cast<uint64_t>(workspace);
+    constexpr uint32_t kSignalScratchSlotsPerQueue = DeviceToHostCmdBuffer::mask() + 1u;
+
     // The kernel uses a fixed space of dynamic shared memory (no static shared memory)
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
     constexpr int kNumSmemBytesForNotify = kNumNotifyThreads > 0 ?
@@ -77,10 +124,10 @@ hybrid_dispatch_impl(
         sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    // Global parallel barriers for scale-out subteam and scale-up subteam
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, false, true>(
-        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+    // Phase 1 native EFA: the opening scale-out (ncclTeamTagRail) barrier is
+    // removed.  Cross-rank start synchronization is provided by a host-side
+    // torch.distributed barrier before launch (plus a tail-clear sync between
+    // rounds), since the scale-out GIN path no longer exists here.
 
     // The golden layout during the whole process for both scale-out and forward warps
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
@@ -175,15 +222,18 @@ hybrid_dispatch_impl(
                              "kNumScaleoutRanks must be less than kNumNotifyThreads");
             if (thread_idx < kNumScaleoutRanks) {
                 const auto dst_scaleout_rank_idx = thread_idx;
-                gin.put<ncclTeamTagRail>(
-                    workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),
-                    workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),
-                    kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx,
-                    ncclGinOptFlagsAggregateRequests);
-                gin.put<ncclTeamTagRail>(
-                    workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx),
-                    workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx),
-                    kNumExpertsPerScaleout * sizeof(int), dst_scaleout_rank_idx);
+                auto* q = d2h_queues[dst_scaleout_rank_idx % num_d2h_queues];
+                // local src = staged per-dst send count (<true>); remote dst =
+                // peer's recv slot reserved for this sender (<false>, indexed by
+                // our own scaleout rank).
+                v2_d2h_write(
+                    q, dst_scaleout_rank_idx, kNumScaleupRanks * sizeof(int),
+                    v2_window_off(workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx), window_base),
+                    v2_window_off(workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx), window_base));
+                v2_d2h_write(
+                    q, dst_scaleout_rank_idx, kNumExpertsPerScaleout * sizeof(int),
+                    v2_window_off(workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx), window_base),
+                    v2_window_off(workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx), window_base));
             }
             __syncwarp();
 
@@ -333,13 +383,30 @@ hybrid_dispatch_impl(
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
             if (lane_idx < kNumScaleoutRanks and
                 (stored_scaleout_tail >= stored_old_scaleout_tail + kScaleoutUpdateInterval or finish_flag)) {
-                const auto signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
-                const auto ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
-                const auto old_signaled_tail = math::pack2<int, int64_t>(0, stored_old_scaleout_tail);
-
-                // NOTES: the "release" scope will be `sys` for the local rank (we may involve NVLink so not `gpu`)
-                // For RDMA requests, "release" is ensured by "atomic"
-                gin.red_add_rel<ncclTeamTagRail>(ptr, signaled_tail - old_signaled_tail, lane_idx);
+                // EFA has no remote atomic add: write the ABSOLUTE packed tail
+                // word.  Each (channel, sender-rank) slot has a single writer, so
+                // an absolute write is equivalent to the original delta add.  The
+                // value is staged into a scratch slot bound to the reserved D2H
+                // ring slot (so it survives until the proxy drains the command),
+                // then a WRITE copies it to the peer's tail slot.
+                const int64_t signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
+                const auto remote_ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
+                const uint32_t q_idx = channel_idx % num_d2h_queues;
+                auto* q = d2h_queues[q_idx];
+                uint64_t slot;
+                q->reserve(&slot);
+                int64_t* scratch = uccl::v2_efa::signal_scratch_slot_for(
+                    signal_scratch_base, q_idx,
+                    static_cast<uint32_t>(slot) & (kSignalScratchSlotsPerQueue - 1u),
+                    kSignalScratchSlotsPerQueue);
+                *scratch = signaled_tail;
+                TransferCmd cmd{};
+                cmd.cmd_type = make_cmd_type(CmdType::WRITE, false, false);
+                cmd.dst_rank = static_cast<uint8_t>(lane_idx);
+                cmd.bytes = sizeof(int64_t);
+                cmd.req_lptr = v2_window_off(scratch, window_base);
+                cmd.req_rptr = v2_window_off(remote_ptr, window_base);
+                q->commit_at(slot, cmd);  // threadfence_system publishes scratch + cmd
                 stored_old_scaleout_tail = stored_scaleout_tail;
             }
             __syncwarp();
@@ -439,14 +506,16 @@ hybrid_dispatch_impl(
             // Preload the next token (overlapping with the IBGDA issues)
             preload_next_token(token_idx + kNumChannels);
 
-            // Issue IBGDA requests
+            // Issue scale-out payload WRITE: local src = staged send slot,
+            // remote dst = peer's recv slot.  Same D2H queue as the tail write
+            // for this channel, so the proxy posts them on one QP and the tail
+            // is guaranteed visible only after the payload.
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
-                gin.put<ncclTeamTagRail>(
-                        scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                        scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(),
-                        tma_buffer.get_num_bytes<false>(),
-                        stored_dst_scaleout_rank_idx,
-                        ncclGinOptFlagsAggregateRequests);
+                auto* q = d2h_queues[channel_idx % num_d2h_queues];
+                v2_d2h_write(
+                    q, stored_dst_scaleout_rank_idx, tma_buffer.get_num_bytes<false>(),
+                    v2_window_off(scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(), window_base),
+                    v2_window_off(scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), window_base));
             }
             __syncwarp();
 

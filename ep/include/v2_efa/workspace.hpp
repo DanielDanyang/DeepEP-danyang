@@ -3,59 +3,41 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "v2_efa/descriptor.hpp"
+// Signal-scratch geometry for the native V2 EFA dispatch/combine path.
+//
+// The tail word the scaleout warp produces is computed in registers and must be
+// staged into registered memory before the proxy RDMA-writes it to the remote
+// workspace.  Each D2H queue owns a contiguous block of int64 scratch slots,
+// one per ring slot, so a scratch slot is never reused before its command is
+// drained (slot lifetime mirrors the ring slot it is bound to).  The scratch
+// block lives inside the registered NCCL window (carved from the flexible
+// cpu_buffer/engram region), so a single MR covers it.
 
 namespace uccl::v2_efa {
 
-constexpr size_t kWorkspaceAlignment = 128;
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define V2_EFA_DEV __device__ __forceinline__
+#else
+#define V2_EFA_DEV inline
+#endif
 
-inline constexpr size_t align_up(size_t value, size_t alignment) {
-  return (value + alignment - 1) / alignment * alignment;
+constexpr uint32_t kSignalScratchSlotBytes = sizeof(int64_t);
+
+// Total scratch bytes for `num_queues` queues, each owning `slots_per_queue`
+// int64 slots (slots_per_queue should equal the D2H ring capacity).
+inline size_t signal_scratch_bytes(uint32_t num_queues,
+                                   uint32_t slots_per_queue) {
+  return static_cast<size_t>(num_queues) * static_cast<size_t>(slots_per_queue) *
+         kSignalScratchSlotBytes;
 }
 
-struct WorkspaceRegion {
-  size_t offset = 0;
-  size_t bytes = 0;
-};
-
-struct WorkspacePlan {
-  WorkspaceRegion dispatch_segments;
-  WorkspaceRegion dispatch_batches;
-  WorkspaceRegion combine_segments;
-  WorkspaceRegion combine_batches;
-  WorkspaceRegion dispatch_counters;
-  WorkspaceRegion combine_counters;
-  size_t total_bytes = 0;
-};
-
-inline WorkspacePlan build_workspace_plan(int64_t max_dispatch_segments,
-                                          int64_t max_dispatch_batches,
-                                          int64_t max_combine_segments,
-                                          int64_t max_combine_batches) {
-  WorkspacePlan plan;
-  size_t cursor = 0;
-
-  auto add_region = [&](size_t bytes) {
-    WorkspaceRegion region{cursor, bytes};
-    cursor = align_up(cursor + bytes, kWorkspaceAlignment);
-    return region;
-  };
-
-  plan.dispatch_segments = add_region(
-      sizeof(DispatchSegmentDescriptor) *
-      static_cast<size_t>(max_dispatch_segments));
-  plan.dispatch_batches = add_region(sizeof(DispatchExpertBatch) *
-                                     static_cast<size_t>(max_dispatch_batches));
-  plan.combine_segments = add_region(sizeof(CombineSegmentDescriptor) *
-                                     static_cast<size_t>(max_combine_segments));
-  plan.combine_batches = add_region(sizeof(CombineExpertBatch) *
-                                    static_cast<size_t>(max_combine_batches));
-  plan.dispatch_counters =
-      add_region(sizeof(uint32_t) * kDescriptorCounterWords);
-  plan.combine_counters =
-      add_region(sizeof(uint32_t) * kDescriptorCounterWords);
-  plan.total_bytes = cursor;
-  return plan;
+// Pointer to the scratch slot bound to (queue_idx, slot) where `slot` is the
+// D2H ring slot modulo `slots_per_queue`.
+V2_EFA_DEV int64_t* signal_scratch_slot_for(uint64_t scratch_base,
+                                            uint32_t queue_idx, uint32_t slot,
+                                            uint32_t slots_per_queue) {
+  return reinterpret_cast<int64_t*>(scratch_base) +
+         static_cast<uint64_t>(queue_idx) * slots_per_queue + slot;
 }
 
 }  // namespace uccl::v2_efa

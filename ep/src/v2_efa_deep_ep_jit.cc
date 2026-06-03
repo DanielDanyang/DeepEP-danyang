@@ -99,8 +99,10 @@ void compile_v2_efa_jit_plan(const V2EfaJitLaunchPlan& plan) {
 //   standard DeepEP V2 args (x, sf, topk_idx, ..., nccl_dev_comm, nccl_window,
 //                             buffer, workspace, mapped_host_workspace,
 //                             scaleout_rank, scaleup_rank)
-//   EFA D2H args: d2h_queues**, num_queues,
-//                 buffer_base, workspace_base, signal_scratch_base
+//   EFA D2H args: d2h_queues** (GPU array of DeviceToHostCmdBuffer*),
+//                 num_queues, signal_scratch_base.
+//   The kernel derives every transport offset relative to the mapped workspace
+//   pointer (= registered NCCL window base), so no separate base args are passed.
 // ---------------------------------------------------------------------------
 void launch_v2_efa_native_hybrid_dispatch_plan(
     const V2EfaJitLaunchPlan& plan, std::uintptr_t x_ptr,
@@ -118,14 +120,10 @@ void launch_v2_efa_native_hybrid_dispatch_plan(
     int scaleup_rank,
     // EFA D2H: GPU pointer to array of DeviceToHostCmdBuffer* pointers
     std::uintptr_t d2h_queues_ptr, uint32_t num_queues,
-    std::uintptr_t buffer_base, std::uintptr_t workspace_base,
-    std::uintptr_t signal_scratch_base,
-    DispatchTransferLayout layout,
-    std::uintptr_t cuda_stream_ptr) {
+    std::uintptr_t signal_scratch_base, std::uintptr_t cuda_stream_ptr) {
   if (num_tokens < 0 || num_queues == 0 || d2h_queues_ptr == 0 ||
-      buffer_base == 0 || workspace_base == 0 || signal_scratch_base == 0 ||
-      nccl_dev_comm_ptr == 0 || nccl_window_ptr == 0 ||
-      mapped_host_workspace_ptr == 0) {
+      signal_scratch_base == 0 || nccl_dev_comm_ptr == 0 ||
+      nccl_window_ptr == 0 || mapped_host_workspace_ptr == 0) {
     throw std::invalid_argument("invalid V2 EFA native hybrid dispatch launch");
   }
 
@@ -153,10 +151,8 @@ void launch_v2_efa_native_hybrid_dispatch_plan(
       checked_ptr<void>(workspace_ptr, "workspace"),
       checked_ptr<void>(mapped_host_workspace_ptr, "mapped_host_workspace"),
       scaleout_rank, scaleup_rank,
-      reinterpret_cast<DeviceToHostCmdBuffer**>(d2h_queues_ptr),
-      num_queues,
-      buffer_base, workspace_base, signal_scratch_base,
-      layout));
+      reinterpret_cast<DeviceToHostCmdBuffer**>(d2h_queues_ptr), num_queues,
+      static_cast<uint64_t>(signal_scratch_base)));
 }
 
 void launch_v2_efa_dispatch_copy_epilogue_plan(
@@ -216,16 +212,9 @@ void V2EfaRuntime::launch_native_hybrid_dispatch(
     std::uintptr_t buffer_ptr, std::uintptr_t workspace_ptr,
     std::uintptr_t mapped_host_workspace_ptr,
     std::uintptr_t d2h_queues_ptr, uint32_t num_queues,
-    std::uintptr_t buffer_base, std::uintptr_t workspace_base,
-    std::uintptr_t signal_scratch_base,
-    DispatchTransferLayout layout, const std::string& uccl_include_path,
+    std::uintptr_t signal_scratch_base, const std::string& uccl_include_path,
     std::uintptr_t cuda_stream_ptr) const {
   const auto& cfg = config();
-  layout.skip_scaleout_rank = cfg.scaleout_rank;
-  layout.num_scaleup_ranks = static_cast<uint32_t>(cfg.num_scaleup_ranks);
-  layout.num_ranks = static_cast<uint32_t>(cfg.world_size);
-  layout.source_rank = static_cast<uint32_t>(cfg.rank);
-  layout.max_batches = static_cast<uint32_t>(cfg.num_experts);
   const auto plan = build_native_hybrid_dispatch_jit_plan(
       num_max_tokens_per_rank, num_channels_per_sm, num_sf_packs,
       expert_alignment, num_qps, num_timeout_cycles, cached_mode,
@@ -238,8 +227,7 @@ void V2EfaRuntime::launch_native_hybrid_dispatch(
       token_metadata_at_forward_ptr, num_tokens, sf_token_stride,
       sf_hidden_stride, nccl_dev_comm_ptr, nccl_window_ptr, buffer_ptr,
       workspace_ptr, mapped_host_workspace_ptr, cfg.scaleout_rank,
-      cfg.scaleup_rank, d2h_queues_ptr, num_queues,
-      buffer_base, workspace_base, signal_scratch_base, layout,
+      cfg.scaleup_rank, d2h_queues_ptr, num_queues, signal_scratch_base,
       cuda_stream_ptr);
 }
 

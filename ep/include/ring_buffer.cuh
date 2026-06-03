@@ -428,6 +428,53 @@ struct alignas(128) RingBuffer {
     return val;
   }
 
+  // Two-phase publish for commands whose payload must be staged into a
+  // slot-bound scratch region BEFORE the command becomes visible (e.g. the V2
+  // native dispatch tail word: the GPU stages the absolute tail value into
+  // scratch[slot], then commits a WRITE command referencing that scratch slot).
+  // `reserve()` claims a ring slot (advancing head) without publishing it;
+  // `commit_at()` writes the entry into the reserved slot and publishes it with
+  // the DeviceToHost system fence so both the scratch store and the entry are
+  // visible to the CPU proxy.  Slot lifetime mirrors the ring slot lifetime, so
+  // a scratch region sized to the ring capacity is never reused before its
+  // command is drained.
+  __device__ inline bool reserve(uint64_t* out_slot) {
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    while (true) {
+      uint64_t h = ld_volatile(&head);
+      uint64_t t = ld_volatile(&tail);
+      if (h - t == Capacity) {
+        __nanosleep(64);
+        continue;
+      }
+      unsigned long long prev =
+          atomicCAS((unsigned long long*)&head, (unsigned long long)h,
+                    (unsigned long long)(h + 1));
+      if (prev == h) {
+        *out_slot = h;
+        return true;
+      }
+    }
+#else
+    return false;
+#endif
+  }
+
+  __device__ inline void commit_at(uint64_t slot, T const& item) {
+    uint32_t idx = (uint32_t)slot & mask();
+    T tmp = item;
+    auto saved_cmd = tmp.cmd_type;
+    tmp.cmd_type = CmdType::EMPTY;
+    buf[idx] = tmp;
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+    if constexpr (Dir == FlowDirection::DeviceToHost)
+      __threadfence_system();
+    else
+      __threadfence();
+#endif
+    buf[idx].cmd_type = saved_cmd;
+  }
+
   __host__ __device__ inline bool atomic_set_and_commit(
       T const& item, uint64_t* out_slot = nullptr) {
     uint64_t slot;

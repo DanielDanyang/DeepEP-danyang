@@ -2,10 +2,17 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 
 namespace uccl::v2_efa {
 
 namespace {
+
+void validate_non_negative(const char* name, int value) {
+  if (value < 0) {
+    throw std::invalid_argument(std::string(name) + " must be non-negative");
+  }
+}
 
 void validate_config(const RuntimeConfig& config) {
   validate_non_negative("rank", config.rank);
@@ -37,6 +44,20 @@ void validate_config(const RuntimeConfig& config) {
   (void)experts_per_rank(config.num_experts, config.world_size);
 }
 
+V2EfaDispatchJitConfig make_dispatch_jit_config(const RuntimeConfig& config) {
+  V2EfaDispatchJitConfig jit_config;
+  jit_config.num_scaleout_ranks = config.num_scaleout_ranks;
+  jit_config.num_scaleup_ranks = config.num_scaleup_ranks;
+  jit_config.num_experts = config.num_experts;
+  jit_config.num_topk = config.num_topk;
+  jit_config.hidden = config.hidden;
+  jit_config.elem_bytes = config.elem_bytes;
+  jit_config.num_sms = config.num_sms > 0 ? config.num_sms : 1;
+  jit_config.scaleout_rank = config.scaleout_rank;
+  jit_config.scaleup_rank = config.scaleup_rank;
+  return jit_config;
+}
+
 }  // namespace
 
 V2EfaRuntime::V2EfaRuntime(RuntimeConfig config) : config_(config) {
@@ -44,34 +65,8 @@ V2EfaRuntime::V2EfaRuntime(RuntimeConfig config) : config_(config) {
 }
 
 std::string V2EfaRuntime::status() const {
-  return "native V2 AWS EFA runtime: dispatch uses fused V2 descriptor-to-D2H "
-         "commands; combine is under native V2 rewrite";
-}
-
-DescriptorPlanStats V2EfaRuntime::worst_case_stats(
-    int num_max_tokens_per_rank) const {
-  validate_non_negative("num_max_tokens_per_rank", num_max_tokens_per_rank);
-  DescriptorPlanStats stats;
-  stats.num_dispatch_segments = static_cast<int32_t>(
-      max_dispatch_segments(num_max_tokens_per_rank, config_.num_topk));
-  stats.num_dispatch_batches = static_cast<int32_t>(max_expert_batches(
-      config_.num_experts, config_.num_scaleout_ranks,
-      config_.num_scaleup_ranks));
-  stats.num_combine_segments = stats.num_dispatch_segments;
-  stats.num_combine_batches = stats.num_dispatch_batches;
-  stats.max_tokens_per_segment = std::max(1, num_max_tokens_per_rank);
-  stats.max_payload_bytes_per_segment =
-      std::max(1, config_.hidden * config_.elem_bytes);
-  return stats;
-}
-
-WorkspacePlan V2EfaRuntime::workspace_plan(
-    int num_max_tokens_per_rank) const {
-  const auto stats = worst_case_stats(num_max_tokens_per_rank);
-  return build_workspace_plan(stats.num_dispatch_segments,
-                              stats.num_dispatch_batches,
-                              stats.num_combine_segments,
-                              stats.num_combine_batches);
+  return "native V2 AWS EFA runtime: dispatch replaces scaleout GIN with UCCL "
+         "D2H TransferCmd writes over a single registered NCCL window";
 }
 
 ExpertRoute V2EfaRuntime::route_expert(int expert_id) const {
@@ -81,129 +76,14 @@ ExpertRoute V2EfaRuntime::route_expert(int expert_id) const {
                                     config_.scaleout_rank);
 }
 
-V2EfaJitLaunchPlan
-V2EfaRuntime::build_dispatch_descriptor_enqueue_d2h_jit_plan(
-    int num_max_tokens_per_rank, int num_channels_per_sm, int scale_bytes,
-    bool has_topk_weight, bool cached_mode, bool deterministic,
-    bool do_cpu_sync, int smem_bytes,
-    const std::string& uccl_include_path) const {
-  V2EfaDispatchJitConfig jit_config;
-  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
-  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
-  jit_config.num_experts = config_.num_experts;
-  jit_config.num_topk = config_.num_topk;
-  jit_config.hidden = config_.hidden;
-  jit_config.elem_bytes = config_.elem_bytes;
-  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
-  jit_config.num_channels_per_sm = num_channels_per_sm;
-  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
-  jit_config.scaleout_rank = config_.scaleout_rank;
-  jit_config.scaleup_rank = config_.scaleup_rank;
-  jit_config.scale_bytes = scale_bytes;
-  jit_config.has_topk_weight = has_topk_weight;
-  jit_config.cached_mode = cached_mode;
-  jit_config.deterministic = deterministic;
-  jit_config.do_cpu_sync = do_cpu_sync;
-  jit_config.smem_bytes = smem_bytes;
-  jit_config.uccl_include_path = uccl_include_path;
-  return build_v2_efa_dispatch_descriptor_enqueue_d2h_jit_plan(jit_config);
-}
-
-V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_forward_metadata_jit_plan(
-    int num_max_tokens_per_rank, int num_channels_per_sm,
-    const std::string& uccl_include_path) const {
-  V2EfaDispatchJitConfig jit_config;
-  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
-  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
-  jit_config.num_experts = config_.num_experts;
-  jit_config.num_topk = config_.num_topk;
-  jit_config.hidden = std::max(1, config_.hidden);
-  jit_config.elem_bytes = std::max(1, config_.elem_bytes);
-  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
-  jit_config.num_channels_per_sm = num_channels_per_sm;
-  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
-  jit_config.scaleout_rank = config_.scaleout_rank;
-  jit_config.scaleup_rank = config_.scaleup_rank;
-  jit_config.uccl_include_path = uccl_include_path;
-  return build_v2_efa_dispatch_forward_metadata_jit_plan(jit_config);
-}
-
-V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_receiver_metadata_jit_plan(
-    int num_max_tokens_per_rank, const std::string& uccl_include_path) const {
-  V2EfaDispatchJitConfig jit_config;
-  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
-  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
-  jit_config.num_experts = config_.num_experts;
-  jit_config.num_topk = config_.num_topk;
-  jit_config.hidden = std::max(1, config_.hidden);
-  jit_config.elem_bytes = std::max(1, config_.elem_bytes);
-  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
-  jit_config.num_channels_per_sm = 1;
-  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
-  jit_config.scaleout_rank = config_.scaleout_rank;
-  jit_config.scaleup_rank = config_.scaleup_rank;
-  jit_config.uccl_include_path = uccl_include_path;
-  return build_v2_efa_dispatch_receiver_metadata_jit_plan(jit_config);
-}
-
-V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_materialize_records_jit_plan(
-    int num_max_tokens_per_rank, const std::string& uccl_include_path) const {
-  V2EfaDispatchJitConfig jit_config;
-  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
-  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
-  jit_config.num_experts = config_.num_experts;
-  jit_config.num_topk = config_.num_topk;
-  jit_config.hidden = std::max(1, config_.hidden);
-  jit_config.elem_bytes = std::max(1, config_.elem_bytes);
-  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
-  jit_config.num_channels_per_sm = 1;
-  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
-  jit_config.scaleout_rank = config_.scaleout_rank;
-  jit_config.scaleup_rank = config_.scaleup_rank;
-  jit_config.uccl_include_path = uccl_include_path;
-  return build_v2_efa_dispatch_materialize_records_jit_plan(jit_config);
-}
-
-V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_signal_offsets_jit_plan(
-    const std::string& uccl_include_path) const {
-  return build_v2_efa_dispatch_signal_offsets_jit_plan(uccl_include_path);
-}
-
-V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_expand_records_jit_plan(
-    int num_max_tokens_per_rank, const std::string& uccl_include_path) const {
-  V2EfaDispatchJitConfig jit_config;
-  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
-  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
-  jit_config.num_experts = config_.num_experts;
-  jit_config.num_topk = config_.num_topk;
-  jit_config.hidden = std::max(1, config_.hidden);
-  jit_config.elem_bytes = std::max(1, config_.elem_bytes);
-  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
-  jit_config.num_channels_per_sm = 1;
-  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
-  jit_config.scaleout_rank = config_.scaleout_rank;
-  jit_config.scaleup_rank = config_.scaleup_rank;
-  jit_config.uccl_include_path = uccl_include_path;
-  return build_v2_efa_dispatch_expand_records_jit_plan(jit_config);
-}
-
 V2EfaJitLaunchPlan V2EfaRuntime::build_native_hybrid_dispatch_jit_plan(
     int num_max_tokens_per_rank, int num_channels_per_sm, int num_sf_packs,
     int expert_alignment, int num_qps, int64_t num_timeout_cycles,
     bool cached_mode, bool deterministic, bool do_cpu_sync, int smem_bytes,
     const std::string& uccl_include_path) const {
-  V2EfaDispatchJitConfig jit_config;
-  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
-  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
-  jit_config.num_experts = config_.num_experts;
-  jit_config.num_topk = config_.num_topk;
-  jit_config.hidden = config_.hidden;
-  jit_config.elem_bytes = config_.elem_bytes;
-  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
+  auto jit_config = make_dispatch_jit_config(config_);
   jit_config.num_channels_per_sm = num_channels_per_sm;
   jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
-  jit_config.scaleout_rank = config_.scaleout_rank;
-  jit_config.scaleup_rank = config_.scaleup_rank;
   jit_config.num_sf_packs = num_sf_packs;
   jit_config.expert_alignment = expert_alignment;
   jit_config.num_qps = num_qps;
@@ -220,69 +100,15 @@ V2EfaJitLaunchPlan V2EfaRuntime::build_dispatch_copy_epilogue_jit_plan(
     int num_max_tokens_per_rank, int num_channels, int num_sf_packs,
     bool do_expand, bool cached_mode, int smem_bytes,
     const std::string& uccl_include_path) const {
-  V2EfaDispatchJitConfig jit_config;
-  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
-  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
-  jit_config.num_experts = config_.num_experts;
-  jit_config.num_topk = config_.num_topk;
-  jit_config.hidden = config_.hidden;
-  jit_config.elem_bytes = config_.elem_bytes;
-  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
-  jit_config.num_channels_per_sm = std::max(1, num_channels / jit_config.num_sms);
+  auto jit_config = make_dispatch_jit_config(config_);
+  jit_config.num_channels_per_sm =
+      std::max(1, num_channels / jit_config.num_sms);
   jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
-  jit_config.scaleout_rank = config_.scaleout_rank;
-  jit_config.scaleup_rank = config_.scaleup_rank;
   jit_config.num_sf_packs = num_sf_packs;
   jit_config.smem_bytes = smem_bytes;
   jit_config.uccl_include_path = uccl_include_path;
-  return build_v2_efa_dispatch_copy_epilogue_jit_plan(
-      jit_config, num_channels, do_expand, cached_mode);
-}
-
-V2EfaJitLaunchPlan
-V2EfaRuntime::build_combine_descriptor_enqueue_d2h_jit_plan(
-    int num_max_tokens_per_rank, int num_channels, int payload_bytes,
-    bool use_expanded_layout, bool allow_multiple_reduction, int smem_bytes,
-    const std::string& uccl_include_path) const {
-  V2EfaCombineJitConfig jit_config;
-  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
-  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
-  jit_config.num_experts = config_.num_experts;
-  jit_config.num_topk = config_.num_topk;
-  jit_config.hidden = config_.hidden;
-  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
-  jit_config.num_channels = num_channels;
-  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
-  jit_config.dst_original_rank = config_.rank;
-  jit_config.payload_bytes = payload_bytes;
-  jit_config.use_expanded_layout = use_expanded_layout;
-  jit_config.allow_multiple_reduction = allow_multiple_reduction;
-  jit_config.smem_bytes = smem_bytes;
-  jit_config.uccl_include_path = uccl_include_path;
-  return build_v2_efa_combine_descriptor_enqueue_d2h_jit_plan(jit_config);
-}
-
-V2EfaJitLaunchPlan
-V2EfaRuntime::build_combine_forward_metadata_enqueue_d2h_jit_plan(
-    int num_max_tokens_per_rank, int num_channels, int payload_bytes,
-    bool use_expanded_layout, bool allow_multiple_reduction, int smem_bytes,
-    const std::string& uccl_include_path) const {
-  V2EfaCombineJitConfig jit_config;
-  jit_config.num_scaleout_ranks = config_.num_scaleout_ranks;
-  jit_config.num_scaleup_ranks = config_.num_scaleup_ranks;
-  jit_config.num_experts = config_.num_experts;
-  jit_config.num_topk = config_.num_topk;
-  jit_config.hidden = config_.hidden;
-  jit_config.num_sms = config_.num_sms > 0 ? config_.num_sms : 1;
-  jit_config.num_channels = num_channels;
-  jit_config.num_max_tokens_per_rank = num_max_tokens_per_rank;
-  jit_config.dst_original_rank = config_.rank;
-  jit_config.payload_bytes = payload_bytes;
-  jit_config.use_expanded_layout = use_expanded_layout;
-  jit_config.allow_multiple_reduction = allow_multiple_reduction;
-  jit_config.smem_bytes = smem_bytes;
-  jit_config.uccl_include_path = uccl_include_path;
-  return build_v2_efa_combine_forward_metadata_enqueue_d2h_jit_plan(jit_config);
+  return build_v2_efa_dispatch_copy_epilogue_jit_plan(jit_config, num_channels,
+                                                      do_expand, cached_mode);
 }
 
 }  // namespace uccl::v2_efa

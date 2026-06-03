@@ -216,9 +216,23 @@ V2 的三个特殊需求都可以用旧 TransferCmd 表达：
 | receiver 落点 | V1 staging buffer | 直接写 `scaleout_recv_buffer` | 避免额外 GPU memcpy |
 | proxy 框架 | CPU proxy/FIFO/EFA post | 原样复用 | transport substrate 与 V1 语义耦合弱 |
 
-**关于 MR 注册**：原 `uccl/ep` 的 `ProxyCtx` 已有 `lkey_for(addr)` / `rkey_for(addr)` 按地址查 chunk，
-`atomic_buffer_mr` 也是独立 MR。V2 的 buffer/workspace/signal_scratch 可注册成三个独立 MR，
-proxy 查 `lkey_for(addr)` 就能找到正确 lkey，**不需要统一 window**。
+**关于 MR 注册（2026-06-03 修正，推翻早期"三独立 MR"说法）**：
+`rdma.cpp` 的 WRITE 路径是**单 window**：remote = `ctx->remote_addr + (req_rptr<<2)`（单 rkey），
+local = `ctx->mr->addr + (req_lptr<<2)`（单 lkey）。`req_lptr/req_rptr` 是相对**单一 base** 的
+32-bit shifted offset（shift=2，≤16 GiB），TransferCmd **没有 region 字段**。
+`lkey_for/rkey_for/gpu_mr_chunks` 是 `#ifdef USE_DMABUF` 下对**一个连续 window** 的 chunk 拆分，
+不是多区域寻址。所以"三独立 MR"不可行。
+
+**解决：单一统一 window（正好是 DeepEP 现有布局，零 transport 改动）**。
+`csrc/elastic/buffer.hpp::get_native_v2_resources()` 已把 workspace+buffer 连续放在**一个 NCCL
+symmetric window**：`raw_workspace`=window base，`raw_buffer`=`raw_workspace+ws_bytes`，尾部还有
+`num_cpu_buffer_bytes`（engram/agrs，按 API 灵活使用）。mapped 侧 `buffer = workspace + ws_bytes`
+（buffer.hpp:132），mapped 与 raw 布局一致。
+- 把**整个 window**注册成**一个 MR**（base = raw_workspace，len = ws+gpu_buffer+cpu_buffer）。
+- kernel offset = `target_mapped_addr - workspace_base`（workspace/buffer/scratch 通用），
+  `req_lptr=req_rptr=offset>>2`（symmetric window 两侧 offset 相同）。
+- 约束：window 总大小 < 16 GiB（shift=2 寻址上限），需断言。
+- **signal_scratch** 占用尾部 cpu_buffer/engram 区域（仅作 local source，单 MR 覆盖）。
 
 **关于 GPUDirect 内存序**：`ring_buffer.cuh::commit_with_head` 在 `DeviceToHost` 方向调用
 `__threadfence_system()`，保证 GPU 对 RDMA buffer 的写在 CPU 读到 D2H slot 之前对 NIC 可见。
@@ -387,19 +401,19 @@ uint64_t                signal_scratch_transport_offset,
 2. GPU 写一个旧 TransferCmd WRITE
 3. proxy drain 后对端 GPU tensor 内容正确
 
-#### 1b. 注册 V2 buffer/workspace/scratch 为 EFA MR
+#### 1b. 注册整个 NCCL symmetric window 为单一 EFA MR（修正）
 
 ```
-V2 buffer    → ibv_reg_mr → lkey_A / rkey_A
-V2 workspace → ibv_reg_mr → lkey_B / rkey_B
-signal_scratch (GPU memory) → ibv_reg_mr → lkey_C / rkey_C
-
-bootstrap: allgather rkey_A / rkey_B / rkey_C 以及 remote base 地址
-proxy 查 lkey_for(addr) / rkey_for(addr) 得到正确 MR（已有机制）
+ibv_reg_mr(raw_workspace, ws_bytes + gpu_buffer_bytes + cpu_buffer_bytes) → 单 mr / rkey
+  raw_workspace = nccl_context->get_raw_window_ptr()（get_native_v2_resources 的 rdma_workspace_ptr）
+bootstrap: allgather 这一个 remote base + rkey
+ctx->mr = 该 MR；ctx->remote_addr/remote_rkey/remote_len = 对端同一 window
+signal_scratch = window 尾部 cpu_buffer 区域的一个切片（同一 MR 覆盖）
 ```
 
-`TransferCmd` shift=2，32-bit shifted offset 覆盖约 16 GiB offset 范围。
-如果任一 buffer 超过这个范围（offset 从 buffer base 算起），需改用 UCCL 低层 MR chunk 方案，
+kernel 把 workspace/buffer/scratch 目标地址都换算成相对 `workspace_base`(=mapped window base)
+的 offset，`req = offset >> 2`。symmetric window 保证两侧 offset 相同。
+约束：window 总大小 < 16 GiB（shift=2 上限），`init` 时断言；超限再走 UCCL DMABUF chunk 方案，
 **不能悄悄截断 offset**。
 
 #### 1c. 替换 notify warp 的 `gin.put<ncclTeamTagRail>`
@@ -602,20 +616,71 @@ D2H FIFO push old TransferCmd ────→ post RDMA write (same QP/queue)
 
 ## 十、文件修改清单（阶段 1 实施）
 
-工作目录：`ep/`（全新 fork，基于 `uccl/ep` + DeepEP V2 kernel）。已完成的 fork 操作：
+工作目录：`ep/`（全新 fork，基于 `uccl/ep` + DeepEP V2 kernel）。
+
+#### 已完成的 fork 操作
+
 - `ep/` 整体复制自 `uccl/ep/`，V1 完整保留（`internode.cu`, `intranode.cu`, `layout.cu`, `ep_runtime.cu` 等全在）
 - `include/v2_efa/hybrid_dispatch_native.cuh`（从 `deep_ep/impls/hybrid_dispatch.cuh` 复制，672 行，全量原版，待修改）
 - `include/v2_efa/hybrid_combine_native.cuh`（从 `deep_ep/impls/hybrid_combine.cuh` 复制，620 行，全量原版，待修改）
-- `include/v2_efa/workspace.hpp`, `jit_plan.hpp`, `topology.hpp`（从 `uccl-ep` 带入，仍然有效）
-- `src/v2_efa_deep_ep_jit.cc`（273 行，已清理：删除全部旧 scaffold / V2TransferCmd 函数，只保留 JIT 基础设施 + native hybrid dispatch + copy epilogue）
-- `src/v2_efa_runtime.cc`（从 `uccl-ep` 带入，作为改动起点，需重写）
+- `include/v2_efa/workspace.hpp`(61), `jit_plan.hpp`(624), `topology.hpp`(50)（从 `uccl-ep` 带入）
+- `src/v2_efa_deep_ep_jit.cc`（273 行，已清理：删除全部旧 scaffold / V2TransferCmd 函数，只保留 JIT 基础设施 + native hybrid dispatch + copy epilogue，include 改为 `ring_buffer.cuh`，queue 参数改为 `DeviceToHostCmdBuffer**`，已加 `signal_scratch_base`）
 - `deep_ep_v2_wrapper/`（从 `uccl-ep` 带入，Python V2 层）
 
-已删除（不符合新计划）：`dispatch_jit.cuh`, `combine_jit.cuh`（全为 V2TransferCmd shim，废弃）
+#### ⚠️ 当前 `ep/` 不能编译——已知缺口（阶段 1 第 0 步必须先解决）
+
+实际状态与早期假设不符，盘点如下：
+
+| 缺口 | 现象 | 处理 |
+|------|------|------|
+| `include/v2_efa/runtime.hpp` **未 fork** | `v2_efa_deep_ep_jit.cc:1` 和 `v2_efa_runtime.cc:1` 都 `#include "v2_efa/runtime.hpp"`，文件不存在 | 从 `uccl-ep` fork 并清理（见下「头文件归整」） |
+| `descriptor.hpp` **未 fork**，但 `workspace.hpp:6` 仍 `#include "v2_efa/descriptor.hpp"` | 编译即断 | `workspace.hpp` 去掉该 include；`DescriptorPlanStats` 等旧统计结构整体不带入 |
+| `transfer_cmd.hpp` **未 fork**，但 `DispatchTransferLayout`/`CombineTransferLayout` 仍被 jit / runtime 使用 | 类型缺失 | 把这两个 struct 抢救到保留的头（`topology.hpp` 或新 `transfer_layout.hpp`），其余 V2TransferCmd 内容不带入 |
+| `src/v2_efa_runtime.cc`（288 行）仍是**旧 scaffold** | 用 `DescriptorPlanStats`/`worst_case_stats`/`max_dispatch_segments` 等已废弃符号 | 与 `v2_efa_deep_ep_jit.cc` 同样清理 + 重写为 MR/proxy 初始化 |
+
+注：`uccl-ep/include/v2_efa/` 下的 `transfer_cmd.hpp`、`verbs_sink.hpp`、`efa_adapter.hpp`、`uccl_transfer_adapter.hpp`、`descriptor.hpp`、`dispatch_jit.cuh`、`combine_jit.cuh`、`transfer_d2h_queue.cuh`、`proxy.hpp` **都没有进 `ep/`**——不存在「删除」动作，只有「确认不带入」+「抢救少量仍需的 struct」。
 
 ---
 
 ### 修改文件
+
+#### 0. 头文件归整（header reconciliation，编译前置，无依赖，先做）
+
+让 `ep/` 重新可编译，不引入任何废弃头：
+
+```
+0a. 新建 include/v2_efa/transfer_layout.hpp（~40 行）
+    从 uccl-ep/include/v2_efa/transfer_cmd.hpp 抢救：
+      struct DispatchTransferLayout（line 68）
+      struct CombineTransferLayout（line 93）
+    只搬这两个 POD struct，不带 V2TransferCmd / encode / sink。
+
+0b. include/v2_efa/workspace.hpp
+    删除 #include "v2_efa/descriptor.hpp"（line 6）
+    若 WorkspacePlan 依赖 DescriptorPlanStats，就地内联所需字段或删除该依赖。
+
+0c. fork + 清理 include/v2_efa/runtime.hpp（303 → ~150 行）
+    从 uccl-ep fork，然后：
+      - include 改为 jit_plan.hpp + topology.hpp + workspace.hpp + transfer_layout.hpp
+        （删 descriptor.hpp / transfer_cmd.hpp）
+      - 删除全部旧 scaffold 自由函数声明（descriptor_enqueue / forward_metadata /
+        receiver_metadata / materialize_records / signal_offsets / expand_records /
+        combine_descriptor_enqueue / combine_forward_metadata）
+      - 删除 V2EfaRuntime 里对应的旧 build_* / launch_* 方法声明
+      - 只保留：init/compile JIT、launch_v2_efa_native_hybrid_dispatch_plan、
+        launch_v2_efa_dispatch_copy_epilogue_plan，及 V2EfaRuntime 的
+        launch_native_hybrid_dispatch / launch_dispatch_copy_epilogue
+      - 这两个保留声明的签名要与已清理的 v2_efa_deep_ep_jit.cc 对齐
+        （DeviceToHostCmdBuffer** queues、signal_scratch_base 参数）
+
+0d. src/v2_efa_runtime.cc（288 → 重写）
+    删掉 worst_case_stats / DescriptorPlanStats / max_dispatch_segments 等旧 scaffold；
+    保留 RuntimeConfig 校验 + status，其余并入步骤 5（MR/proxy 初始化）。
+```
+
+完成 0 后，`ep/` 应能在不接通新功能的前提下编译通过（hybrid kernel 仍是原版 fork）。
+
+---
 
 #### 1. `include/v2_efa/workspace.hpp`　61 → ~130 行　+69
 
@@ -714,12 +779,13 @@ d2h_queues[q]->atomic_set_and_commit(sig);
 
 ---
 
-#### 4. `include/v2_efa/runtime.hpp`　303 → ~390 行　+87
+#### 4. `include/v2_efa/runtime.hpp`（在步骤 0c 已 fork+清理的基础上加字段）　~150 → ~230 行
+
+> 前提：步骤 0c 已把 runtime.hpp fork 进 `ep/` 并删干净旧 scaffold 声明。本步只在
+> `V2EfaRuntime` 类上加 MR/proxy 字段与方法（V2EfaConnectionHandle 在旧版根本没保留下来，
+> 无需「删除」）。
 
 ```
-删除字段：
-  V2EfaConnectionHandle handle_;          // 完整移除，约 5 行
-
 新增字段：
   void*     signal_scratch_ = nullptr;    // GPU memory，cudaMalloc
   size_t    signal_scratch_bytes_ = 0;
@@ -739,55 +805,53 @@ d2h_queues[q]->atomic_set_and_commit(sig);
 
 ---
 
-#### 5. `src/v2_efa_runtime.cc`　288 → ~460 行　+172
+#### 5. `src/v2_efa_runtime.cc`（步骤 0d 清理后再实现）　288 → ~360 行
 
-核心改动是 `init_native_v2_efa_transport()` 的实现：
-
-```
-删除：
-  V2EfaConnectionHandle 构造、EFA QP/MR 自建路径（约 180 行）
-
-新增：
-  1. cudaMalloc signal_scratch（num_d2h_queues × kSignalScratchSlotsPerQueue × 8 字节）
-  2. ibv_reg_mr(buffer_ptr, buffer_bytes)   → buffer_mr_
-  3. ibv_reg_mr(workspace_ptr, ws_bytes)    → workspace_mr_
-  4. ibv_reg_mr(signal_scratch_, ...)       → signal_scratch_mr_
-  5. Python dist.all_gather_object() 交换三个 MR 的 rkey + remote base（约 40 行）
-  6. 创建 UcclProxy 实例（per lane），调用 proxy->connect(remote_info) 建 QP
-  7. 把三个 MR 的 rkey/base 填入 ProxyCtx 的 gpu_mr_chunks，使 lkey_for(addr) 可查
-```
-
----
-
-#### 6. `src/v2_efa_deep_ep_jit.cc`　772 → ~880 行　+108
+> 前提：步骤 0d 已删掉旧 scaffold 方法（worst_case_stats / DescriptorPlanStats 等），
+> 只剩 RuntimeConfig 校验 + status。本步实现 `init_native_v2_efa_transport()`：
 
 ```
-修改 launch_native_hybrid_dispatch()：
-  - 函数签名新增：buffer_base, workspace_base, scratch_base 三个 uint64_t 参数
-    + buffer/workspace/scratch_transport_offset（从 V2EfaRuntime 读取）
-  - kernel<<<grid, block, smem, stream>>> 调用传入新增的 10 个 EFA 参数
-  - 删除旧的 D2HQueueHandle array 构造（基于 V2TransferCmd 的路径）
-  - 新增：从 runtime.hpp 获取 d2h_queues[] 指针数组，直接传入 kernel
-
-修改 launch_native_hybrid_combine()（新增）：
-  - 与 dispatch 对称，同样传入 10 个 EFA 参数
+新增（单 window 模型）：
+  1. signal_scratch = window 尾部 cpu_buffer 区域切片（不单独 cudaMalloc，复用 engram 空间）
+  2. ibv_reg_mr(raw_workspace, ws+gpu_buffer+cpu_buffer bytes) → 单 mr（覆盖 workspace+buffer+scratch）
+  3. 断言 window 总大小 < 16 GiB
+  4. allgather 单个 remote base + rkey（约 20 行）
+  5. 创建 UcclProxy 实例（per lane），proxy->connect(remote_info) 建 QP
+  6. ctx->mr / ctx->remote_addr / ctx->remote_rkey / ctx->remote_len 指向该 window
+注：现有 init_native_v2_efa_transport 已经在注册一个 window（_v2_efa_window），
+   改为直接注册 DeepEP 的 raw_workspace window 即可，proxy.cpp 无需新增 chunk（步骤 10 取消）。
 ```
 
 ---
 
-#### 7. `src/uccl_ep.cc`　2101 → ~1650 行　-451
+#### 6. `src/v2_efa_deep_ep_jit.cc`（已清理至 273 行）　273 → ~290 行
+
+> dispatch 路径已在清理时接好 `DeviceToHostCmdBuffer**` + `signal_scratch_base`。本步只补 combine：
 
 ```
-删除（整块移除）：
-  class V2EfaConnectionHandle（Python binding）约 450 行
-    包含：__init__, connect, drain_queue, poll_completions, 所有属性 getter
+launch_native_hybrid_dispatch()：基本就绪
+  - 已有：DeviceToHostCmdBuffer** d2h_queues, num_queues,
+          buffer_base, workspace_base, signal_scratch_base, layout
+  - 待补：buffer/workspace/scratch_transport_offset（如改用 offset 编码而非裸地址）
 
-保留并调整：
-  class UcclProxy binding（保留，用于 V2 proxy lifecycle）
-  init_native_v2_efa_transport() 暴露（参数改为接受 buffer/workspace Python tensor 指针）
+新增 launch_native_hybrid_combine()：
+  - 与 dispatch 对称，同样传入 D2H queues + 三个 base + transport offset
+```
 
-新增（约 20 行）：
-  signal_scratch_ptr 属性 getter（返回 GPU memory uintptr_t，供 JIT kernel 使用）
+---
+
+#### 7. `src/uccl_ep.cc`（原 `uccl/ep` V1 binding）　2574 → ~2600 行
+
+> `ep/uccl_ep.cc` 是原 UCCL V1 的 Python binding，**不含** V2EfaConnectionHandle
+> （那只存在于 `uccl-ep`）。本步是**新增** V2 binding，不是删类。
+
+```
+保留：
+  全部 V1 binding + UcclProxy binding（V2 proxy lifecycle 直接复用）
+
+新增（约 +30 行）：
+  init_native_v2_efa_transport() 暴露（接受 buffer/workspace Python tensor 指针）
+  signal_scratch_ptr 属性 getter（GPU memory uintptr_t，供 JIT kernel 使用）
   buffer_transport_offset / workspace_transport_offset / scratch_transport_offset 属性
 ```
 
@@ -837,14 +901,19 @@ SRC_CU := src/ep_runtime.cu src/internode.cu src/internode_ll.cu \
 
 ---
 
-### 删除文件
+### 确认不带入 `ep/` 的废弃头（`uccl-ep` 里存在，但本 fork 不复制）
 
-| 文件 | 行数 | 原因 |
-|------|------|------|
-| `include/v2_efa/transfer_cmd.hpp` | 477 | V2TransferCmd 整个废弃，改用旧 TransferCmd |
-| `include/v2_efa/verbs_sink.hpp` | 355 | V2EfaVerbsPostSink 废弃 |
-| `include/v2_efa/efa_adapter.hpp` | ~300 | EfaPostSink / CoalescingEfaPostSink 废弃 |
-| `include/v2_efa/uccl_transfer_adapter.hpp` | ~150 | adapter 层废弃 |
+无「删除」动作——这些文件从未进 `ep/`。只需保证 `ep/` 内不再有任何 include 指向它们。
+
+| `uccl-ep` 文件 | 处理 |
+|------|------|
+| `transfer_cmd.hpp` | 不带入；仅抢救 `DispatchTransferLayout` / `CombineTransferLayout` 两个 struct（步骤 0a） |
+| `verbs_sink.hpp` | 不带入（V2EfaVerbsPostSink 废弃） |
+| `efa_adapter.hpp` | 不带入（EfaPostSink / CoalescingEfaPostSink 废弃） |
+| `uccl_transfer_adapter.hpp` | 不带入（adapter 层废弃） |
+| `descriptor.hpp` | 不带入；`workspace.hpp` 去掉对它的 include（步骤 0b） |
+| `dispatch_jit.cuh` / `combine_jit.cuh` | 不带入（device-side V2TransferCmd shim 废弃，已确认 `ep/` 中无） |
+| `transfer_d2h_queue.cuh` / `proxy.hpp` | 不带入（已被 `ring_buffer.cuh` + 原 UCCL proxy 取代） |
 
 ---
 
@@ -852,33 +921,38 @@ SRC_CU := src/ep_runtime.cu src/internode.cu src/internode_ll.cu \
 
 | 文件 | 当前行数 | 预计行数 | 净变化 |
 |------|---------|---------|--------|
-| `workspace.hpp` | 61 | 130 | +69 |
-| `hybrid_dispatch_native.cuh` | 672 (原版 fork) | 820 | +148 |
-| `hybrid_combine_native.cuh` | 620 (新 fork) | 720 | +100 |
-| `runtime.hpp` | 303 | 390 | +87 |
-| `v2_efa_runtime.cc` | 288 | 460 | +172 |
-| `v2_efa_deep_ep_jit.cc` | 773→273 (已清理) | ~300 | +27 (signal_scratch_base param) |
-| `uccl_ep.cc` | 2101 | 1650 | -451 |
-| `elastic.py` | 1967 | 1820 | -147 |
-| `proxy.cpp` | 1557 | 1587 | +30 |
-| `Makefile` | 161 | 170 | +9 |
-| **删除合计** | **~1282** | 0 | -1282 |
-| **净变化** | | | **约 -1175 行** |
+| `transfer_layout.hpp`（新建，步骤 0a） | 0 | ~40 | +40 |
+| `runtime.hpp`（fork+清理，步骤 0c→0c 后再加字段） | 0（未 fork） | ~230 | +230 |
+| `workspace.hpp` | 61 | ~130 | +69 |
+| `hybrid_dispatch_native.cuh` | 672 (原版 fork) | ~820 | +148 |
+| `hybrid_combine_native.cuh` | 620 (原版 fork) | ~720 | +100 |
+| `v2_efa_runtime.cc`（清理旧 scaffold + 重写） | 288 | ~360 | +72 |
+| `v2_efa_deep_ep_jit.cc` | 273 (已清理) | ~290 | +17 |
+| `uccl_ep.cc` | 2574 | ~2600 | +V2 binding/−死代码 |
+| `elastic.py` | 1967 | ~1820 | -147 |
+| `proxy.cpp` | 1557 | ~1587 | +30 |
+| `Makefile` | 161 | ~170 | +9 |
+
+> 注：`ep/` 是干净 fork，`uccl-ep` 里的废弃头从未带入，所以没有「删除 ~1282 行」这一项。
+> `uccl_ep.cc` 是原 `uccl/ep` 的 V1 binding（2574 行），改动是**新增** V2 binding，
+> 不是删 V2EfaConnectionHandle（后者只存在于 `uccl-ep`）。
 
 ---
 
 ### 实施顺序建议
 
 ```
-1. workspace.hpp          ← 无依赖，先写常量和 helper
-2. hybrid_dispatch_native.cuh ← 依赖 workspace.hpp
-3. hybrid_combine_native.cuh  ← 同上
-4. runtime.hpp            ← 删字段、加字段，不实现
-5. v2_efa_runtime.cc      ← 实现 MR 注册和 proxy 初始化
-6. proxy.cpp              ← 加 chunk 注册（依赖 v2_efa_runtime.cc 设计确定后）
-7. v2_efa_deep_ep_jit.cc  ← 更新 kernel launch 参数
-8. uccl_ep.cc             ← 删 V2EfaConnectionHandle，暴露新属性
-9. elastic.py             ← Python 层接通（端到端 smoke test 之前最后改）
-10. Makefile              ← 加 V1 .cu，最后确认编译
-11. 删除 4 个废弃文件
+0. 头文件归整         ← 编译前置：transfer_layout.hpp + workspace.hpp 去 descriptor +
+                        fork/清理 runtime.hpp + 清理 v2_efa_runtime.cc 旧 scaffold
+                        目标：ep/ 先恢复可编译（kernel 仍原版）
+1. workspace.hpp      ← 加 signal scratch 常量和 helper
+2. hybrid_dispatch_native.cuh ← 依赖 workspace.hpp，加参数 + 4 call site
+3. hybrid_combine_native.cuh  ← 同上，3 call site
+4. runtime.hpp        ← 在 0c 基础上加 MR/proxy 字段与方法声明
+5. v2_efa_runtime.cc  ← 实现 MR 注册和 proxy 初始化
+6. proxy.cpp          ← 加 chunk 注册（依赖 v2_efa_runtime.cc 设计确定后）
+7. v2_efa_deep_ep_jit.cc  ← 接通新 kernel launch 参数
+8. uccl_ep.cc         ← 新增 V2 binding，暴露 signal_scratch / transport offset 属性
+9. elastic.py         ← Python 层接通（端到端 smoke test 之前最后改）
+10. Makefile          ← 加 V1 .cu，最后确认编译
 ```
