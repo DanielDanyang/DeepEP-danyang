@@ -223,15 +223,19 @@ hybrid_dispatch_impl(
             if (thread_idx < kNumScaleoutRanks) {
                 const auto dst_scaleout_rank_idx = thread_idx;
                 auto* q = d2h_queues[dst_scaleout_rank_idx % num_d2h_queues];
+                // The proxy peer table is indexed by GLOBAL rank; the scaleout
+                // peer at our scaleup position is dst_scaleout * kNumScaleupRanks
+                // + scaleup_rank_idx.
+                const int dst_global = dst_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
                 // local src = staged per-dst send count (<true>); remote dst =
                 // peer's recv slot reserved for this sender (<false>, indexed by
                 // our own scaleout rank).
                 v2_d2h_write(
-                    q, dst_scaleout_rank_idx, kNumScaleupRanks * sizeof(int),
+                    q, dst_global, kNumScaleupRanks * sizeof(int),
                     v2_window_off(workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx), window_base),
                     v2_window_off(workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx), window_base));
                 v2_d2h_write(
-                    q, dst_scaleout_rank_idx, kNumExpertsPerScaleout * sizeof(int),
+                    q, dst_global, kNumExpertsPerScaleout * sizeof(int),
                     v2_window_off(workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx), window_base),
                     v2_window_off(workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx), window_base));
             }
@@ -402,7 +406,8 @@ hybrid_dispatch_impl(
                 *scratch = signaled_tail;
                 TransferCmd cmd{};
                 cmd.cmd_type = make_cmd_type(CmdType::WRITE, false, false);
-                cmd.dst_rank = static_cast<uint8_t>(lane_idx);
+                // lane_idx is the destination scaleout rank; map to global rank.
+                cmd.dst_rank = static_cast<uint8_t>(lane_idx * kNumScaleupRanks + scaleup_rank_idx);
                 cmd.bytes = sizeof(int64_t);
                 cmd.req_lptr = v2_window_off(scratch, window_base);
                 cmd.req_rptr = v2_window_off(remote_ptr, window_base);
@@ -513,7 +518,8 @@ hybrid_dispatch_impl(
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
                 auto* q = d2h_queues[channel_idx % num_d2h_queues];
                 v2_d2h_write(
-                    q, stored_dst_scaleout_rank_idx, tma_buffer.get_num_bytes<false>(),
+                    q, stored_dst_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx,
+                    tma_buffer.get_num_bytes<false>(),
                     v2_window_off(scaleout_send_buffer.get_token_buffer(token_idx).get_base_ptr(), window_base),
                     v2_window_off(scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), window_base));
             }

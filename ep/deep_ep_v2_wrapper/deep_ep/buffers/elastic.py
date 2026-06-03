@@ -13,6 +13,10 @@ from uccl import ep
 from ..utils.event import EventOverlap
 
 
+# D2H ring capacity (must match include/common.hpp kQueueSize); one int64 signal
+# scratch slot is reserved per ring slot per queue.
+_V2_KQUEUE_SIZE = 2048
+
 _NATIVE_V2_REWRITE_MESSAGE = (
     "uccl-ep is being rewritten as a native DeepEP V2 AWS EFA backend. "
     "The previous V1/UCCL EP transport path has been removed, and dispatch/"
@@ -162,13 +166,14 @@ class ElasticBuffer:
         self.allow_hybrid_mode = bool(allow_hybrid_mode)
         self.allow_multiple_reduction = bool(allow_multiple_reduction)
         self.prefer_overlap_with_compute = bool(prefer_overlap_with_compute)
-        self._v2_efa_window: Optional[torch.Tensor] = None
-        self._v2_efa_workspace: Optional[torch.Tensor] = None
-        self._v2_efa_connection = None
-        self._v2_efa_window_addr = 0
-        self._v2_efa_window_bytes = 0
-        self._v2_efa_workspace_addr = 0
-        self._v2_efa_workspace_bytes = 0
+        # Native UCCL EFA transport: persistent UcclProxy threads over the single
+        # DeepEP symmetric window (workspace+buffer registered as one MR).
+        self._v2_proxies = None                 # list[ep.Proxy]
+        self._v2_window_base = 0                # registered window base (raw symmetric)
+        self._v2_window_bytes = 0              # registered window size
+        self._v2_d2h_queue_ptrs: Optional[torch.Tensor] = None  # int64[]: DeviceToHostCmdBuffer*
+        self._v2_num_d2h_queues = 0
+        self._v2_signal_scratch_base = 0       # mapped scratch base (window tail)
         self._v2_efa_num_lanes = 1
         self._native_v2_resources: Optional[dict] = None
 
@@ -443,96 +448,100 @@ class ElasticBuffer:
 
     def init_native_v2_efa_transport(
         self,
-        window: Optional[torch.Tensor] = None,
-        workspace: Optional[torch.Tensor] = None,
-        window_addr: int = 0,
-        workspace_addr: int = 0,
-        num_bytes: Optional[int] = None,
-        workspace_bytes: Optional[int] = None,
+        *,
+        window_base: int,
+        mapped_window_base: int,
+        window_bytes: int,
         num_lanes: int = 1,
-        device_index: int = -1,
-        signal_capacity: int = 65536,
     ):
-        """Create the V2-only EFA verbs connection for the native backend.
+        """Set up the native UCCL EFA transport for the DeepEP symmetric window.
 
-        The connection registers one caller-owned V2 RDMA window and exchanges
-        endpoint metadata through the existing torch distributed group. It does
-        not instantiate the removed V1 proxy or old TransferCmd path.
+        Mirrors the V1 ``init_uccl`` setup: spin up ``get_num_proxy_threads()``
+        persistent ``UcclProxy`` threads, each registering the single window
+        ``[window_base, window_base+window_bytes)`` (raw symmetric address) as its
+        RDMA MR, exchange peer meta (listen ports + window base) over the torch
+        group, connect, and start them in dual mode.  The proxies' D2H command
+        rings become the kernel's ``d2h_queues**``.  ``signal_scratch`` is carved
+        from the tail of the registered window (idle buffer slack); its mapped
+        base is derived from ``mapped_window_base`` once the queue count is known.
         """
+        if not hasattr(ep, "Proxy"):
+            raise RuntimeError("uccl.ep was built without the UcclProxy transport")
 
-        if not hasattr(ep, "V2EfaConnection"):
-            raise RuntimeError("uccl.ep was built without V2 EFA verbs connection support")
-        if window is None and int(window_addr) == 0:
-            bytes_to_alloc = int(self.num_bytes if num_bytes is None else num_bytes)
-            window = torch.empty((bytes_to_alloc,), dtype=torch.uint8, device="cuda")
-        if window is not None:
-            _require_cuda_contiguous(window, "window")
-            window_addr = int(window.data_ptr())
-            bytes_in_window = int(window.numel() * window.element_size())
-        else:
-            if num_bytes is None:
-                raise ValueError("num_bytes is required when window_addr is provided")
-            bytes_in_window = int(num_bytes)
-        if num_bytes is not None and int(num_bytes) > bytes_in_window:
-            raise ValueError("num_bytes exceeds the provided V2 EFA window")
-        if window is None and int(workspace_addr) == 0 and workspace is None:
-            raise ValueError(
-                "workspace tensor or workspace_addr is required when window_addr "
-                "is provided as a raw pointer"
-            )
-        if workspace is None and int(workspace_addr) == 0:
-            workspace_alloc_bytes = int(
-                _native_workspace_bytes()
-                if workspace_bytes is None else workspace_bytes
-            )
-            workspace = torch.empty(
-                (workspace_alloc_bytes,), dtype=torch.uint8,
-                device=("cuda" if window is None else window.device)
-            )
-            workspace.zero_()
-        if workspace is not None:
-            _require_cuda_contiguous(workspace, "workspace")
-            workspace_addr = int(workspace.data_ptr())
-            bytes_in_workspace = int(workspace.numel() * workspace.element_size())
-            if workspace_bytes is not None and int(workspace_bytes) > bytes_in_workspace:
-                raise ValueError("workspace_bytes exceeds the provided V2 EFA workspace")
-        else:
-            if int(workspace_addr) != 0 and workspace_bytes is None:
-                raise ValueError("workspace_bytes is required when workspace_addr is provided")
-            bytes_in_workspace = int(0 if workspace_bytes is None else workspace_bytes)
-        registered_workspace_bytes = int(
-            bytes_in_workspace if workspace_bytes is None else workspace_bytes
-        )
-        if device_index < 0 and "UCCL_V2_EFA_DEVICE_INDEX" not in os.environ:
-            local_rank = int(os.environ.get("LOCAL_RANK", self.scaleup_rank_idx))
-            efa_stride = int(os.environ.get("UCCL_V2_EFA_DEVICE_STRIDE", "2"))
-            efa_offset = int(os.environ.get("UCCL_V2_EFA_DEVICE_OFFSET", "0"))
-            device_index = efa_offset + local_rank * max(1, efa_stride)
+        rank = int(self.rank_idx)
+        num_ranks = int(self.num_ranks)
+        local_rank = int(os.environ.get("LOCAL_RANK", self.scaleup_rank_idx))
+        node_idx = int(self.scaleout_rank_idx)
+        num_nodes = int(self.num_scaleout_ranks)
+        is_intranode = num_nodes <= 1
 
-        connection = ep.V2EfaConnection(
-            int(window_addr),
-            int(bytes_in_window if num_bytes is None else num_bytes),
-            int(self.num_ranks),
-            int(self.rank_idx),
-            int(max(1, num_lanes)),
-            int(device_index),
-            int(signal_capacity),
-            int(workspace_addr),
-            int(registered_workspace_bytes),
-        )
-        local_info = connection.local_info()
-        all_infos = [None for _ in range(self.num_ranks)]
-        dist.all_gather_object(all_infos, local_info, group=self.group)
-        connection.connect(all_infos)
-        self._v2_efa_window = window
-        self._v2_efa_workspace = workspace
-        self._v2_efa_connection = connection
-        self._v2_efa_window_addr = int(window_addr)
-        self._v2_efa_window_bytes = int(bytes_in_window if num_bytes is None else num_bytes)
-        self._v2_efa_workspace_addr = int(workspace_addr)
-        self._v2_efa_workspace_bytes = int(registered_workspace_bytes)
+        num_proxy_threads = int(ep.get_num_proxy_threads())
+        proxies = [
+            ep.Proxy(
+                thread_idx=i,
+                gpu_buffer_addr=int(window_base),
+                total_size=int(window_bytes),
+                rank=rank,
+                node_idx=node_idx,
+                local_rank=local_rank,
+                num_experts=int(self.num_experts),
+                num_ranks=num_ranks,
+                num_nodes=num_nodes,
+                use_normal_mode=True,
+                is_intranode=is_intranode,
+            )
+            for i in range(num_proxy_threads)
+        ]
+
+        # Peer-meta exchange (mirror get_cpu_proxies_meta): each rank advertises
+        # its window base/size and per-thread listen ports; the proxy completes
+        # the rkey handshake over those ports during start_dual().
+        my_ip = ep.get_oob_ip()
+        meta = {
+            "rank": rank,
+            "ptr": int(window_base),
+            "nbytes": int(window_bytes),
+            "ip": my_ip,
+            "listen_ports": [p.get_listen_port() for p in proxies],
+        }
+        all_meta = [None] * num_ranks
+        dist.all_gather_object(all_meta, meta, group=self.group)
+        rank2meta = {m["rank"]: m for m in all_meta}
+        peers = [rank2meta[r] for r in range(num_ranks)]
+        if not is_intranode:
+            for p in proxies:
+                p.set_peers_meta(peers)
+        ep.register_proxies(local_rank, proxies)
+        dist.barrier(self.group)
+        if not is_intranode:
+            for p in proxies:
+                p.start_dual()
+        time.sleep(1)
+
+        # GPU-resident array of DeviceToHostCmdBuffer* (one per proxy D2H channel).
+        d2h_addrs = []
+        for p in proxies:
+            d2h_addrs.extend(int(a) for a in p.get_d2h_channel_addrs())
+        if not d2h_addrs:
+            raise RuntimeError("UcclProxy exposed no D2H channels")
+        self._v2_d2h_queue_ptrs = torch.tensor(d2h_addrs, dtype=torch.int64, device="cuda")
+        self._v2_num_d2h_queues = len(d2h_addrs)
+
+        # signal_scratch: one int64 slot per ring slot per queue, carved from the
+        # tail of the registered window (mapped address space).
+        scratch_bytes = _align(self._v2_num_d2h_queues * _V2_KQUEUE_SIZE * 8, 128)
+        if scratch_bytes >= int(window_bytes):
+            raise RuntimeError(
+                f"V2 EFA window ({int(window_bytes)} B) too small for signal scratch "
+                f"({scratch_bytes} B); enlarge the buffer or reduce proxy threads"
+            )
+        self._v2_signal_scratch_base = int(mapped_window_base) + int(window_bytes) - scratch_bytes
+
+        self._v2_proxies = proxies
+        self._v2_window_base = int(window_base)
+        self._v2_window_bytes = int(window_bytes)
         self._v2_efa_num_lanes = int(max(1, num_lanes))
-        return local_info
+        return proxies
 
     def _require_v2_efa_window(self, required_bytes: int) -> Optional[torch.Tensor]:
         if self._v2_efa_connection is None:
@@ -611,7 +620,7 @@ class ElasticBuffer:
         window[remote_signal_base: remote_signal_base + signal_bytes].zero_()
 
     def has_native_v2_efa_transport(self) -> bool:
-        return self._v2_efa_connection is not None
+        return self._v2_proxies is not None
 
     def init_from_deep_ep_v2(
         self,
@@ -623,8 +632,12 @@ class ElasticBuffer:
         """One-shot setup: extract V2 resources from an existing DeepEP ElasticBuffer
         and wire up both the EFA RDMA transport and the native dispatch resource table.
 
+        Registers the WHOLE DeepEP symmetric window (workspace + buffer) as one MR
+        via UcclProxy; signal scratch is carved from the window tail.
+
         Returns the full resource dict so callers can inspect addresses.
         """
+        del device_index, signal_capacity  # legacy scaffold args, no longer used
         deep_ep_handle = getattr(deep_ep_buffer, "runtime", None)
         if deep_ep_handle is None:
             deep_ep_handle = getattr(deep_ep_buffer, "_handle", None)
@@ -636,16 +649,17 @@ class ElasticBuffer:
                 "with get_native_v2_resources()"
             )
         resources = deep_ep_handle.get_native_v2_resources()
-        rdma_buffer_ptr = int(resources.get("rdma_buffer_ptr", resources["buffer_ptr"]))
-        rdma_workspace_ptr = int(resources.get("rdma_workspace_ptr", resources["workspace_ptr"]))
+        ws_bytes = int(resources["workspace_bytes"])
+        buf_bytes = int(resources["buffer_bytes"])
+        window_bytes = ws_bytes + buf_bytes
+        # Raw symmetric base for ibv_reg_mr; mapped base for kernel/scratch offsets.
+        raw_window_base = int(resources.get("rdma_workspace_ptr", resources["workspace_ptr"]))
+        mapped_window_base = int(resources["workspace_ptr"])
         self.init_native_v2_efa_transport(
-            window_addr=rdma_buffer_ptr,
-            num_bytes=int(resources["buffer_bytes"]),
-            workspace_addr=rdma_workspace_ptr,
-            workspace_bytes=int(resources["workspace_bytes"]),
+            window_base=raw_window_base,
+            mapped_window_base=mapped_window_base,
+            window_bytes=window_bytes,
             num_lanes=num_lanes,
-            device_index=device_index,
-            signal_capacity=signal_capacity,
         )
         self.init_native_v2_deep_ep_resources(
             nccl_dev_comm_ptr=int(resources["nccl_dev_comm_ptr"]),
@@ -1282,7 +1296,7 @@ class ElasticBuffer:
 
         if topk_idx is None:
             raise ValueError("topk_idx is required for uncached native V2 dispatch")
-        if self._v2_efa_connection is None:
+        if self._v2_proxies is None:
             raise RuntimeError("native V2 dispatch requires init_native_v2_efa_transport()")
         _require_cuda_contiguous(topk_idx, "topk_idx")
         if topk_idx.dtype != torch.int64:
@@ -1351,7 +1365,7 @@ class ElasticBuffer:
     ):
         if self._native_v2_resources is None:
             raise RuntimeError("native V2 resources are not initialized")
-        if self._v2_efa_connection is None:
+        if self._v2_proxies is None:
             raise RuntimeError("native V2 EFA transport is not initialized")
         if do_cpu_sync and int(self._native_v2_resources.get("host_workspace_ptr", 0)) == 0:
             raise RuntimeError(
@@ -1398,36 +1412,15 @@ class ElasticBuffer:
         )
         copied_topk_idx = topk_idx.clone() if do_handle_copy else topk_idx
 
-        # Phase 2: one D2H queue per proxy thread so channels can drain in parallel.
-        # Cap at num_efa_lanes; also cap at num_channels to avoid empty queues.
-        requested_proxy_threads = int(
-            os.environ.get("UCCL_V2_NUM_PROXY_THREADS",
-                           str(min(4, max(1, self._v2_efa_num_lanes), num_channels)))
-        )
-        num_proxy_threads = max(
-            1,
-            min(requested_proxy_threads, max(1, self._v2_efa_num_lanes), max(1, num_channels)),
-        )
-        queue_capacity = _next_power_of_two(
-            max(65536, (int(num_tokens) * max(1, num_topk) * 8
-                        + num_channels * self.num_scaleout_ranks * 8)
-                        // num_proxy_threads + 1)
-        )
-        queues = [self.allocate_d2h_queue(queue_capacity) for _ in range(num_proxy_threads)]
-        # Build GPU-resident array of V2TransferD2HQueueView structs for kernel.
-        queue_views = self.build_queue_views_tensor(queues, device=x_tensor.device)
-        layout = self._make_dispatch_window_layout(
-            num_tokens=num_tokens,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            payload_bytes=hidden_bytes,
-            max_batches=max(1, int(self.num_experts)),
-            num_topk=num_topk,
-            has_topk_weight=topk_weights is not None,
-        )
-
-        proxy_before = self._v2_efa_connection.proxy_stats()
-        # Start N persistent proxy threads, each draining its own queue.
-        self.start_native_v2_proxy(queues, num_threads=num_proxy_threads)
+        # Native UCCL transport: persistent UcclProxy D2H queues (created in
+        # init_native_v2_efa_transport).  The kernel pushes old TransferCmds into
+        # d2h_queues[channel % num_queues]; the owning proxy thread drains and
+        # posts the RDMA write.  signal_scratch lives at the registered window
+        # tail.  No per-dispatch queue/layout allocation any more.
+        if self._v2_proxies is None or self._v2_d2h_queue_ptrs is None:
+            raise RuntimeError("native V2 dispatch requires init_native_v2_efa_transport()")
+        queues = None
+        layout = None
         try:
             self.runtime.launch_native_hybrid_dispatch(
                 int(x_tensor.data_ptr()),
@@ -1449,8 +1442,8 @@ class ElasticBuffer:
                 int(expert_alignment),
                 int(max(1, self._v2_efa_num_lanes)),
                 int(os.environ.get("UCCL_V2_GPU_TIMEOUT_CYCLES", "200000000000")),
-                False,
-                False,
+                False,  # cached_mode
+                False,  # deterministic
                 bool(do_cpu_sync),
                 int(smem_bytes),
                 int(self._native_v2_resources["nccl_dev_comm_ptr"]),
@@ -1458,26 +1451,10 @@ class ElasticBuffer:
                 int(self._native_v2_resources["buffer_ptr"]),
                 int(self._native_v2_resources["workspace_ptr"]),
                 int(self._native_v2_resources["mapped_host_workspace_ptr"]),
-                int(queue_views.data_ptr()),
-                int(num_proxy_threads),
-                int(self._native_v2_resources["buffer_ptr"]),
-                int(self._native_v2_resources["workspace_ptr"]),
-                int(layout["local_payload_base"]),
-                int(layout["remote_payload_base"]),
-                int(layout["remote_signal_base"]),
-                int(layout["src_token_stride"]),
-                int(layout["expanded_slot_stride"]),
-                int(layout["batch_payload_stride"]),
-                int(layout.get("source_rank_stride", 0)),
-                int(layout.get("source_signal_stride", 0)),
-                int(layout.get("token_record_bytes", 0)),
-                int(layout.get("record_payload_offset", 0)),
-                int(layout.get("record_src_global_offset", 0)),
-                int(layout.get("record_topk_idx_offset", 0)),
-                int(layout.get("record_topk_weight_offset", 0)),
-                int(layout.get("record_topk_weight_bytes", 0)),
-                int(layout.get("signal_stride", 4)),
-                int(max(1, self._v2_efa_num_lanes)),
+                # EFA transport (new short ABI): D2H queue array, count, scratch.
+                int(self._v2_d2h_queue_ptrs.data_ptr()),
+                int(self._v2_num_d2h_queues),
+                int(self._v2_signal_scratch_base),
                 str(Path(__file__).resolve().parents[3] / "include"),
                 _cuda_stream_ptr(torch.cuda.current_stream()),
             )
@@ -1533,9 +1510,9 @@ class ElasticBuffer:
             )
             torch.cuda.current_stream().synchronize()
         finally:
-            self.stop_native_v2_proxy()
-        proxy_after = self._v2_efa_connection.proxy_stats()
-        # Use the first queue as the canonical d2h_queue for the handle (legacy field).
+            # Proxies are persistent (started in init_native_v2_efa_transport);
+            # nothing to stop per-dispatch.
+            pass
         transport = V2TransportHandle(
             dispatch_segments=torch.empty((0,), dtype=torch.uint8, device=x_tensor.device),
             dispatch_batches=torch.empty((0,), dtype=torch.uint8, device=x_tensor.device),
@@ -1544,7 +1521,7 @@ class ElasticBuffer:
             combine_segments=None,
             combine_batches=None,
             combine_counters=None,
-            d2h_queue=queues[0],
+            d2h_queue=None,
             combine_d2h_queue=None,
             dispatch_layout=layout,
             combine_layout=None,
@@ -1554,7 +1531,7 @@ class ElasticBuffer:
             num_combine_segments=0,
             payload_bytes=hidden_bytes,
             scale_bytes=scale_bytes,
-            dispatch_drain_stats={"proxy_before": proxy_before, "proxy_after": proxy_after},
+            dispatch_drain_stats=None,
             timings=None,
         )
         expert_counts = [0 for _ in range(num_local_experts)]
