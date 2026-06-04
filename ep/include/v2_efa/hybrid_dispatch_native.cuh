@@ -222,22 +222,35 @@ hybrid_dispatch_impl(
                              "kNumScaleoutRanks must be less than kNumNotifyThreads");
             if (thread_idx < kNumScaleoutRanks) {
                 const auto dst_scaleout_rank_idx = thread_idx;
-                auto* q = d2h_queues[dst_scaleout_rank_idx % num_d2h_queues];
-                // The proxy peer table is indexed by GLOBAL rank; the scaleout
-                // peer at our scaleup position is dst_scaleout * kNumScaleupRanks
-                // + scaleup_rank_idx.
-                const int dst_global = dst_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
-                // local src = staged per-dst send count (<true>); remote dst =
-                // peer's recv slot reserved for this sender (<false>, indexed by
-                // our own scaleout rank).
-                v2_d2h_write(
-                    q, dst_global, kNumScaleupRanks * sizeof(int),
-                    v2_window_off(workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx), window_base),
-                    v2_window_off(workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx), window_base));
-                v2_d2h_write(
-                    q, dst_global, kNumExpertsPerScaleout * sizeof(int),
-                    v2_window_off(workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx), window_base),
-                    v2_window_off(workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx), window_base));
+                if (dst_scaleout_rank_idx == scaleout_rank_idx) {
+                    // Local scale-out rank: the proxy rejects self / intra-node
+                    // commands, so copy the counts directly into the local recv
+                    // slots (exactly what the RDMA write produces on a peer).
+                    const auto* rank_src = workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx);
+                    auto* rank_dst = workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx);
+                    #pragma unroll
+                    for (int k = 0; k < kNumScaleupRanks; ++k)
+                        ptx::st_release_sys(rank_dst + k, rank_src[k]);
+                    const auto* expert_src = workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx);
+                    auto* expert_dst = workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx);
+                    #pragma unroll
+                    for (int k = 0; k < kNumExpertsPerScaleout; ++k)
+                        ptx::st_release_sys(expert_dst + k, expert_src[k]);
+                } else {
+                    // Remote scale-out rank: enqueue D2H TransferCmd WRITEs.  The
+                    // proxy peer table is indexed by GLOBAL rank; the peer at our
+                    // scaleup position is dst_scaleout*kNumScaleupRanks+scaleup.
+                    auto* q = d2h_queues[dst_scaleout_rank_idx % num_d2h_queues];
+                    const int dst_global = dst_scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx;
+                    v2_d2h_write(
+                        q, dst_global, kNumScaleupRanks * sizeof(int),
+                        v2_window_off(workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx), window_base),
+                        v2_window_off(workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx), window_base));
+                    v2_d2h_write(
+                        q, dst_global, kNumExpertsPerScaleout * sizeof(int),
+                        v2_window_off(workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx), window_base),
+                        v2_window_off(workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx), window_base));
+                }
             }
             __syncwarp();
 
@@ -394,24 +407,33 @@ hybrid_dispatch_impl(
                 // ring slot (so it survives until the proxy drains the command),
                 // then a WRITE copies it to the peer's tail slot.
                 const int64_t signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
-                const auto remote_ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
-                const uint32_t q_idx = channel_idx % num_d2h_queues;
-                auto* q = d2h_queues[q_idx];
-                uint64_t slot;
-                q->reserve(&slot);
-                int64_t* scratch = uccl::v2_efa::signal_scratch_slot_for(
-                    signal_scratch_base, q_idx,
-                    static_cast<uint32_t>(slot) & (kSignalScratchSlotsPerQueue - 1u),
-                    kSignalScratchSlotsPerQueue);
-                *scratch = signaled_tail;
-                TransferCmd cmd{};
-                cmd.cmd_type = make_cmd_type(CmdType::WRITE, false, false);
-                // lane_idx is the destination scaleout rank; map to global rank.
-                cmd.dst_rank = static_cast<uint8_t>(lane_idx * kNumScaleupRanks + scaleup_rank_idx);
-                cmd.bytes = sizeof(int64_t);
-                cmd.req_lptr = v2_window_off(scratch, window_base);
-                cmd.req_rptr = v2_window_off(remote_ptr, window_base);
-                q->commit_at(slot, cmd);  // threadfence_system publishes scratch + cmd
+                auto* local_tail_ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
+                if (lane_idx == scaleout_rank_idx) {
+                    // Local scale-out rank: the proxy rejects self / intra-node
+                    // commands, so publish the tail word directly (release so the
+                    // forward warp's ld_acquire_sys sees it after the payload).
+                    ptx::st_release_sys(local_tail_ptr, signaled_tail);
+                } else {
+                    // Remote scale-out rank: stage the tail word in a scratch slot
+                    // bound to the reserved D2H ring slot, then enqueue the WRITE.
+                    const uint32_t q_idx = channel_idx % num_d2h_queues;
+                    auto* q = d2h_queues[q_idx];
+                    uint64_t slot;
+                    q->reserve(&slot);
+                    int64_t* scratch = uccl::v2_efa::signal_scratch_slot_for(
+                        signal_scratch_base, q_idx,
+                        static_cast<uint32_t>(slot) & (kSignalScratchSlotsPerQueue - 1u),
+                        kSignalScratchSlotsPerQueue);
+                    *scratch = signaled_tail;
+                    TransferCmd cmd{};
+                    cmd.cmd_type = make_cmd_type(CmdType::WRITE, false, false);
+                    // lane_idx is the destination scaleout rank; map to global.
+                    cmd.dst_rank = static_cast<uint8_t>(lane_idx * kNumScaleupRanks + scaleup_rank_idx);
+                    cmd.bytes = sizeof(int64_t);
+                    cmd.req_lptr = v2_window_off(scratch, window_base);
+                    cmd.req_rptr = v2_window_off(local_tail_ptr, window_base);
+                    q->commit_at(slot, cmd);  // threadfence_system publishes scratch + cmd
+                }
                 stored_old_scaleout_tail = stored_scaleout_tail;
             }
             __syncwarp();

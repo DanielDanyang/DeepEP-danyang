@@ -1,5 +1,47 @@
 # DeepEP / NCCL GIN Worklog
 
+## 2026-06-02 UCCL-EP transport substrate 复用收敛
+
+- 根据最新原则重新收敛 native V2 方向：能用原 `uccl/ep` transport substrate
+  就不自写 proxy/verbs 策略；只有 V2 layout/handle/command 语义不同的部分新增代码。
+- 本地代码改动：
+  - `uccl-ep/Makefile` 恢复编译原 UCCL substrate：
+    `src/proxy.cpp`、`src/rdma.cpp`、`src/common.cpp`、`src/uccl_proxy.cpp`、
+    `src/fifo.cpp`、`src/adaptive_sleeper.cc`。
+  - `Proxy` 新增 `submit_commands_from_adapter()`，作为 V2 adapter 进入原
+    `post_gpu_commands_mixed()` 的窄入口；不复制 UCCL proxy batching/quiet/CQ 逻辑。
+  - 新增 `include/v2_efa/uccl_transfer_adapter.hpp`：
+    - V2 payload command 精确映射为旧 UCCL `TransferCmd` WRITE；
+    - V2 signal command 不伪装成旧 immediate，而是显式要求 registered
+      signal scratch slot，再用 UCCL WRITE 写远端 signal word；
+    - 引入 `V2UcclWindowMapping`，把 V2 buffer/workspace/signal_scratch
+      规整到 UCCL 单 transport window offset。
+  - `uccl_ep.cc` 暴露 `UcclProxy` substrate 和
+    `translate_v2_transfer_to_uccl_for_debug()`，便于后续服务器验证 command 映射。
+  - 新增设计文档 `uccl-ep/NATIVE_V2_UCCL_PROXY_DESIGN.md`，详细比较原
+    `uccl/ep` 与 native V2 backend 的差异，并用 ASCII 图记录设计。
+- 验证：
+  - 本地 `git diff --check -- uccl-ep/...` 通过。
+  - 未上服务器 build/bench：按 AGENTS 约束，最近一次检查两台 p5en 都有
+    `sglang::scheduler` 占满 GPU，当前只做本地代码和文档。
+
+### 计划修正：主路径回到旧 TransferCmd
+
+- 根据后续讨论修正计划：
+  - 旧 `TransferCmd` 并非不能表达 V2 所需能力；V1 也已有 signal/counter、
+    region-like offset 约定、queue/proxy/channel lane 隐含语义。
+  - 主路径应直接让 V2 JIT 生成旧 16B `TransferCmd`。
+  - region 用 unified transport window offset 消解；
+  - signal/tail/count 先写入 signal scratch，再用旧 `TransferCmd` WRITE 到远端
+    workspace word；
+  - lane 不进入 command，由 `channel_idx % num_fifo_queues` 选择 D2H queue/proxy/lane。
+- 已更新：
+  - `uccl-ep/PLAN.md`：新增“基于原 uccl/ep 到底还需要改什么”，并把阶段计划从
+    `V2TransferCmd` 主路径改成旧 `TransferCmd` 主路径。
+  - `plan.md`：增加 native UCCL-EP 计划入口，明确详细计划以 `uccl-ep/PLAN.md` 为准。
+  - `uccl-ep/NATIVE_V2_UCCL_PROXY_DESIGN.md`：顶部加入 superseded note，说明 adapter
+    方案降级为原型/debug。
+
 ## 2026-06-02 Phase 0/1/2 resource binding + multi-queue proxy
 
 ### Phase 0 — V2 resource binding (csrc/elastic/buffer.hpp)
@@ -3028,3 +3070,40 @@ README 风格 EP8x2 性能：
     `_native_v2_resources` 时失败。
   - `do_cpu_sync=True` 的 host workspace reader 仍未实现。
   - 尚未跑 EP8x2/EP16 correctness 和 BW。
+
+## 2026-06-04 转向 `ep/` 主线、清理 `uccl-ep`、服务器编译
+
+- 按当前指令，`uccl-ep/` 已从本地工作区删除；远端 EFS 仓库
+  `/home/ubuntu/efs/yzhou/playground/daniel/DeepEP-danyang/uccl-ep/` 也已删除。
+- `agents.md` 已更新：
+  - 当前主线是 `ep/`，不是 `uccl-ep/`。
+  - `uccl/ep` 只作为 transport substrate 参考和复用来源。
+  - 继续坚持不写 fallback/临时主路径、不自创新策略，遇到 bug 优先参考原
+    `uccl/ep` 成熟逻辑。
+- 同步到服务器的主线文件：
+  - `ep/`
+  - `csrc/elastic/buffer.hpp`
+  - `agents.md`
+- 编译环境修正：
+  - 服务器 `/usr/local/cuda` 指向 CUDA 12.9，但当前 venv PyTorch 是
+    `2.12.0+cu130`。
+  - 根 DeepEP extension 必须显式使用 `/usr/local/cuda-13.0`，否则 PyTorch
+    extension 会报 CUDA 12.9 vs 13.0 mismatch。
+- p5en_0 编译结果：
+  - `python -m pip install -e . --no-build-isolation` 通过。
+  - `make -C ep clean && make -C ep install PYTHON=$VIRTUAL_ENV/bin/python
+    CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j8` 通过。
+  - import smoke 通过：
+    `import deep_ep`、`import uccl.ep`。
+- p5en_1 编译/安装结果：
+  - `python -m pip install -e . --no-build-isolation` 通过。
+  - `make -C ep install PYTHON=$VIRTUAL_ENV/bin/python
+    CUDA_PATH=/usr/local/cuda-13.0 SM=90 -j8` 通过。
+  - import smoke 通过：
+    `import deep_ep`、`import uccl.ep`。
+- 未继续运行 correctness/benchmark：
+  - 准备跑双机 native dispatch smoke 前再次检查 GPU。
+  - p5en_0 和 p5en_1 各 8 张 GPU 均被 `sglang::scheduler_*` 进程占用，
+    每张约 `125656 MiB`。
+  - 按 `agents.md` 约束，发现别人占用 GPU 后立即停止服务器测试，没有继续跑
+    correctness、benchmark、profiling 或采样。

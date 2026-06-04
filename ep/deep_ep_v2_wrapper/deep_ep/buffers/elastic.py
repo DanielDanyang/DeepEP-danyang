@@ -341,8 +341,9 @@ class ElasticBuffer:
         self,
         *,
         window_base: int,
-        mapped_window_base: int,
         window_bytes: int,
+        scratch_region_base: int,
+        scratch_region_bytes: int,
         num_lanes: int = 1,
     ):
         """Set up the native UCCL EFA transport for the DeepEP symmetric window.
@@ -352,12 +353,23 @@ class ElasticBuffer:
         ``[window_base, window_base+window_bytes)`` (raw symmetric address) as its
         RDMA MR, exchange peer meta (listen ports + window base) over the torch
         group, connect, and start them in dual mode.  The proxies' D2H command
-        rings become the kernel's ``d2h_queues**``.  ``signal_scratch`` is carved
-        from the tail of the registered window (idle buffer slack); its mapped
-        base is derived from ``mapped_window_base`` once the queue count is known.
+        rings become the kernel's ``d2h_queues**``.  ``signal_scratch`` is placed
+        in ``[scratch_region_base, scratch_region_base+scratch_region_bytes)`` (the
+        mapped CPU/engram segment of the window) so it never overlaps the GPU
+        dispatch/combine buffer.
         """
         if not hasattr(ep, "Proxy"):
             raise RuntimeError("uccl.ep was built without the UcclProxy transport")
+
+        # TransferCmd WRITE offsets are 32-bit, shifted by 2 (4-byte granularity),
+        # so the registered window must fit the 16 GiB encodable range and be
+        # 4-byte aligned; otherwise device-side offsets silently truncate.
+        if int(window_bytes) <= 0 or int(window_bytes) > (1 << 34):
+            raise RuntimeError(
+                f"V2 EFA window {int(window_bytes)} B exceeds the 16 GiB TransferCmd "
+                f"offset-encoding range")
+        if int(window_base) % 4 != 0:
+            raise RuntimeError("V2 EFA window base must be 4-byte aligned")
 
         rank = int(self.rank_idx)
         num_ranks = int(self.num_ranks)
@@ -418,15 +430,17 @@ class ElasticBuffer:
         self._v2_d2h_queue_ptrs = torch.tensor(d2h_addrs, dtype=torch.int64, device="cuda")
         self._v2_num_d2h_queues = len(d2h_addrs)
 
-        # signal_scratch: one int64 slot per ring slot per queue, carved from the
-        # tail of the registered window (mapped address space).
+        # signal_scratch: one int64 slot per ring slot per queue, placed at the
+        # start of the CPU/engram segment (mapped) so it never overlaps the GPU
+        # dispatch/combine buffer.
         scratch_bytes = _align(self._v2_num_d2h_queues * _V2_KQUEUE_SIZE * 8, 128)
-        if scratch_bytes >= int(window_bytes):
+        if int(scratch_region_base) == 0 or scratch_bytes > int(scratch_region_bytes):
             raise RuntimeError(
-                f"V2 EFA window ({int(window_bytes)} B) too small for signal scratch "
-                f"({scratch_bytes} B); enlarge the buffer or reduce proxy threads"
+                f"signal scratch needs {scratch_bytes} B but the CPU/engram segment "
+                f"is {int(scratch_region_bytes)} B; create the DeepEP buffer with "
+                f"num_cpu_bytes >= {scratch_bytes}"
             )
-        self._v2_signal_scratch_base = int(mapped_window_base) + int(window_bytes) - scratch_bytes
+        self._v2_signal_scratch_base = int(scratch_region_base)
 
         self._v2_proxies = proxies
         self._v2_window_base = int(window_base)
@@ -447,8 +461,9 @@ class ElasticBuffer:
         """One-shot setup: extract V2 resources from an existing DeepEP ElasticBuffer
         and wire up both the EFA RDMA transport and the native dispatch resource table.
 
-        Registers the WHOLE DeepEP symmetric window (workspace + buffer) as one MR
-        via UcclProxy; signal scratch is carved from the window tail.
+        Registers the WHOLE DeepEP symmetric window (workspace + GPU buffer + CPU
+        segment) as one MR via UcclProxy; signal scratch lives in the CPU/engram
+        segment so it never overlaps the GPU dispatch/combine buffer.
 
         Returns the full resource dict so callers can inspect addresses.
         """
@@ -465,15 +480,18 @@ class ElasticBuffer:
             )
         resources = deep_ep_handle.get_native_v2_resources()
         ws_bytes = int(resources["workspace_bytes"])
-        buf_bytes = int(resources["buffer_bytes"])
-        window_bytes = ws_bytes + buf_bytes
-        # Raw symmetric base for ibv_reg_mr; mapped base for kernel/scratch offsets.
+        gpu_bytes = int(resources["buffer_bytes"])
+        cpu_bytes = int(resources.get("cpu_buffer_bytes", 0))
+        # Full symmetric window [Workspace | GPU buffer | CPU segment].
+        window_bytes = int(resources.get("rdma_window_bytes", ws_bytes + gpu_bytes + cpu_bytes))
         raw_window_base = int(resources.get("rdma_workspace_ptr", resources["workspace_ptr"]))
-        mapped_window_base = int(resources["workspace_ptr"])
+        # Scratch in the CPU/engram segment (idle when engram unused); mapped base.
+        scratch_region_base = int(resources.get("cpu_buffer_ptr", 0))
         self.init_native_v2_efa_transport(
             window_base=raw_window_base,
-            mapped_window_base=mapped_window_base,
             window_bytes=window_bytes,
+            scratch_region_base=scratch_region_base,
+            scratch_region_bytes=cpu_bytes,
             num_lanes=num_lanes,
         )
         self.init_native_v2_deep_ep_resources(
@@ -550,7 +568,9 @@ class ElasticBuffer:
             else self.num_max_tokens_per_rank
         )
         expert_alignment = int(expert_alignment if expert_alignment is not None else 1)
-        do_cpu_sync = True if do_cpu_sync is None else bool(do_cpu_sync)
+        # Default False: the native path reads counts on the GPU receiver; the
+        # host-workspace CPU-sync reader is not implemented.
+        do_cpu_sync = False if do_cpu_sync is None else bool(do_cpu_sync)
         num_sms = int(num_sms or self.get_theoretical_num_sms(num_experts, num_topk))
         elem_bytes = int(x_tensor.element_size())
         scale_bytes = 0 if sf is None else int(sf.shape[1] * sf.element_size())
@@ -599,10 +619,14 @@ class ElasticBuffer:
             raise RuntimeError("native V2 resources are not initialized")
         if self._v2_proxies is None:
             raise RuntimeError("native V2 EFA transport is not initialized")
-        if do_cpu_sync and int(self._native_v2_resources.get("host_workspace_ptr", 0)) == 0:
+        # Reject CPU-sync BEFORE launching anything: the host-workspace CPU
+        # reader is not implemented, so a do_cpu_sync=True call would otherwise
+        # launch the kernel + emit transport commands and only then fail, leaving
+        # proxy/remote state mid-flight.
+        if do_cpu_sync:
             raise RuntimeError(
-                "native V2 CPU-sync dispatch requires host_workspace_ptr; "
-                "pass do_cpu_sync=False until the official resource binding exposes it"
+                "native V2 do_cpu_sync=True is not supported yet (host-workspace "
+                "CPU reader unimplemented); call dispatch(..., do_cpu_sync=False)"
             )
 
         smem_bytes = int(os.environ.get("UCCL_V2_SMEM_BYTES", str(224 * 1024)))
@@ -691,8 +715,7 @@ class ElasticBuffer:
                 _cuda_stream_ptr(torch.cuda.current_stream()),
             )
 
-            if do_cpu_sync:
-                raise RuntimeError("host workspace CPU reader is not implemented in uccl-ep wrapper yet")
+            # (do_cpu_sync=True is rejected before launch, above.)
             num_recv_tokens = int(num_max_tokens_per_rank) * int(self.num_ranks)
             num_expanded_tokens = (
                 self.num_ranks * int(num_max_tokens_per_rank) * min(num_topk, num_local_experts)

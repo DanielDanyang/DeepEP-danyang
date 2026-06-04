@@ -195,6 +195,13 @@ public:
         out["workspace_bytes"]            = static_cast<int64_t>(num_workspace_bytes);
         out["rdma_buffer_ptr"]            = reinterpret_cast<int64_t>(raw_buffer);
         out["rdma_workspace_ptr"]         = reinterpret_cast<int64_t>(raw_workspace);
+        // CPU/engram segment: tail of the symmetric window [[[Workspace] GPU] CPU].
+        // Exposed so external transports (e.g. native EFA signal scratch) can use
+        // this region without touching the GPU dispatch/combine buffer.  Mapped
+        // pointer for kernels; size; and the full registerable window size.
+        out["cpu_buffer_ptr"]             = reinterpret_cast<int64_t>(static_cast<uint8_t*>(buffer) + num_gpu_buffer_bytes);
+        out["cpu_buffer_bytes"]           = static_cast<int64_t>(num_cpu_buffer_bytes);
+        out["rdma_window_bytes"]          = static_cast<int64_t>(num_workspace_bytes + num_gpu_buffer_bytes + num_cpu_buffer_bytes);
         out["host_workspace_ptr"]         = reinterpret_cast<int64_t>(host_workspace);
         out["mapped_host_workspace_ptr"]  = reinterpret_cast<int64_t>(mapped_host_workspace);
         out["nccl_dev_comm_ptr"]          = reinterpret_cast<int64_t>(&nccl_context->dev_comm);
